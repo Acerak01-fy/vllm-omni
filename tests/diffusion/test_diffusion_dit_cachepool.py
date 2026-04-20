@@ -1,9 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+"""Tests for the experimental cache-pool execution paths.
+
+Covers three flavors of the cache backend:
+
+* Cache-DiT stepwise (single-request lifecycle)
+* Cache-DiT batched forward + batched stepwise runner
+* TeaCache stepwise (hook state restoration across requests)
+
+The fakes in this module implement just enough of the pipeline contract
+(``prepare_encode`` / ``denoise_step`` / ``step_scheduler`` / ``post_decode``)
+and of the ``CacheStateDriver`` interface to drive ``DiffusionModelRunner``
+end-to-end on CPU.
+"""
+
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -25,11 +40,20 @@ from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.driver import TeaCacheStateDriver
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
+from vllm_omni.diffusion.sched.interface import (
+    CachedRequestData,
+    DiffusionSchedulerOutput,
+    NewRequestData,
+)
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import CacheBackendSlot
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers / fixtures
+# ---------------------------------------------------------------------------
 
 
 @contextmanager
@@ -39,8 +63,16 @@ def _noop_forward_context(*args, **kwargs):
 
 
 @pytest.fixture(autouse=True)
-def _enable_experiment_cachepool(monkeypatch):
+def _cachepool_test_env(monkeypatch):
+    """Enable the experimental cache pool and stub ``set_forward_context``.
+
+    Individual tests may still override ``EXPERIMENT_CACHEPOOL`` — later
+    monkeypatches chain on top of this one.
+    """
     monkeypatch.setattr(diffusion_experimental, "EXPERIMENT_CACHEPOOL", True)
+    monkeypatch.setattr(
+        model_runner_module, "set_forward_context", _noop_forward_context
+    )
 
 
 def _make_request(req_id: str, num_inference_steps: int = 3):
@@ -58,47 +90,125 @@ def _make_request(req_id: str, num_inference_steps: int = 3):
     )
 
 
-def _make_new_scheduler_output(req, step_id: int = 0, finished_req_ids=None):
-    return DiffusionSchedulerOutput(
-        step_id=step_id,
-        scheduled_new_reqs=[NewRequestData(sched_req_id=req.request_ids[0], req=req)],
-        scheduled_cached_reqs=CachedRequestData.make_empty(),
-        finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
-        num_running_reqs=1,
-        num_waiting_reqs=0,
-    )
-
-
-def _make_batch_scheduler_output(
-    new_reqs=None,
-    cached_req_ids=None,
+def _make_scheduler_output(
+    *,
+    new_reqs: Iterable = (),
+    cached_req_ids: Iterable[str] = (),
     step_id: int = 0,
-    finished_req_ids=None,
-):
-    new_reqs = [] if new_reqs is None else list(new_reqs)
-    cached_req_ids = [] if cached_req_ids is None else list(cached_req_ids)
+    finished_req_ids: Iterable[str] | None = None,
+) -> DiffusionSchedulerOutput:
+    """Build a ``DiffusionSchedulerOutput`` for the runner under test."""
+    new_reqs = list(new_reqs)
+    cached_ids = list(cached_req_ids)
+    cached = (
+        CachedRequestData.make_empty()
+        if not cached_ids
+        else CachedRequestData(sched_req_ids=cached_ids)
+    )
     return DiffusionSchedulerOutput(
         step_id=step_id,
         scheduled_new_reqs=[
             NewRequestData(sched_req_id=req.request_ids[0], req=req)
             for req in new_reqs
         ],
-        scheduled_cached_reqs=CachedRequestData(sched_req_ids=cached_req_ids),
+        scheduled_cached_reqs=cached,
         finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
-        num_running_reqs=len(new_reqs) + len(cached_req_ids),
+        num_running_reqs=len(new_reqs) + len(cached_ids),
         num_waiting_reqs=0,
     )
 
 
-def _make_cached_scheduler_output(sched_req_id: str, step_id: int = 0, finished_req_ids=None):
-    return DiffusionSchedulerOutput(
-        step_id=step_id,
-        scheduled_new_reqs=[],
-        scheduled_cached_reqs=CachedRequestData(sched_req_ids=[sched_req_id]),
-        finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
-        num_running_reqs=1,
-        num_waiting_reqs=0,
+def _make_cache_state(
+    req_id: str,
+    *,
+    num_inference_steps: int,
+    rows: int = 1,
+    slot: CacheBackendSlot | None = None,
+):
+    return SimpleNamespace(
+        req_id=req_id,
+        sampling=SimpleNamespace(num_inference_steps=num_inference_steps),
+        latents=torch.zeros((rows, 2), dtype=torch.float32),
+        cache_slot=slot,
     )
+
+
+def _attach_fresh_slots(driver, states) -> None:
+    """Create + initialize a fresh cache slot on each state."""
+    for state in states:
+        state.cache_slot = driver.create_empty_slot()
+        driver.initialize_fresh_slot(
+            state.cache_slot, state.sampling.num_inference_steps
+        )
+
+
+def _build_runner(pipeline, driver, *, backend_name: str = "cache_dit"):
+    """Assemble a minimal ``DiffusionModelRunner`` backed by test doubles."""
+    runner = object.__new__(DiffusionModelRunner)
+    runner.vllm_config = object()
+    runner.od_config = SimpleNamespace(
+        cache_backend=backend_name,
+        enable_cache_dit_summary=False,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+    )
+    runner.device = torch.device("cpu")
+    runner.pipeline = pipeline
+    runner.cache_backend = SimpleNamespace(is_enabled=lambda: True)
+    runner.cache_manager = CacheManager(driver)
+    runner.offload_backend = None
+    runner.state_cache = {}
+    runner.kv_transfer_manager = SimpleNamespace()
+    pipeline.runner = runner
+    return runner
+
+
+# ---------------------------------------------------------------------------
+# Shared pipeline base
+# ---------------------------------------------------------------------------
+
+
+class _BasePipeline:
+    """Shared ``prepare_encode``/``step_scheduler``/``post_decode`` for fakes."""
+
+    supports_step_execution = True
+
+    def __init__(self):
+        self.runner = None
+        self.prepare_calls: list[str] = []
+        self.decode_calls: list[str] = []
+
+    def _make_latents(self) -> torch.Tensor:
+        return torch.tensor([0.0])
+
+    def _extend_prepared_state(self, state) -> None:
+        """Hook for subclasses to populate extra state during ``prepare_encode``."""
+
+    def prepare_encode(self, state, **kwargs):
+        del kwargs
+        self.prepare_calls.append(state.req_id)
+        num_steps = state.sampling.num_inference_steps
+        state.timesteps = [torch.tensor(num_steps - idx) for idx in range(num_steps)]
+        state.latents = self._make_latents()
+        state.prompt_embeds = torch.zeros((1, 2, 4), dtype=torch.float32)
+        state.prompt_embeds_mask = torch.tensor([[True, True]])
+        self._extend_prepared_state(state)
+        return state
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        del noise_pred, kwargs
+        state.step_index += 1
+
+    def post_decode(self, state, **kwargs):
+        del kwargs
+        self.decode_calls.append(state.req_id)
+        return DiffusionOutput(
+            output=torch.tensor([state.step_index], dtype=torch.float32)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cache-DiT single-request fakes
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -128,21 +238,24 @@ class _FakeCacheDiTDriver(CacheStateDriver):
         self._next_slot_id += 1
         return CacheBackendSlot(
             backend_name=self.backend_name,
-            payload={
-                "slot_id": self._next_slot_id,
-                "trace": [],
-            },
+            payload={"slot_id": self._next_slot_id, "trace": []},
         )
 
     def install_slot(self, slot: CacheBackendSlot) -> None:
         self.pipeline.live_cache_slot = slot
 
-    def initialize_fresh_slot(self, slot: CacheBackendSlot, num_inference_steps: int) -> None:
+    def initialize_fresh_slot(
+        self, slot: CacheBackendSlot, num_inference_steps: int
+    ) -> None:
         slot.payload["trace"].clear()
         slot.payload["initialized_for_steps"] = num_inference_steps
-        self.initialize_history.append((slot.payload["slot_id"], num_inference_steps))
+        self.initialize_history.append(
+            (slot.payload["slot_id"], num_inference_steps)
+        )
 
-    def is_slot_compatible(self, slot: CacheBackendSlot, num_inference_steps: int) -> bool:
+    def is_slot_compatible(
+        self, slot: CacheBackendSlot, num_inference_steps: int
+    ) -> bool:
         return slot.metadata.get("num_inference_steps") == num_inference_steps
 
     def deactivate_slot(self, slot: CacheBackendSlot | None) -> None:
@@ -163,34 +276,22 @@ class _FakeCacheDiTDriver(CacheStateDriver):
         return 1024 + 64 * len(slot.payload["trace"])
 
 
-class _CacheDiTPipeline:
-    supports_step_execution = True
-
+class _CacheDiTPipeline(_BasePipeline):
     def __init__(self):
-        self.runner = None
+        super().__init__()
         self.live_cache_slot = None
         self.snapshots: list[_CacheDiTSnapshot] = []
-        self.prepare_calls: list[str] = []
-        self.decode_calls: list[str] = []
         self.none_req_ids: set[str] = set()
         self.fail_req_ids: set[str] = set()
-
-    def prepare_encode(self, state, **kwargs):
-        del kwargs
-        self.prepare_calls.append(state.req_id)
-        num_steps = state.sampling.num_inference_steps
-        state.timesteps = [torch.tensor(num_steps - idx) for idx in range(num_steps)]
-        state.latents = torch.tensor([0.0])
-        state.prompt_embeds = torch.zeros((1, 2, 4), dtype=torch.float32)
-        state.prompt_embeds_mask = torch.tensor([[True, True]])
-        return state
 
     def denoise_step(self, input_batch, **kwargs):
         del input_batch, kwargs
         assert self.runner is not None
         active_req_id = self.runner.cache_manager._active_req_id
         if active_req_id is None:
-            raise AssertionError("cache manager must activate one request before denoise_step")
+            raise AssertionError(
+                "cache manager must activate one request before denoise_step"
+            )
         state = self.runner.state_cache[active_req_id]
         assert self.live_cache_slot is state.cache_slot
 
@@ -201,8 +302,9 @@ class _CacheDiTPipeline:
                 if cached_state.cache_slot is not None
             )
         )
-        waiting_req_ids = tuple(req_id for req_id in resident_req_ids if req_id != active_req_id)
-        trace_before = tuple(state.cache_slot.payload["trace"])
+        waiting_req_ids = tuple(
+            rid for rid in resident_req_ids if rid != active_req_id
+        )
         self.snapshots.append(
             _CacheDiTSnapshot(
                 req_id=state.req_id,
@@ -211,7 +313,7 @@ class _CacheDiTPipeline:
                 waiting_req_ids=waiting_req_ids,
                 resident_req_ids=resident_req_ids,
                 slot_id=state.cache_slot.payload["slot_id"],
-                trace_before=trace_before,
+                trace_before=tuple(state.cache_slot.payload["trace"]),
             )
         )
 
@@ -220,36 +322,20 @@ class _CacheDiTPipeline:
         if state.req_id in self.none_req_ids:
             return None
 
-        state.cache_slot.payload["trace"].append(f"{state.req_id}:{state.step_index}")
+        state.cache_slot.payload["trace"].append(
+            f"{state.req_id}:{state.step_index}"
+        )
         return torch.tensor([float(state.step_index + 1)])
-
-    def step_scheduler(self, state, noise_pred, **kwargs):
-        del noise_pred, kwargs
-        state.step_index += 1
-
-    def post_decode(self, state, **kwargs):
-        del kwargs
-        self.decode_calls.append(state.req_id)
-        return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
 
 
 def _make_cache_dit_runner():
-    runner = object.__new__(DiffusionModelRunner)
-    runner.vllm_config = object()
-    runner.od_config = SimpleNamespace(
-        cache_backend="cache_dit",
-        enable_cache_dit_summary=False,
-        parallel_config=SimpleNamespace(use_hsdp=False),
-    )
-    runner.device = torch.device("cpu")
-    runner.pipeline = _CacheDiTPipeline()
-    runner.cache_backend = SimpleNamespace(is_enabled=lambda: True)
-    runner.cache_manager = CacheManager(_FakeCacheDiTDriver(runner.pipeline))
-    runner.offload_backend = None
-    runner.state_cache = {}
-    runner.kv_transfer_manager = SimpleNamespace()
-    runner.pipeline.runner = runner
-    return runner
+    pipeline = _CacheDiTPipeline()
+    return _build_runner(pipeline, _FakeCacheDiTDriver(pipeline))
+
+
+# ---------------------------------------------------------------------------
+# Cache-DiT batched-forward fakes
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -285,7 +371,7 @@ class _BatchContextManager:
         self._batch_contexts = None
         self._batch_row_offsets = None
         self._batch_row_counts = None
-        self._current_context = None
+        self._current_context: _BatchCacheContext | None = None
         self._is_l1_enabled = is_l1_enabled
         self._cache_residual = cache_residual
         self._encoder_cache_residual = encoder_cache_residual
@@ -297,16 +383,17 @@ class _BatchContextManager:
 
     def can_cache(self, states_tensor, parallelized=False, prefix="Fn"):
         del parallelized
-        assert self._current_context is not None
-        self._current_context.last_check_tensor = states_tensor.detach().clone()
-        self._current_context.last_prefix = prefix
-        if self._current_context.warmup_blocks_cache:
+        ctx = self._current_context
+        assert ctx is not None
+        ctx.last_check_tensor = states_tensor.detach().clone()
+        ctx.last_prefix = prefix
+        if ctx.warmup_blocks_cache:
             return False
-        if self._current_context.block_due_to_continuous_limit:
+        if ctx.block_due_to_continuous_limit:
             return False
-        if self._current_context.block_due_to_accumulated_diff:
+        if ctx.block_due_to_accumulated_diff:
             return False
-        return self._current_context.cache_decision
+        return ctx.cache_decision
 
     def add_cached_step(self):
         assert self._current_context is not None
@@ -326,22 +413,25 @@ class _BatchContextManager:
             return
         self._current_context.buffers[f"{prefix}_encoder"] = buffer.detach().clone()
 
-    def apply_cache(self, hidden_states, encoder_hidden_states, prefix="Bn", encoder_prefix="Bn"):
-        assert self._current_context is not None
-        cached_hs = self._current_context.buffers[prefix]
-        if self.is_cache_residual():
-            cached_hs = hidden_states + cached_hs
-        else:
-            cached_hs = cached_hs.clone()
+    def apply_cache(
+        self, hidden_states, encoder_hidden_states, prefix="Bn", encoder_prefix="Bn"
+    ):
+        ctx = self._current_context
+        assert ctx is not None
+        cached_hs = ctx.buffers[prefix]
+        cached_hs = (
+            hidden_states + cached_hs if self.is_cache_residual() else cached_hs.clone()
+        )
 
         cached_enc = None
         encoder_key = f"{encoder_prefix}_encoder"
-        if encoder_hidden_states is not None and encoder_key in self._current_context.buffers:
-            cached_enc = self._current_context.buffers[encoder_key]
-            if self.is_encoder_cache_residual():
-                cached_enc = encoder_hidden_states + cached_enc
-            else:
-                cached_enc = cached_enc.clone()
+        if encoder_hidden_states is not None and encoder_key in ctx.buffers:
+            cached_enc = ctx.buffers[encoder_key]
+            cached_enc = (
+                encoder_hidden_states + cached_enc
+                if self.is_encoder_cache_residual()
+                else cached_enc.clone()
+            )
 
         return cached_hs, cached_enc
 
@@ -382,9 +472,8 @@ class _FakeBatchedPatternBase:
     def call_Fn_blocks(self, hidden_states, encoder_hidden_states, *args, **kwargs):
         del args, kwargs
         self.fn_call_shapes.append(tuple(hidden_states.shape))
-        new_hs = hidden_states + 1
         new_enc = None if encoder_hidden_states is None else encoder_hidden_states + 10
-        return new_hs, new_enc
+        return hidden_states + 1, new_enc
 
     def _get_Fn_residual(self, original_hidden_states, hidden_states):
         return hidden_states - original_hidden_states
@@ -395,17 +484,18 @@ class _FakeBatchedPatternBase:
         new_hs = hidden_states + 2
         new_enc = None if encoder_hidden_states is None else encoder_hidden_states + 20
         hs_residual = torch.full_like(hidden_states, 5)
-        enc_residual = None if encoder_hidden_states is None else torch.full_like(
-            encoder_hidden_states, 7
+        enc_residual = (
+            None
+            if encoder_hidden_states is None
+            else torch.full_like(encoder_hidden_states, 7)
         )
         return new_hs, new_enc, hs_residual, enc_residual
 
     def call_Bn_blocks(self, hidden_states, encoder_hidden_states, *args, **kwargs):
         del args, kwargs
         self.bn_call_shapes.append(tuple(hidden_states.shape))
-        new_hs = hidden_states + 3
         new_enc = None if encoder_hidden_states is None else encoder_hidden_states + 30
-        return new_hs, new_enc
+        return hidden_states + 3, new_enc
 
     def _process_forward_outputs(self, hidden_states, encoder_hidden_states):
         return hidden_states, encoder_hidden_states
@@ -447,18 +537,34 @@ class _FakeBatchedPattern345:
 
 
 def _clone_batch_contexts(contexts):
-    return [{name: copy.deepcopy(ctx) for name, ctx in ctx_map.items()} for ctx_map in contexts]
+    return [
+        {name: copy.deepcopy(ctx) for name, ctx in ctx_map.items()}
+        for ctx_map in contexts
+    ]
+
+
+def _fn_check_prefix(use_l1: bool) -> str:
+    return "fake_Fn_hidden_states" if use_l1 else "fake_Fn_residual"
+
+
+def _bn_prefix(residual: bool) -> str:
+    return "fake_Bn_residual" if residual else "fake_Bn_hidden_states"
 
 
 def _run_serial_base(pattern, batch_contexts, hidden_states, encoder_hidden_states):
+    """Reference serial loop mirroring ``_forward_batched_base`` semantics."""
     cm = pattern.context_manager
-    outputs_hs = []
-    outputs_enc = []
+    outputs_hs: list[torch.Tensor] = []
+    outputs_enc: list[torch.Tensor] = []
     use_l1 = cm.is_l1_diff_enabled()
-    for ctx_map, hs_slice in zip(batch_contexts, hidden_states.split(1, dim=0), strict=True):
+    for ctx_map, hs_slice in zip(
+        batch_contexts, hidden_states.split(1, dim=0), strict=True
+    ):
         enc_slice = None
         if encoder_hidden_states is not None:
-            enc_slice = encoder_hidden_states[len(outputs_hs) : len(outputs_hs) + 1].clone()
+            enc_slice = encoder_hidden_states[
+                len(outputs_hs) : len(outputs_hs) + 1
+            ].clone()
         hs_slice = hs_slice.clone()
         cm._current_context = ctx_map["ctx"]
         orig = hs_slice
@@ -468,31 +574,22 @@ def _run_serial_base(pattern, batch_contexts, hidden_states, encoder_hidden_stat
         cm.mark_step_begin()
         can_cache = cm.can_cache(
             fn_hidden_states if use_l1 else fn_residual,
-            prefix="fake_Fn_hidden_states" if use_l1 else "fake_Fn_residual",
+            prefix=_fn_check_prefix(use_l1),
         )
         if can_cache:
             cm.add_cached_step()
             hs_slice, enc_slice = cm.apply_cache(
                 hs_slice,
                 enc_slice,
-                prefix=(
-                    "fake_Bn_residual"
-                    if cm.is_cache_residual()
-                    else "fake_Bn_hidden_states"
-                ),
-                encoder_prefix=(
-                    "fake_Bn_residual"
-                    if cm.is_encoder_cache_residual()
-                    else "fake_Bn_hidden_states"
-                ),
+                prefix=_bn_prefix(cm.is_cache_residual()),
+                encoder_prefix=_bn_prefix(cm.is_encoder_cache_residual()),
             )
         else:
             cm.set_Fn_buffer(fn_residual, prefix="fake_Fn_residual")
             if use_l1:
                 cm.set_Fn_buffer(fn_hidden_states, "fake_Fn_hidden_states")
             hs_slice, enc_slice, hs_residual, enc_residual = pattern.call_Mn_blocks(
-                hs_slice,
-                enc_slice,
+                hs_slice, enc_slice
             )
             if cm.is_cache_residual():
                 cm.set_Bn_buffer(hs_residual, prefix="fake_Bn_residual")
@@ -508,15 +605,19 @@ def _run_serial_base(pattern, batch_contexts, hidden_states, encoder_hidden_stat
         if enc_slice is not None:
             outputs_enc.append(enc_slice)
     cm._current_context = None
-    return torch.cat(outputs_hs, dim=0), (None if encoder_hidden_states is None else torch.cat(outputs_enc, dim=0))
+    out_enc = None if encoder_hidden_states is None else torch.cat(outputs_enc, dim=0)
+    return torch.cat(outputs_hs, dim=0), out_enc
 
 
 def _run_serial_345(pattern, batch_contexts, hidden_states):
+    """Reference serial loop mirroring ``_forward_batched_345`` semantics."""
     cm = pattern.context_manager
-    outputs_hs = []
-    outputs_enc = []
+    outputs_hs: list[torch.Tensor] = []
+    outputs_enc: list[torch.Tensor] = []
     use_l1 = cm.is_l1_diff_enabled()
-    for ctx_map, hs_slice in zip(batch_contexts, hidden_states.split(1, dim=0), strict=True):
+    for ctx_map, hs_slice in zip(
+        batch_contexts, hidden_states.split(1, dim=0), strict=True
+    ):
         hs_slice = hs_slice.clone()
         cm._current_context = ctx_map["ctx"]
         orig = hs_slice
@@ -526,23 +627,15 @@ def _run_serial_345(pattern, batch_contexts, hidden_states):
         cm.mark_step_begin()
         can_cache = cm.can_cache(
             fn_hidden_states if use_l1 else fn_residual,
-            prefix="fake_Fn_hidden_states" if use_l1 else "fake_Fn_residual",
+            prefix=_fn_check_prefix(use_l1),
         )
         if can_cache:
             cm.add_cached_step()
             hs_slice, enc_slice = cm.apply_cache(
                 hs_slice,
                 enc_slice,
-                prefix=(
-                    "fake_Bn_residual"
-                    if cm.is_cache_residual()
-                    else "fake_Bn_hidden_states"
-                ),
-                encoder_prefix=(
-                    "fake_Bn_residual"
-                    if cm.is_encoder_cache_residual()
-                    else "fake_Bn_hidden_states"
-                ),
+                prefix=_bn_prefix(cm.is_cache_residual()),
+                encoder_prefix=_bn_prefix(cm.is_encoder_cache_residual()),
             )
         else:
             cm.set_Fn_buffer(fn_residual, prefix="fake_Fn_residual")
@@ -567,6 +660,49 @@ def _run_serial_345(pattern, batch_contexts, hidden_states):
     return torch.cat(outputs_hs, dim=0), torch.cat(outputs_enc, dim=0)
 
 
+def _seed_cached_buffers(
+    ctx: _BatchCacheContext,
+    *,
+    hidden_shape: tuple[int, ...],
+    encoder_shape: tuple[int, ...] | None = None,
+    cache_residual: bool = False,
+    encoder_cache_residual: bool = False,
+) -> None:
+    ctx.buffers[_bn_prefix(cache_residual)] = torch.full(hidden_shape, 50.0)
+    if encoder_shape is not None:
+        ctx.buffers[f"{_bn_prefix(encoder_cache_residual)}_encoder"] = torch.full(
+            encoder_shape, 70.0
+        )
+
+
+def _assert_context_maps_match(actual_contexts, expected_contexts):
+    assert len(actual_contexts) == len(expected_contexts)
+    for actual_map, expected_map in zip(
+        actual_contexts, expected_contexts, strict=True
+    ):
+        assert tuple(actual_map) == tuple(expected_map)
+        for name in actual_map:
+            actual = actual_map[name]
+            expected = expected_map[name]
+            assert actual.mark_step_calls == expected.mark_step_calls
+            assert actual.cached_step_calls == expected.cached_step_calls
+            assert actual.last_prefix == expected.last_prefix
+            if expected.last_check_tensor is None:
+                assert actual.last_check_tensor is None
+            else:
+                assert torch.allclose(
+                    actual.last_check_tensor, expected.last_check_tensor
+                )
+            assert set(actual.buffers) == set(expected.buffers)
+            for key in expected.buffers:
+                assert torch.allclose(actual.buffers[key], expected.buffers[key])
+
+
+# ---------------------------------------------------------------------------
+# CacheManager batch-lifecycle fakes
+# ---------------------------------------------------------------------------
+
+
 class _FakeBatchCacheLifecycleDriver(CacheStateDriver):
     def __init__(self):
         self._next_slot_id = 0
@@ -589,11 +725,17 @@ class _FakeBatchCacheLifecycleDriver(CacheStateDriver):
     def install_slot(self, slot: CacheBackendSlot) -> None:
         slot.payload["installed_single"] = True
 
-    def initialize_fresh_slot(self, slot: CacheBackendSlot, num_inference_steps: int) -> None:
+    def initialize_fresh_slot(
+        self, slot: CacheBackendSlot, num_inference_steps: int
+    ) -> None:
         slot.payload["initialized_for_steps"] = num_inference_steps
-        self.initialize_history.append((slot.payload["slot_id"], num_inference_steps))
+        self.initialize_history.append(
+            (slot.payload["slot_id"], num_inference_steps)
+        )
 
-    def is_slot_compatible(self, slot: CacheBackendSlot, num_inference_steps: int) -> bool:
+    def is_slot_compatible(
+        self, slot: CacheBackendSlot, num_inference_steps: int
+    ) -> bool:
         return slot.metadata.get("num_inference_steps") == num_inference_steps
 
     def deactivate_slot(self, slot: CacheBackendSlot | None) -> None:
@@ -613,6 +755,11 @@ class _FakeBatchCacheLifecycleDriver(CacheStateDriver):
 
     def deactivate_batch_slots(self):
         self.deactivate_batch_calls += 1
+
+
+# ---------------------------------------------------------------------------
+# Cache-DiT batched runner fakes
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -644,11 +791,15 @@ class _FakeRunnerBatchCacheDiTDriver(CacheStateDriver):
     def install_slot(self, slot: CacheBackendSlot) -> None:
         self.pipeline.live_cache_slot = slot
 
-    def initialize_fresh_slot(self, slot: CacheBackendSlot, num_inference_steps: int) -> None:
+    def initialize_fresh_slot(
+        self, slot: CacheBackendSlot, num_inference_steps: int
+    ) -> None:
         slot.payload["history"].clear()
         slot.payload["initialized_for_steps"] = num_inference_steps
 
-    def is_slot_compatible(self, slot: CacheBackendSlot, num_inference_steps: int) -> bool:
+    def is_slot_compatible(
+        self, slot: CacheBackendSlot, num_inference_steps: int
+    ) -> bool:
         return slot.metadata.get("num_inference_steps") == num_inference_steps
 
     def deactivate_slot(self, slot: CacheBackendSlot | None) -> None:
@@ -676,27 +827,18 @@ class _FakeRunnerBatchCacheDiTDriver(CacheStateDriver):
         self.pipeline.live_batch_req_ids = []
 
 
-class _BatchCacheDiTPipeline:
-    supports_step_execution = True
-
+class _BatchCacheDiTPipeline(_BasePipeline):
     def __init__(self):
-        self.runner = None
+        super().__init__()
         self.live_cache_slot = None
         self.live_batch_req_ids: list[str] = []
-        self.prepare_calls: list[str] = []
-        self.decode_calls: list[str] = []
         self.snapshots: list[_BatchRunnerSnapshot] = []
 
-    def prepare_encode(self, state, **kwargs):
-        del kwargs
-        self.prepare_calls.append(state.req_id)
-        num_steps = state.sampling.num_inference_steps
-        state.timesteps = [torch.tensor(num_steps - idx) for idx in range(num_steps)]
-        state.latents = torch.tensor([[0.0]], dtype=torch.float32)
-        state.prompt_embeds = torch.zeros((1, 2, 4), dtype=torch.float32)
-        state.prompt_embeds_mask = torch.tensor([[True, True]])
+    def _make_latents(self) -> torch.Tensor:
+        return torch.tensor([[0.0]], dtype=torch.float32)
+
+    def _extend_prepared_state(self, state) -> None:
         state.extra["cache_plan"] = tuple(getattr(state.sampling, "cache_plan", ()))
-        return state
 
     def denoise_step(self, input_batch, **kwargs):
         del kwargs
@@ -715,36 +857,20 @@ class _BatchCacheDiTPipeline:
             )
         )
         for state in states:
-            state.cache_slot.payload["history"].append((state.req_id, state.step_index))
+            state.cache_slot.payload["history"].append(
+                (state.req_id, state.step_index)
+            )
         return input_batch.latents + 1
-
-    def step_scheduler(self, state, noise_pred, **kwargs):
-        del noise_pred, kwargs
-        state.step_index += 1
-
-    def post_decode(self, state, **kwargs):
-        del kwargs
-        self.decode_calls.append(state.req_id)
-        return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
 
 
 def _make_batch_cache_dit_runner():
-    runner = object.__new__(DiffusionModelRunner)
-    runner.vllm_config = object()
-    runner.od_config = SimpleNamespace(
-        cache_backend="cache_dit",
-        enable_cache_dit_summary=False,
-        parallel_config=SimpleNamespace(use_hsdp=False),
-    )
-    runner.device = torch.device("cpu")
-    runner.pipeline = _BatchCacheDiTPipeline()
-    runner.cache_backend = SimpleNamespace(is_enabled=lambda: True)
-    runner.cache_manager = CacheManager(_FakeRunnerBatchCacheDiTDriver(runner.pipeline))
-    runner.offload_backend = None
-    runner.state_cache = {}
-    runner.kv_transfer_manager = SimpleNamespace()
-    runner.pipeline.runner = runner
-    return runner
+    pipeline = _BatchCacheDiTPipeline()
+    return _build_runner(pipeline, _FakeRunnerBatchCacheDiTDriver(pipeline))
+
+
+# ---------------------------------------------------------------------------
+# Cache-DiT state-driver (module-context) fakes
+# ---------------------------------------------------------------------------
 
 
 class _FakeDriverContext:
@@ -763,8 +889,7 @@ class _FakeDriverContext:
 class _FakeDriverContextManager:
     def __init__(self, *context_names: str):
         self._cached_context_manager = {
-            name: _FakeDriverContext(name)
-            for name in context_names
+            name: _FakeDriverContext(name) for name in context_names
         }
         self._current_context = None
         self._batch_contexts = None
@@ -813,57 +938,9 @@ def _make_cache_dit_driver():
     return driver, backend, pipeline, (manager_a, manager_b)
 
 
-def _make_cache_state(
-    req_id: str,
-    *,
-    num_inference_steps: int,
-    rows: int = 1,
-    slot: CacheBackendSlot | None = None,
-):
-    return SimpleNamespace(
-        req_id=req_id,
-        sampling=SimpleNamespace(num_inference_steps=num_inference_steps),
-        latents=torch.zeros((rows, 2), dtype=torch.float32),
-        cache_slot=slot,
-    )
-
-
-def _seed_cached_buffers(
-    ctx: _BatchCacheContext,
-    *,
-    hidden_shape: tuple[int, ...],
-    encoder_shape: tuple[int, ...] | None = None,
-    cache_residual: bool = False,
-    encoder_cache_residual: bool = False,
-) -> None:
-    hidden_prefix = "fake_Bn_residual" if cache_residual else "fake_Bn_hidden_states"
-    encoder_prefix = (
-        "fake_Bn_residual"
-        if encoder_cache_residual
-        else "fake_Bn_hidden_states"
-    )
-    ctx.buffers[hidden_prefix] = torch.full(hidden_shape, 50.0)
-    if encoder_shape is not None:
-        ctx.buffers[f"{encoder_prefix}_encoder"] = torch.full(encoder_shape, 70.0)
-
-
-def _assert_context_maps_match(actual_contexts, expected_contexts):
-    assert len(actual_contexts) == len(expected_contexts)
-    for actual_map, expected_map in zip(actual_contexts, expected_contexts, strict=True):
-        assert tuple(actual_map) == tuple(expected_map)
-        for name in actual_map:
-            actual = actual_map[name]
-            expected = expected_map[name]
-            assert actual.mark_step_calls == expected.mark_step_calls
-            assert actual.cached_step_calls == expected.cached_step_calls
-            assert actual.last_prefix == expected.last_prefix
-            if expected.last_check_tensor is None:
-                assert actual.last_check_tensor is None
-            else:
-                assert torch.allclose(actual.last_check_tensor, expected.last_check_tensor)
-            assert set(actual.buffers) == set(expected.buffers)
-            for key in expected.buffers:
-                assert torch.allclose(actual.buffers[key], expected.buffers[key])
+# ---------------------------------------------------------------------------
+# TeaCache fakes
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -888,14 +965,10 @@ class _TeaHookRegistry:
         return None
 
 
-class _TeaCachePipeline:
-    supports_step_execution = True
-
+class _TeaCachePipeline(_BasePipeline):
     def __init__(self):
-        self.runner = None
+        super().__init__()
         self.snapshots: list[_TeaCacheSnapshot] = []
-        self.prepare_calls: list[str] = []
-        self.decode_calls: list[str] = []
         self.none_req_ids: set[str] = set()
         self.fail_req_ids: set[str] = set()
         self.hook = TeaCacheHook(
@@ -907,22 +980,14 @@ class _TeaCachePipeline:
         self.hook.state_manager.set_context("teacache")
         self.transformer = SimpleNamespace(_hook_registry=_TeaHookRegistry(self.hook))
 
-    def prepare_encode(self, state, **kwargs):
-        del kwargs
-        self.prepare_calls.append(state.req_id)
-        num_steps = state.sampling.num_inference_steps
-        state.timesteps = [torch.tensor(num_steps - idx) for idx in range(num_steps)]
-        state.latents = torch.tensor([0.0])
-        state.prompt_embeds = torch.zeros((1, 2, 4), dtype=torch.float32)
-        state.prompt_embeds_mask = torch.tensor([[True, True]])
-        return state
-
     def denoise_step(self, input_batch, **kwargs):
         del input_batch, kwargs
         assert self.runner is not None
         active_req_id = self.runner.cache_manager._active_req_id
         if active_req_id is None:
-            raise AssertionError("cache manager must activate one request before denoise_step")
+            raise AssertionError(
+                "cache manager must activate one request before denoise_step"
+            )
         state = self.runner.state_cache[active_req_id]
         resident_req_ids = tuple(
             sorted(
@@ -931,7 +996,9 @@ class _TeaCachePipeline:
                 if cached_state.cache_slot is not None
             )
         )
-        waiting_req_ids = tuple(req_id for req_id in resident_req_ids if req_id != active_req_id)
+        waiting_req_ids = tuple(
+            rid for rid in resident_req_ids if rid != active_req_id
+        )
 
         self.hook.state_manager.set_context("teacache_positive")
         positive_state = self.hook.state_manager.get_state()
@@ -958,62 +1025,67 @@ class _TeaCachePipeline:
             return None
 
         positive_state.cnt += 1
-        positive_state.previous_modulated_input = torch.full((2,), float(state.step_index + 1))
-        positive_state.previous_residual = torch.full((2,), float(10 * positive_state.cnt))
-        positive_state.previous_residual_encoder = torch.full((1,), float(100 * positive_state.cnt))
+        positive_state.previous_modulated_input = torch.full(
+            (2,), float(state.step_index + 1)
+        )
+        positive_state.previous_residual = torch.full(
+            (2,), float(10 * positive_state.cnt)
+        )
+        positive_state.previous_residual_encoder = torch.full(
+            (1,), float(100 * positive_state.cnt)
+        )
 
         self.hook.state_manager.set_context("teacache_negative")
         negative_state = self.hook.state_manager.get_state()
         negative_state.cnt = positive_state.cnt
-        negative_state.previous_modulated_input = torch.full((1,), float(1000 + state.step_index))
-        negative_state.previous_residual = torch.full((1,), float(2000 + state.step_index))
+        negative_state.previous_modulated_input = torch.full(
+            (1,), float(1000 + state.step_index)
+        )
+        negative_state.previous_residual = torch.full(
+            (1,), float(2000 + state.step_index)
+        )
 
         self.hook.state_manager.set_context("teacache_positive")
         self.hook._forward_cnt += 1
         return torch.tensor([float(positive_state.cnt)])
 
-    def step_scheduler(self, state, noise_pred, **kwargs):
-        del noise_pred, kwargs
-        state.step_index += 1
-
-    def post_decode(self, state, **kwargs):
-        del kwargs
-        self.decode_calls.append(state.req_id)
-        return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
-
 
 def _make_teacache_runner():
-    runner = object.__new__(DiffusionModelRunner)
-    runner.vllm_config = object()
-    runner.od_config = SimpleNamespace(
-        cache_backend="tea_cache",
-        enable_cache_dit_summary=False,
-        parallel_config=SimpleNamespace(use_hsdp=False),
+    pipeline = _TeaCachePipeline()
+    return _build_runner(
+        pipeline, TeaCacheStateDriver(pipeline), backend_name="tea_cache"
     )
-    runner.device = torch.device("cpu")
-    runner.pipeline = _TeaCachePipeline()
-    runner.cache_backend = SimpleNamespace(is_enabled=lambda: True)
-    runner.cache_manager = CacheManager(TeaCacheStateDriver(runner.pipeline))
-    runner.offload_backend = None
-    runner.state_cache = {}
-    runner.kv_transfer_manager = SimpleNamespace()
-    runner.pipeline.runner = runner
-    return runner
+
+
+# ---------------------------------------------------------------------------
+# Tests — Cache-DiT single-request stepwise
+# ---------------------------------------------------------------------------
+
+
+def _new_sched(req, *, step_id: int = 0, finished_req_ids=None):
+    return _make_scheduler_output(
+        new_reqs=[req], step_id=step_id, finished_req_ids=finished_req_ids
+    )
+
+
+def _cached_sched(req_id: str, *, step_id: int = 0, finished_req_ids=None):
+    return _make_scheduler_output(
+        cached_req_ids=[req_id], step_id=step_id, finished_req_ids=finished_req_ids
+    )
 
 
 class TestExecuteStepwiseCacheDiTCachePool:
-    def test_cache_dit_switching_keeps_acceleration_state(self, monkeypatch):
+    def test_cache_dit_switching_keeps_acceleration_state(self):
         runner = _make_cache_dit_runner()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
         req_a = _make_request("req-a", num_inference_steps=3)
         req_b = _make_request("req-b", num_inference_steps=3)
 
-        first = DiffusionModelRunner.execute_stepwise(runner, _make_new_scheduler_output(req_a, step_id=0))
+        first = DiffusionModelRunner.execute_stepwise(runner, _new_sched(req_a, step_id=0))
         slot_a = runner.state_cache["req-a"].cache_slot
 
-        second = DiffusionModelRunner.execute_stepwise(runner, _make_new_scheduler_output(req_b, step_id=1))
-        third = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output("req-a", step_id=2))
+        second = DiffusionModelRunner.execute_stepwise(runner, _new_sched(req_b, step_id=1))
+        third = DiffusionModelRunner.execute_stepwise(runner, _cached_sched("req-a", step_id=2))
 
         assert first.req_id == "req-a"
         assert first.step_index == 1
@@ -1026,53 +1098,59 @@ class TestExecuteStepwiseCacheDiTCachePool:
         assert third.finished is False
 
         assert runner.state_cache["req-a"].cache_slot is slot_a
-        assert runner.state_cache["req-a"].cache_slot.payload["trace"] == ["req-a:0", "req-a:1"]
-        assert runner.state_cache["req-b"].cache_slot.payload["trace"] == ["req-b:0"]
-        assert [snapshot.trace_before for snapshot in runner.pipeline.snapshots if snapshot.req_id == "req-a"] == [
-            (),
-            ("req-a:0",),
+        assert runner.state_cache["req-a"].cache_slot.payload["trace"] == [
+            "req-a:0",
+            "req-a:1",
         ]
+        assert runner.state_cache["req-b"].cache_slot.payload["trace"] == ["req-b:0"]
+        assert [
+            snapshot.trace_before
+            for snapshot in runner.pipeline.snapshots
+            if snapshot.req_id == "req-a"
+        ] == [(), ("req-a:0",)]
         assert runner.cache_manager.driver.initialize_history == [(1, 3), (2, 3)]
         assert runner.cache_manager._active_req_id is None
         assert runner.pipeline.live_cache_slot is None
 
-    def test_hbm_can_hold_multiple_waiting_slots_while_one_request_runs(self, monkeypatch):
+    def test_hbm_can_hold_multiple_waiting_slots_while_one_request_runs(self):
         runner = _make_cache_dit_runner()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
         for step_id, req_id in enumerate(("req-a", "req-b", "req-c")):
             output = DiffusionModelRunner.execute_stepwise(
                 runner,
-                _make_new_scheduler_output(_make_request(req_id, num_inference_steps=4), step_id=step_id),
+                _new_sched(_make_request(req_id, num_inference_steps=4), step_id=step_id),
             )
             assert output.finished is False
 
         snapshot = runner.pipeline.snapshots[-1]
-        resident_slots = {req_id: state.cache_slot for req_id, state in runner.state_cache.items()}
+        resident_slots = {
+            req_id: state.cache_slot for req_id, state in runner.state_cache.items()
+        }
 
         assert snapshot.req_id == "req-c"
         assert snapshot.active_req_id == "req-c"
         assert snapshot.waiting_req_ids == ("req-a", "req-b")
         assert snapshot.resident_req_ids == ("req-a", "req-b", "req-c")
         assert set(resident_slots) == {"req-a", "req-b", "req-c"}
-        assert len({slot.payload["slot_id"] for slot in resident_slots.values()}) == 3
+        assert (
+            len({slot.payload["slot_id"] for slot in resident_slots.values()}) == 3
+        )
         assert all(slot.resident_bytes > 0 for slot in resident_slots.values())
         assert runner.cache_manager._active_req_id is None
         assert runner.pipeline.live_cache_slot is None
 
-    def test_finished_req_ids_free_resident_slot_before_next_run(self, monkeypatch):
+    def test_finished_req_ids_free_resident_slot_before_next_run(self):
         runner = _make_cache_dit_runner()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
         req_a = _make_request("req-a", num_inference_steps=3)
         req_b = _make_request("req-b", num_inference_steps=3)
 
-        DiffusionModelRunner.execute_stepwise(runner, _make_new_scheduler_output(req_a, step_id=0))
+        DiffusionModelRunner.execute_stepwise(runner, _new_sched(req_a, step_id=0))
         slot_a = runner.state_cache["req-a"].cache_slot
 
         output = DiffusionModelRunner.execute_stepwise(
             runner,
-            _make_new_scheduler_output(req_b, step_id=1, finished_req_ids={"req-a"}),
+            _new_sched(req_b, step_id=1, finished_req_ids={"req-a"}),
         )
 
         assert output.req_id == "req-b"
@@ -1082,14 +1160,13 @@ class TestExecuteStepwiseCacheDiTCachePool:
         assert runner.cache_manager.driver.clear_history == [slot_a.payload["slot_id"]]
         assert runner.state_cache["req-b"].cache_slot.payload["trace"] == ["req-b:0"]
 
-    def test_denoise_none_path_cleans_up_cache_slot(self, monkeypatch):
+    def test_denoise_none_path_cleans_up_cache_slot(self):
         runner = _make_cache_dit_runner()
         runner.pipeline.none_req_ids.add("req-a")
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
         output = DiffusionModelRunner.execute_stepwise(
             runner,
-            _make_new_scheduler_output(_make_request("req-a", num_inference_steps=3), step_id=0),
+            _new_sched(_make_request("req-a", num_inference_steps=3), step_id=0),
         )
 
         assert output.req_id == "req-a"
@@ -1103,15 +1180,14 @@ class TestExecuteStepwiseCacheDiTCachePool:
         assert runner.cache_manager._active_req_id is None
         assert runner.pipeline.live_cache_slot is None
 
-    def test_pipeline_error_still_deactivates_active_slot(self, monkeypatch):
+    def test_pipeline_error_still_deactivates_active_slot(self):
         runner = _make_cache_dit_runner()
         runner.pipeline.fail_req_ids.add("req-a")
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
         with pytest.raises(RuntimeError, match="boom-req-a"):
             DiffusionModelRunner.execute_stepwise(
                 runner,
-                _make_new_scheduler_output(_make_request("req-a", num_inference_steps=3), step_id=0),
+                _new_sched(_make_request("req-a", num_inference_steps=3), step_id=0),
             )
 
         assert runner.cache_manager.driver.deactivate_history == [1]
@@ -1120,20 +1196,25 @@ class TestExecuteStepwiseCacheDiTCachePool:
         assert runner.state_cache == {}
         assert runner.input_batch is None
 
-
-    def test_stepwise_cache_backend_no_longer_requires_experiment_cachepool(self, monkeypatch):
+    def test_stepwise_cache_backend_no_longer_requires_experiment_cachepool(
+        self, monkeypatch
+    ):
         runner = _make_cache_dit_runner()
         monkeypatch.setattr(diffusion_experimental, "EXPERIMENT_CACHEPOOL", False)
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
         output = DiffusionModelRunner.execute_stepwise(
             runner,
-            _make_new_scheduler_output(_make_request("req-a", num_inference_steps=3), step_id=0),
+            _new_sched(_make_request("req-a", num_inference_steps=3), step_id=0),
         )
 
         assert output.req_id == "req-a"
         assert output.finished is False
         assert output.step_index == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests — CacheManager batch lifecycle
+# ---------------------------------------------------------------------------
 
 
 class TestCacheManagerBatchLifecycle:
@@ -1201,19 +1282,18 @@ class TestCacheManagerBatchLifecycle:
         assert manager._active_req_id is None
 
 
+# ---------------------------------------------------------------------------
+# Tests — CacheDiTStateDriver batch install
+# ---------------------------------------------------------------------------
+
+
 class TestCacheDiTStateDriverBatchInstall:
     def test_install_batch_slots_preserves_request_order_for_each_handle(self):
         driver, backend, _, managers = _make_cache_dit_driver()
         req_a = _make_cache_state("req-a", num_inference_steps=3, rows=2)
         req_b = _make_cache_state("req-b", num_inference_steps=5, rows=1)
 
-        for state in (req_a, req_b):
-            state.cache_slot = driver.create_empty_slot()
-            driver.initialize_fresh_slot(
-                state.cache_slot,
-                state.sampling.num_inference_steps,
-            )
-
+        _attach_fresh_slots(driver, (req_a, req_b))
         driver.install_batch_slots([req_a, req_b])
 
         manager_a, manager_b = managers
@@ -1235,13 +1315,7 @@ class TestCacheDiTStateDriverBatchInstall:
         req_a = _make_cache_state("req-a", num_inference_steps=3, rows=1)
         req_b = _make_cache_state("req-b", num_inference_steps=3, rows=1)
 
-        for state in (req_a, req_b):
-            state.cache_slot = driver.create_empty_slot()
-            driver.initialize_fresh_slot(
-                state.cache_slot,
-                state.sampling.num_inference_steps,
-            )
-
+        _attach_fresh_slots(driver, (req_a, req_b))
         driver.install_batch_slots([req_a, req_b])
         for manager in managers:
             manager._current_context = object()
@@ -1259,13 +1333,7 @@ class TestCacheDiTStateDriverBatchInstall:
         req_a = _make_cache_state("req-a", num_inference_steps=3, rows=1)
         req_b = _make_cache_state("req-b", num_inference_steps=5, rows=1)
 
-        for state in (req_a, req_b):
-            state.cache_slot = driver.create_empty_slot()
-            driver.initialize_fresh_slot(
-                state.cache_slot,
-                state.sampling.num_inference_steps,
-            )
-
+        _attach_fresh_slots(driver, (req_a, req_b))
         payload_a = CacheDiTStateDriver._get_payload(req_a.cache_slot)
         payload_b = CacheDiTStateDriver._get_payload(req_b.cache_slot)
 
@@ -1280,6 +1348,11 @@ class TestCacheDiTStateDriverBatchInstall:
 
         assert payload_a[0]["ctx_a"].config_steps == 3
         assert payload_b[0]["ctx_a"].config_steps == 5
+
+
+# ---------------------------------------------------------------------------
+# Tests — batched forward (numerical equivalence with a serial loop)
+# ---------------------------------------------------------------------------
 
 
 class TestCacheDiTBatchedForward:
@@ -1358,14 +1431,9 @@ class TestCacheDiTBatchedForward:
         encoder_hidden_states = torch.arange(6, dtype=torch.float32).reshape(3, 2) + 100
         base_contexts = []
         for idx in range(3):
-            context = _BatchCacheContext(
-                name=f"req-{idx}",
-                cache_decision=True,
-            )
+            context = _BatchCacheContext(name=f"req-{idx}", cache_decision=True)
             _seed_cached_buffers(
-                context,
-                hidden_shape=(1, 2),
-                encoder_shape=(1, 2),
+                context, hidden_shape=(1, 2), encoder_shape=(1, 2)
             )
             base_contexts.append({"ctx": context})
 
@@ -1403,13 +1471,7 @@ class TestCacheDiTBatchedForward:
     def test_forward_batched_base_partial_hit_and_independent_blockers(self):
         hidden_states = torch.arange(10, dtype=torch.float32).reshape(5, 2)
         base_contexts = [
-            {
-                "ctx": _BatchCacheContext(
-                    name="req-0",
-                    cache_decision=True,
-                    cache_residual=True,
-                )
-            },
+            {"ctx": _BatchCacheContext(name="req-0", cache_decision=True, cache_residual=True)},
             {
                 "ctx": _BatchCacheContext(
                     name="req-1",
@@ -1418,13 +1480,7 @@ class TestCacheDiTBatchedForward:
                     cache_residual=True,
                 )
             },
-            {
-                "ctx": _BatchCacheContext(
-                    name="req-2",
-                    cache_decision=True,
-                    cache_residual=True,
-                )
-            },
+            {"ctx": _BatchCacheContext(name="req-2", cache_decision=True, cache_residual=True)},
             {
                 "ctx": _BatchCacheContext(
                     name="req-3",
@@ -1455,18 +1511,13 @@ class TestCacheDiTBatchedForward:
         set_batch_contexts(batch_manager, batch_contexts, [1, 1, 1, 1, 1])
         try:
             batch_out = _forward_batched_base(
-                batch_pattern,
-                hidden_states.clone(),
-                None,
+                batch_pattern, hidden_states.clone(), None
             )
         finally:
             clear_batch_contexts(batch_manager)
 
         serial_out = _run_serial_base(
-            serial_pattern,
-            serial_contexts,
-            hidden_states.clone(),
-            None,
+            serial_pattern, serial_contexts, hidden_states.clone(), None
         )
 
         assert torch.allclose(batch_out[0], serial_out[0])
@@ -1492,13 +1543,17 @@ class TestCacheDiTBatchedForward:
                 super().__init__(context_manager)
                 self.mn_kwargs = None
 
-            def call_Mn_blocks(self, hidden_states, encoder_hidden_states, *args, **kwargs):
+            def call_Mn_blocks(
+                self, hidden_states, encoder_hidden_states, *args, **kwargs
+            ):
                 del args
                 self.mn_kwargs = {
                     key: value.clone() if isinstance(value, torch.Tensor) else value
                     for key, value in kwargs.items()
                 }
-                return super().call_Mn_blocks(hidden_states, encoder_hidden_states, **kwargs)
+                return super().call_Mn_blocks(
+                    hidden_states, encoder_hidden_states, **kwargs
+                )
 
         batch_contexts = _clone_batch_contexts(base_contexts)
         batch_manager = _BatchContextManager()
@@ -1545,7 +1600,9 @@ class TestCacheDiTBatchedForward:
         assert batch_pattern.mn_call_shapes == [(2, 2)]
         assert batch_pattern.mn_kwargs is not None
         assert torch.equal(batch_pattern.mn_kwargs["temb"], temb[doubled_compute_index])
-        assert torch.equal(batch_pattern.mn_kwargs["modulate_index"], modulate_index[compute_index])
+        assert torch.equal(
+            batch_pattern.mn_kwargs["modulate_index"], modulate_index[compute_index]
+        )
         assert torch.equal(
             batch_pattern.mn_kwargs["encoder_hidden_states_mask"],
             encoder_hidden_states_mask[compute_index],
@@ -1617,9 +1674,7 @@ class TestCacheDiTBatchedForward:
             )
             if can_cache:
                 _seed_cached_buffers(
-                    context,
-                    hidden_shape=(1, 2),
-                    encoder_shape=(1, 2),
+                    context, hidden_shape=(1, 2), encoder_shape=(1, 2)
                 )
             base_contexts.append({"ctx": context})
 
@@ -1632,17 +1687,12 @@ class TestCacheDiTBatchedForward:
 
         set_batch_contexts(batch_manager, batch_contexts, [1, 1, 1])
         try:
-            batch_out = _forward_batched_345(
-                batch_pattern,
-                hidden_states.clone(),
-            )
+            batch_out = _forward_batched_345(batch_pattern, hidden_states.clone())
         finally:
             clear_batch_contexts(batch_manager)
 
         serial_out = _run_serial_345(
-            serial_pattern,
-            serial_contexts,
-            hidden_states.clone(),
+            serial_pattern, serial_contexts, hidden_states.clone()
         )
 
         assert torch.allclose(batch_out[0], serial_out[0])
@@ -1652,22 +1702,30 @@ class TestCacheDiTBatchedForward:
         _assert_context_maps_match(batch_contexts, serial_contexts)
 
 
-class TestExecuteStepwiseCacheDiTBatching:
-    def test_runner_batches_two_requests_across_multiple_steps(self, monkeypatch):
-        runner = _make_batch_cache_dit_runner()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+# ---------------------------------------------------------------------------
+# Tests — Cache-DiT batched runner end-to-end
+# ---------------------------------------------------------------------------
 
+
+def _batch_sched(*, new_reqs=(), cached_req_ids=(), step_id: int = 0):
+    return _make_scheduler_output(
+        new_reqs=new_reqs, cached_req_ids=cached_req_ids, step_id=step_id
+    )
+
+
+class TestExecuteStepwiseCacheDiTBatching:
+    def test_runner_batches_two_requests_across_multiple_steps(self):
+        runner = _make_batch_cache_dit_runner()
         req_a = _make_request("req-a", num_inference_steps=3)
         req_b = _make_request("req-b", num_inference_steps=3)
+
         first = DiffusionModelRunner.execute_stepwise(
-            runner,
-            _make_batch_scheduler_output(new_reqs=[req_a, req_b], step_id=0),
+            runner, _batch_sched(new_reqs=[req_a, req_b], step_id=0)
         )
         slot_a = runner.state_cache["req-a"].cache_slot
         slot_b = runner.state_cache["req-b"].cache_slot
         second = DiffusionModelRunner.execute_stepwise(
-            runner,
-            _make_batch_scheduler_output(cached_req_ids=["req-a", "req-b"], step_id=1),
+            runner, _batch_sched(cached_req_ids=["req-a", "req-b"], step_id=1)
         )
 
         assert first.req_id == ["req-a", "req-b"]
@@ -1679,8 +1737,7 @@ class TestExecuteStepwiseCacheDiTBatching:
         assert slot_b.payload["history"] == [("req-b", 0), ("req-b", 1)]
 
         third = DiffusionModelRunner.execute_stepwise(
-            runner,
-            _make_batch_scheduler_output(cached_req_ids=["req-a", "req-b"], step_id=2),
+            runner, _batch_sched(cached_req_ids=["req-a", "req-b"], step_id=2)
         )
 
         assert third.step_index == [3, 3]
@@ -1713,17 +1770,14 @@ class TestExecuteStepwiseCacheDiTBatching:
         ]
         assert runner.cache_manager.driver.deactivate_batch_calls == 3
 
-    def test_runner_allows_mixed_cache_decisions_in_same_step(self, monkeypatch):
+    def test_runner_allows_mixed_cache_decisions_in_same_step(self):
         runner = _make_batch_cache_dit_runner()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-
         req_a = _make_request("req-a", num_inference_steps=3)
         req_b = _make_request("req-b", num_inference_steps=3)
         req_b.sampling_params.cache_plan = (0, 1)
 
         output = DiffusionModelRunner.execute_stepwise(
-            runner,
-            _make_batch_scheduler_output(new_reqs=[req_a, req_b], step_id=0),
+            runner, _batch_sched(new_reqs=[req_a, req_b], step_id=0)
         )
 
         assert output.req_id == ["req-a", "req-b"]
@@ -1738,29 +1792,24 @@ class TestExecuteStepwiseCacheDiTBatching:
             )
         ]
 
-    def test_runner_handles_dynamic_row_layout_when_request_finishes(self, monkeypatch):
+    def test_runner_handles_dynamic_row_layout_when_request_finishes(self):
         runner = _make_batch_cache_dit_runner()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-
         req_a = _make_request("req-a", num_inference_steps=2)
         req_b = _make_request("req-b", num_inference_steps=3)
         req_c = _make_request("req-c", num_inference_steps=2)
 
         first = DiffusionModelRunner.execute_stepwise(
-            runner,
-            _make_batch_scheduler_output(new_reqs=[req_a, req_b], step_id=0),
+            runner, _batch_sched(new_reqs=[req_a, req_b], step_id=0)
         )
         second = DiffusionModelRunner.execute_stepwise(
-            runner,
-            _make_batch_scheduler_output(cached_req_ids=["req-a", "req-b"], step_id=1),
+            runner, _batch_sched(cached_req_ids=["req-a", "req-b"], step_id=1)
         )
         third = DiffusionModelRunner.execute_stepwise(
             runner,
-            _make_batch_scheduler_output(new_reqs=[req_c], cached_req_ids=["req-b"], step_id=2),
+            _batch_sched(new_reqs=[req_c], cached_req_ids=["req-b"], step_id=2),
         )
         fourth = DiffusionModelRunner.execute_stepwise(
-            runner,
-            _make_batch_scheduler_output(cached_req_ids=["req-c"], step_id=3),
+            runner, _batch_sched(cached_req_ids=["req-c"], step_id=3)
         )
 
         assert first.finished == [False, False]
@@ -1800,18 +1849,14 @@ class TestExecuteStepwiseCacheDiTBatching:
         assert runner.pipeline.decode_calls == ["req-a", "req-b", "req-c"]
         assert runner.state_cache == {}
 
-    def test_single_request_path_remains_non_batch(self, monkeypatch):
+    def test_single_request_path_remains_non_batch(self):
         runner = _make_batch_cache_dit_runner()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-
         req = _make_request("req-a", num_inference_steps=2)
         first = DiffusionModelRunner.execute_stepwise(
-            runner,
-            _make_batch_scheduler_output(new_reqs=[req], step_id=0),
+            runner, _batch_sched(new_reqs=[req], step_id=0)
         )
         second = DiffusionModelRunner.execute_stepwise(
-            runner,
-            _make_batch_scheduler_output(cached_req_ids=["req-a"], step_id=1),
+            runner, _batch_sched(cached_req_ids=["req-a"], step_id=1)
         )
 
         assert first.req_id == "req-a"
@@ -1837,18 +1882,21 @@ class TestExecuteStepwiseCacheDiTBatching:
         ]
 
 
-class TestExecuteStepwiseTeaCachePool:
-    def test_teacache_switching_restores_hook_state(self, monkeypatch):
-        runner = _make_teacache_runner()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+# ---------------------------------------------------------------------------
+# Tests — TeaCache stepwise
+# ---------------------------------------------------------------------------
 
+
+class TestExecuteStepwiseTeaCachePool:
+    def test_teacache_switching_restores_hook_state(self):
+        runner = _make_teacache_runner()
         req_a = _make_request("req-a", num_inference_steps=3)
         req_b = _make_request("req-b", num_inference_steps=3)
 
-        first = DiffusionModelRunner.execute_stepwise(runner, _make_new_scheduler_output(req_a, step_id=0))
+        first = DiffusionModelRunner.execute_stepwise(runner, _new_sched(req_a, step_id=0))
         slot_a = runner.state_cache["req-a"].cache_slot
-        second = DiffusionModelRunner.execute_stepwise(runner, _make_new_scheduler_output(req_b, step_id=1))
-        third = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output("req-a", step_id=2))
+        second = DiffusionModelRunner.execute_stepwise(runner, _new_sched(req_b, step_id=1))
+        third = DiffusionModelRunner.execute_stepwise(runner, _cached_sched("req-a", step_id=2))
 
         assert first.finished is False
         assert second.finished is False
@@ -1861,9 +1909,16 @@ class TestExecuteStepwiseTeaCachePool:
         assert payload_a["states"]["teacache_positive"].cnt == 2
         assert payload_a["states"]["teacache_negative"].cnt == 2
         assert runner.state_cache["req-b"].cache_slot.payload["forward_cnt"] == 1
-        assert runner.state_cache["req-b"].cache_slot.payload["states"]["teacache_positive"].cnt == 1
+        assert (
+            runner.state_cache["req-b"].cache_slot.payload["states"]["teacache_positive"].cnt
+            == 1
+        )
 
-        req_a_snapshots = [snapshot for snapshot in runner.pipeline.snapshots if snapshot.req_id == "req-a"]
+        req_a_snapshots = [
+            snapshot
+            for snapshot in runner.pipeline.snapshots
+            if snapshot.req_id == "req-a"
+        ]
         assert [snapshot.positive_cnt_before for snapshot in req_a_snapshots] == [0, 1]
         assert [snapshot.forward_cnt_before for snapshot in req_a_snapshots] == [0, 1]
         assert req_a_snapshots[1].residual_sum_before == pytest.approx(20.0)
@@ -1871,19 +1926,17 @@ class TestExecuteStepwiseTeaCachePool:
         assert runner.pipeline.hook.state_manager._states == {}
         assert runner.cache_manager._active_req_id is None
 
-    def test_runner_interleaves_two_teacache_requests_end_to_end(self, monkeypatch):
+    def test_runner_interleaves_two_teacache_requests_end_to_end(self):
         runner = _make_teacache_runner()
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-
         req_a = _make_request("req-a", num_inference_steps=2)
         req_b = _make_request("req-b", num_inference_steps=2)
 
-        first = DiffusionModelRunner.execute_stepwise(runner, _make_new_scheduler_output(req_a, step_id=0))
+        first = DiffusionModelRunner.execute_stepwise(runner, _new_sched(req_a, step_id=0))
         slot_a = runner.state_cache["req-a"].cache_slot
-        second = DiffusionModelRunner.execute_stepwise(runner, _make_new_scheduler_output(req_b, step_id=1))
+        second = DiffusionModelRunner.execute_stepwise(runner, _new_sched(req_b, step_id=1))
         slot_b = runner.state_cache["req-b"].cache_slot
-        third = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output("req-a", step_id=2))
-        fourth = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output("req-b", step_id=3))
+        third = DiffusionModelRunner.execute_stepwise(runner, _cached_sched("req-a", step_id=2))
+        fourth = DiffusionModelRunner.execute_stepwise(runner, _cached_sched("req-b", step_id=3))
 
         assert first.finished is False
         assert second.finished is False

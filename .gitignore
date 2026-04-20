@@ -231,7 +231,7 @@ outputs/
 results/
 generated/
 output_*/
-
+*_output*/
 # Configuration overrides
 configs/local.yaml
 configs/production.yaml
