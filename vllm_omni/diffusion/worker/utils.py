@@ -16,6 +16,15 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class CacheBackendSlot:
+    """Backend-owned resident cache state for one diffusion request."""
+
+    backend_name: str
+    resident_bytes: int = 0
+    payload: Any = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+@dataclass
 class DiffusionRequestState:
     """Per-request mutable state across all pipeline stages.
 
@@ -71,6 +80,7 @@ class DiffusionRequestState:
     # become part of the shared step-execution contract.
     # For example: Wan condition tensors / masks, or Bagel KV contexts.
     extra: dict[str, Any] = field(default_factory=dict)
+    cache_slot: CacheBackendSlot | None = None
 
     # ── Properties ──
 
@@ -153,6 +163,26 @@ class BatchRunnerOutput(BaseRunnerOutput):
     @property
     def req_ids(self) -> list[str]:
         return list(self._id_to_idx.keys())
+
+    @staticmethod
+    def _single_or_list(values: list[Any]) -> Any:
+        return values[0] if len(values) == 1 else values
+
+    @property
+    def req_id(self) -> str | list[str]:
+        return self._single_or_list([out.req_id for out in self.runner_outputs])
+
+    @property
+    def step_index(self) -> int | None | list[int | None]:
+        return self._single_or_list([out.step_index for out in self.runner_outputs])
+
+    @property
+    def finished(self) -> bool | list[bool]:
+        return self._single_or_list([out.finished for out in self.runner_outputs])
+
+    @property
+    def result(self) -> DiffusionOutput | None | list[DiffusionOutput | None]:
+        return self._single_or_list([out.result for out in self.runner_outputs])
 
     def __len__(self) -> int:
         return len(self.runner_outputs)
