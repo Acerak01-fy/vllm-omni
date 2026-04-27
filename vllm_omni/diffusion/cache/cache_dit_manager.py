@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Backend-generic resident cache lifecycle management for stepwise diffusion."""
+"""Request-local cache pool lifecycle management for stepwise diffusion."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from typing import Any
 from vllm_omni.diffusion.worker.utils import CacheBackendSlot, DiffusionRequestState
 
 
-class CacheStateDriver(ABC):
-    """Backend-specific adapter for request-local resident cache state."""
+class CacheDiTStateDriverBase(ABC):
+    """Backend-specific adapter used by ``CacheDiTManager``."""
 
     @property
     @abstractmethod
@@ -47,18 +47,17 @@ class CacheStateDriver(ABC):
         """Estimate resident bytes currently owned by the slot."""
 
 
-class CacheManager:
-    """Runner-facing lifecycle manager for backend resident cache state.
+class CacheDiTManager:
+    """Runner-facing lifecycle manager for request-local cache slots.
 
     ``activate`` / ``deactivate`` accept either a single
     ``DiffusionRequestState`` or a list.  When a list with more than one
     element is passed, the driver's batch-mode API
-    (``install_batch_slots`` / ``deactivate_batch_slots``) is used so that
-    cache-dit can run a single forward pass over the whole batch while
-    keeping per-request cache decisions.
+    (``install_batch_slots`` / ``deactivate_batch_slots``) is used so the
+    backend can keep per-request cache state during one batched forward pass.
     """
 
-    def __init__(self, driver: CacheStateDriver):
+    def __init__(self, driver: CacheDiTStateDriverBase):
         self.driver = driver
         # Single-request tracking (used when activate receives one state).
         self._active_req_id: str | None = None
@@ -219,7 +218,7 @@ class CacheManager:
         sampling = state.sampling
         timesteps = getattr(sampling, "timesteps", None)
         if timesteps is not None:
-            return CacheManager._sequence_length(timesteps)
+            return CacheDiTManager._sequence_length(timesteps)
 
         sigmas = getattr(sampling, "sigmas", None)
         if sigmas is not None:
