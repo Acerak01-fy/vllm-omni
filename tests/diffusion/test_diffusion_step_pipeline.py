@@ -376,6 +376,7 @@ class TestRunner:
         assert first.finished is False
         assert first.result is None
         assert "req-1" in runner.state_cache
+        assert runner.input_batch is not None
 
         result = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
         second = result.get_req_output("req-1")
@@ -386,6 +387,7 @@ class TestRunner:
         assert second.result.error is None
         assert torch.equal(second.result.output, torch.tensor([2.0]))
         assert "req-1" not in runner.state_cache
+        assert runner.input_batch is None
 
         assert runner.pipeline.prepare_calls == 1
         assert runner.pipeline.denoise_calls == 2
@@ -433,6 +435,7 @@ class TestRunner:
         assert output.result is not None
         assert output.result.error == "stepwise denoise interrupted"
         assert "req-1" not in runner.state_cache
+        assert runner.input_batch is None
         assert runner.pipeline.prepare_calls == 1
         assert runner.pipeline.denoise_calls == 1
         assert runner.pipeline.scheduler_calls == 0

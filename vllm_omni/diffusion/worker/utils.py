@@ -164,26 +164,6 @@ class BatchRunnerOutput(BaseRunnerOutput):
     def req_ids(self) -> list[str]:
         return list(self._id_to_idx.keys())
 
-    @staticmethod
-    def _single_or_list(values: list[Any]) -> Any:
-        return values[0] if len(values) == 1 else values
-
-    @property
-    def req_id(self) -> str | list[str]:
-        return self._single_or_list([out.req_id for out in self.runner_outputs])
-
-    @property
-    def step_index(self) -> int | None | list[int | None]:
-        return self._single_or_list([out.step_index for out in self.runner_outputs])
-
-    @property
-    def finished(self) -> bool | list[bool]:
-        return self._single_or_list([out.finished for out in self.runner_outputs])
-
-    @property
-    def result(self) -> DiffusionOutput | None | list[DiffusionOutput | None]:
-        return self._single_or_list([out.result for out in self.runner_outputs])
-
     def __len__(self) -> int:
         return len(self.runner_outputs)
 

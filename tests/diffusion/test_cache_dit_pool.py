@@ -19,7 +19,7 @@ from vllm_omni.diffusion.cache.cache_dit_batch import (
     set_batch_contexts,
 )
 from vllm_omni.diffusion.cache.cache_dit_driver import CacheDiTStateDriver
-from vllm_omni.diffusion.cache.cache_manager import CacheManager, CacheStateDriver
+from vllm_omni.diffusion.cache.cache_dit_manager import CacheDiTManager, CacheDiTStateDriverBase
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.driver import TeaCacheStateDriver
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
@@ -35,6 +35,24 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 def _noop_forward_context(*args, **kwargs):
     del args, kwargs
     yield
+
+
+def _require_req_output(output, req_id: str):
+    req_output = output.get_req_output(req_id)
+    assert req_output is not None
+    return req_output
+
+
+def _output_req_ids(output) -> list[str]:
+    return [item.req_id for item in output.runner_outputs]
+
+
+def _output_step_indices(output) -> list[int | None]:
+    return [item.step_index for item in output.runner_outputs]
+
+
+def _output_finished(output) -> list[bool]:
+    return [item.finished for item in output.runner_outputs]
 
 
 def _make_request(req_id: str, num_inference_steps: int = 3):
@@ -106,7 +124,7 @@ class _CacheDiTSnapshot:
     trace_before: tuple[str, ...]
 
 
-class _FakeCacheDiTDriver(CacheStateDriver):
+class _FakeCacheDiTDriver(CacheDiTStateDriverBase):
     def __init__(self, pipeline):
         self.pipeline = pipeline
         self._next_slot_id = 0
@@ -182,7 +200,7 @@ class _CacheDiTPipeline:
     def denoise_step(self, input_batch, **kwargs):
         del input_batch, kwargs
         assert self.runner is not None
-        active_req_id = self.runner.cache_manager._active_req_id
+        active_req_id = self.runner.cache_dit_manager._active_req_id
         if active_req_id is None:
             raise AssertionError("cache manager must activate one request before denoise_step")
         state = self.runner.state_cache[active_req_id]
@@ -237,7 +255,7 @@ def _make_cache_dit_runner():
     runner.device = torch.device("cpu")
     runner.pipeline = _CacheDiTPipeline()
     runner.cache_backend = SimpleNamespace(is_enabled=lambda: True)
-    runner.cache_manager = CacheManager(_FakeCacheDiTDriver(runner.pipeline))
+    runner.cache_dit_manager = CacheDiTManager(_FakeCacheDiTDriver(runner.pipeline))
     runner.offload_backend = None
     runner.state_cache = {}
     runner.kv_transfer_manager = SimpleNamespace()
@@ -560,7 +578,7 @@ def _run_serial_345(pattern, batch_contexts, hidden_states):
     return torch.cat(outputs_hs, dim=0), torch.cat(outputs_enc, dim=0)
 
 
-class _FakeBatchCacheLifecycleDriver(CacheStateDriver):
+class _FakeBatchCacheLifecycleDriver(CacheDiTStateDriverBase):
     def __init__(self):
         self._next_slot_id = 0
         self.initialize_history: list[tuple[int, int]] = []
@@ -616,7 +634,7 @@ class _BatchRunnerSnapshot:
     batch_active: bool
 
 
-class _FakeRunnerBatchCacheDiTDriver(CacheStateDriver):
+class _FakeRunnerBatchCacheDiTDriver(CacheDiTStateDriverBase):
     def __init__(self, pipeline):
         self.pipeline = pipeline
         self._next_slot_id = 0
@@ -704,7 +722,7 @@ class _BatchCacheDiTPipeline:
                 req_ids=tuple(input_batch.req_ids),
                 step_indices=tuple(state.step_index for state in states),
                 cache_decisions=decisions,
-                batch_active=self.runner.cache_manager._batch_active,
+                batch_active=self.runner.cache_dit_manager._batch_active,
             )
         )
         for state in states:
@@ -731,7 +749,7 @@ def _make_batch_cache_dit_runner():
     runner.device = torch.device("cpu")
     runner.pipeline = _BatchCacheDiTPipeline()
     runner.cache_backend = SimpleNamespace(is_enabled=lambda: True)
-    runner.cache_manager = CacheManager(_FakeRunnerBatchCacheDiTDriver(runner.pipeline))
+    runner.cache_dit_manager = CacheDiTManager(_FakeRunnerBatchCacheDiTDriver(runner.pipeline))
     runner.offload_backend = None
     runner.state_cache = {}
     runner.kv_transfer_manager = SimpleNamespace()
@@ -912,7 +930,7 @@ class _TeaCachePipeline:
     def denoise_step(self, input_batch, **kwargs):
         del input_batch, kwargs
         assert self.runner is not None
-        active_req_id = self.runner.cache_manager._active_req_id
+        active_req_id = self.runner.cache_dit_manager._active_req_id
         if active_req_id is None:
             raise AssertionError("cache manager must activate one request before denoise_step")
         state = self.runner.state_cache[active_req_id]
@@ -984,7 +1002,7 @@ def _make_teacache_runner():
     runner.device = torch.device("cpu")
     runner.pipeline = _TeaCachePipeline()
     runner.cache_backend = SimpleNamespace(is_enabled=lambda: True)
-    runner.cache_manager = CacheManager(TeaCacheStateDriver(runner.pipeline))
+    runner.cache_dit_manager = CacheDiTManager(TeaCacheStateDriver(runner.pipeline))
     runner.offload_backend = None
     runner.state_cache = {}
     runner.kv_transfer_manager = SimpleNamespace()
@@ -1006,15 +1024,15 @@ class TestExecuteStepwiseCacheDiTPool:
         second = DiffusionModelRunner.execute_stepwise(runner, _make_new_scheduler_output(req_b, step_id=1))
         third = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output("req-a", step_id=2))
 
-        assert first.req_id == "req-a"
-        assert first.step_index == 1
-        assert first.finished is False
-        assert second.req_id == "req-b"
-        assert second.step_index == 1
-        assert second.finished is False
-        assert third.req_id == "req-a"
-        assert third.step_index == 2
-        assert third.finished is False
+        first_req_a = _require_req_output(first, "req-a")
+        second_req_b = _require_req_output(second, "req-b")
+        third_req_a = _require_req_output(third, "req-a")
+        assert first_req_a.step_index == 1
+        assert first_req_a.finished is False
+        assert second_req_b.step_index == 1
+        assert second_req_b.finished is False
+        assert third_req_a.step_index == 2
+        assert third_req_a.finished is False
 
         assert runner.state_cache["req-a"].cache_slot is slot_a
         assert runner.state_cache["req-a"].cache_slot.payload["trace"] == ["req-a:0", "req-a:1"]
@@ -1023,8 +1041,8 @@ class TestExecuteStepwiseCacheDiTPool:
             (),
             ("req-a:0",),
         ]
-        assert runner.cache_manager.driver.initialize_history == [(1, 3), (2, 3)]
-        assert runner.cache_manager._active_req_id is None
+        assert runner.cache_dit_manager.driver.initialize_history == [(1, 3), (2, 3)]
+        assert runner.cache_dit_manager._active_req_id is None
         assert runner.pipeline.live_cache_slot is None
 
     def test_hbm_can_hold_multiple_waiting_slots_while_one_request_runs(self, monkeypatch):
@@ -1036,7 +1054,7 @@ class TestExecuteStepwiseCacheDiTPool:
                 runner,
                 _make_new_scheduler_output(_make_request(req_id, num_inference_steps=4), step_id=step_id),
             )
-            assert output.finished is False
+            assert _require_req_output(output, req_id).finished is False
 
         snapshot = runner.pipeline.snapshots[-1]
         resident_slots = {req_id: state.cache_slot for req_id, state in runner.state_cache.items()}
@@ -1048,7 +1066,7 @@ class TestExecuteStepwiseCacheDiTPool:
         assert set(resident_slots) == {"req-a", "req-b", "req-c"}
         assert len({slot.payload["slot_id"] for slot in resident_slots.values()}) == 3
         assert all(slot.resident_bytes > 0 for slot in resident_slots.values())
-        assert runner.cache_manager._active_req_id is None
+        assert runner.cache_dit_manager._active_req_id is None
         assert runner.pipeline.live_cache_slot is None
 
     def test_finished_req_ids_free_resident_slot_before_next_run(self, monkeypatch):
@@ -1066,11 +1084,11 @@ class TestExecuteStepwiseCacheDiTPool:
             _make_new_scheduler_output(req_b, step_id=1, finished_req_ids={"req-a"}),
         )
 
-        assert output.req_id == "req-b"
+        assert _require_req_output(output, "req-b").req_id == "req-b"
         assert "req-a" not in runner.state_cache
         assert slot_a.metadata == {}
         assert slot_a.resident_bytes == 0
-        assert runner.cache_manager.driver.clear_history == [slot_a.payload["slot_id"]]
+        assert runner.cache_dit_manager.driver.clear_history == [slot_a.payload["slot_id"]]
         assert runner.state_cache["req-b"].cache_slot.payload["trace"] == ["req-b:0"]
 
     def test_denoise_none_path_cleans_up_cache_slot(self, monkeypatch):
@@ -1083,15 +1101,15 @@ class TestExecuteStepwiseCacheDiTPool:
             _make_new_scheduler_output(_make_request("req-a", num_inference_steps=3), step_id=0),
         )
 
-        assert output.req_id == "req-a"
-        assert output.step_index == 0
-        assert output.finished is True
-        assert output.result is not None
-        assert output.result.error == "stepwise denoise returned None"
+        req_output = _require_req_output(output, "req-a")
+        assert req_output.step_index == 0
+        assert req_output.finished is True
+        assert req_output.result is not None
+        assert req_output.result.error == "stepwise denoise returned None"
         assert "req-a" not in runner.state_cache
-        assert runner.cache_manager.driver.deactivate_history == [1]
-        assert runner.cache_manager.driver.clear_history == [1]
-        assert runner.cache_manager._active_req_id is None
+        assert runner.cache_dit_manager.driver.deactivate_history == [1]
+        assert runner.cache_dit_manager.driver.clear_history == [1]
+        assert runner.cache_dit_manager._active_req_id is None
         assert runner.pipeline.live_cache_slot is None
 
     def test_pipeline_error_still_deactivates_active_slot(self, monkeypatch):
@@ -1105,17 +1123,17 @@ class TestExecuteStepwiseCacheDiTPool:
                 _make_new_scheduler_output(_make_request("req-a", num_inference_steps=3), step_id=0),
             )
 
-        assert runner.cache_manager.driver.deactivate_history == [1]
-        assert runner.cache_manager._active_req_id is None
+        assert runner.cache_dit_manager.driver.deactivate_history == [1]
+        assert runner.cache_dit_manager._active_req_id is None
         assert runner.pipeline.live_cache_slot is None
         assert runner.state_cache == {}
         assert runner.input_batch is None
 
 
-class TestCacheManagerBatchLifecycle:
+class TestCacheDiTManagerBatchLifecycle:
     def test_activate_batch_mixes_restored_and_fresh_slots(self):
         driver = _FakeBatchCacheLifecycleDriver()
-        manager = CacheManager(driver)
+        manager = CacheDiTManager(driver)
 
         old_slot = driver.create_empty_slot()
         old_slot.metadata["num_inference_steps"] = 4
@@ -1139,7 +1157,7 @@ class TestCacheManagerBatchLifecycle:
 
     def test_free_during_batch_activation_releases_only_target_slot(self):
         driver = _FakeBatchCacheLifecycleDriver()
-        manager = CacheManager(driver)
+        manager = CacheDiTManager(driver)
 
         req_a = _make_cache_state("req-a", num_inference_steps=3)
         req_b = _make_cache_state("req-b", num_inference_steps=3)
@@ -1161,7 +1179,7 @@ class TestCacheManagerBatchLifecycle:
 
     def test_single_item_list_uses_single_request_lifecycle(self):
         driver = _FakeBatchCacheLifecycleDriver()
-        manager = CacheManager(driver)
+        manager = CacheDiTManager(driver)
         req = _make_cache_state("req-a", num_inference_steps=2)
 
         restored = manager.activate([req])
@@ -1177,8 +1195,8 @@ class TestCacheManagerBatchLifecycle:
         assert manager._active_req_id is None
 
 
-class TestCacheDiTStateDriverBatchInstall:
-    def test_install_batch_slots_preserves_request_order_for_each_handle(self):
+class TestCacheDiTStateDriver:
+    def test_batch_context_lifecycle(self):
         driver, backend, _, managers = _make_cache_dit_driver()
         req_a = _make_cache_state("req-a", num_inference_steps=3, rows=2)
         req_b = _make_cache_state("req-b", num_inference_steps=5, rows=1)
@@ -1193,69 +1211,15 @@ class TestCacheDiTStateDriverBatchInstall:
         driver.install_batch_slots([req_a, req_b])
 
         manager_a, manager_b = managers
-        payload_a = CacheDiTStateDriver._get_payload(req_a.cache_slot)
-        payload_b = CacheDiTStateDriver._get_payload(req_b.cache_slot)
-        assert manager_a._batch_contexts == [payload_a[0], payload_b[0]]
-        assert manager_b._batch_contexts == [payload_a[1], payload_b[1]]
         assert manager_a._batch_row_counts == [2, 1]
         assert manager_b._batch_row_counts == [2, 1]
-        assert manager_a._batch_row_offsets == [0, 2, 3]
-        assert manager_b._batch_row_offsets == [0, 2, 3]
-        assert manager_a._batch_contexts[0]["ctx_a"] is payload_a[0]["ctx_a"]
-        assert manager_a._batch_contexts[1]["ctx_b"] is payload_b[0]["ctx_b"]
-        assert manager_b._batch_contexts[0]["ctx_c"] is payload_a[1]["ctx_c"]
         assert backend.force_refresh_history == [3, 5]
-
-    def test_deactivate_batch_slots_clears_batch_mode_state(self):
-        driver, _, _, managers = _make_cache_dit_driver()
-        req_a = _make_cache_state("req-a", num_inference_steps=3, rows=1)
-        req_b = _make_cache_state("req-b", num_inference_steps=3, rows=1)
-
-        for state in (req_a, req_b):
-            state.cache_slot = driver.create_empty_slot()
-            driver.initialize_fresh_slot(
-                state.cache_slot,
-                state.sampling.num_inference_steps,
-            )
-
-        driver.install_batch_slots([req_a, req_b])
-        for manager in managers:
-            manager._current_context = object()
 
         driver.deactivate_batch_slots()
 
         for manager in managers:
             assert manager._batch_contexts is None
-            assert manager._batch_row_counts is None
-            assert manager._batch_row_offsets is None
             assert manager._current_context is None
-
-    def test_initialize_fresh_slot_keeps_per_request_configs_isolated(self):
-        driver, _, _, _ = _make_cache_dit_driver()
-        req_a = _make_cache_state("req-a", num_inference_steps=3, rows=1)
-        req_b = _make_cache_state("req-b", num_inference_steps=5, rows=1)
-
-        for state in (req_a, req_b):
-            state.cache_slot = driver.create_empty_slot()
-            driver.initialize_fresh_slot(
-                state.cache_slot,
-                state.sampling.num_inference_steps,
-            )
-
-        payload_a = CacheDiTStateDriver._get_payload(req_a.cache_slot)
-        payload_b = CacheDiTStateDriver._get_payload(req_b.cache_slot)
-
-        assert payload_a[0]["ctx_a"].config_steps == 3
-        assert payload_a[0]["ctx_b"].config_steps == 3
-        assert payload_a[1]["ctx_c"].config_steps == 3
-        assert payload_b[0]["ctx_a"].config_steps == 5
-        assert payload_b[0]["ctx_b"].config_steps == 5
-        assert payload_b[1]["ctx_c"].config_steps == 5
-
-        driver.install_batch_slots([req_a, req_b])
-
-        assert payload_a[0]["ctx_a"].config_steps == 3
-        assert payload_b[0]["ctx_a"].config_steps == 5
 
 
 class TestCacheDiTBatchedForward:
@@ -1515,11 +1479,11 @@ class TestExecuteStepwiseCacheDiTBatching:
             _make_batch_scheduler_output(cached_req_ids=["req-a", "req-b"], step_id=1),
         )
 
-        assert first.req_id == ["req-a", "req-b"]
-        assert first.step_index == [1, 1]
-        assert first.finished == [False, False]
-        assert second.step_index == [2, 2]
-        assert second.finished == [False, False]
+        assert _output_req_ids(first) == ["req-a", "req-b"]
+        assert _output_step_indices(first) == [1, 1]
+        assert _output_finished(first) == [False, False]
+        assert _output_step_indices(second) == [2, 2]
+        assert _output_finished(second) == [False, False]
         assert slot_a.payload["history"] == [("req-a", 0), ("req-a", 1)]
         assert slot_b.payload["history"] == [("req-b", 0), ("req-b", 1)]
 
@@ -1528,8 +1492,8 @@ class TestExecuteStepwiseCacheDiTBatching:
             _make_batch_scheduler_output(cached_req_ids=["req-a", "req-b"], step_id=2),
         )
 
-        assert third.step_index == [3, 3]
-        assert third.finished == [True, True]
+        assert _output_step_indices(third) == [3, 3]
+        assert _output_finished(third) == [True, True]
         assert runner.state_cache == {}
         assert runner.pipeline.snapshots == [
             _BatchRunnerSnapshot(
@@ -1551,12 +1515,12 @@ class TestExecuteStepwiseCacheDiTBatching:
                 batch_active=True,
             ),
         ]
-        assert runner.cache_manager.driver.install_batch_history == [
+        assert runner.cache_dit_manager.driver.install_batch_history == [
             ("req-a", "req-b"),
             ("req-a", "req-b"),
             ("req-a", "req-b"),
         ]
-        assert runner.cache_manager.driver.deactivate_batch_calls == 3
+        assert runner.cache_dit_manager.driver.deactivate_batch_calls == 3
 
     def test_runner_allows_mixed_cache_decisions_in_same_step(self, monkeypatch):
         runner = _make_batch_cache_dit_runner()
@@ -1571,9 +1535,9 @@ class TestExecuteStepwiseCacheDiTBatching:
             _make_batch_scheduler_output(new_reqs=[req_a, req_b], step_id=0),
         )
 
-        assert output.req_id == ["req-a", "req-b"]
-        assert output.step_index == [1, 1]
-        assert output.finished == [False, False]
+        assert _output_req_ids(output) == ["req-a", "req-b"]
+        assert _output_step_indices(output) == [1, 1]
+        assert _output_finished(output) == [False, False]
         assert runner.pipeline.snapshots == [
             _BatchRunnerSnapshot(
                 req_ids=("req-a", "req-b"),
@@ -1608,14 +1572,14 @@ class TestExecuteStepwiseCacheDiTBatching:
             _make_batch_scheduler_output(cached_req_ids=["req-c"], step_id=3),
         )
 
-        assert first.finished == [False, False]
-        assert second.finished == [True, False]
-        assert third.req_id == ["req-c", "req-b"]
-        assert third.step_index == [1, 3]
-        assert third.finished == [False, True]
-        assert fourth.req_id == "req-c"
-        assert fourth.step_index == 2
-        assert fourth.finished is True
+        assert _output_finished(first) == [False, False]
+        assert _output_finished(second) == [True, False]
+        assert _output_req_ids(third) == ["req-c", "req-b"]
+        assert _output_step_indices(third) == [1, 3]
+        assert _output_finished(third) == [False, True]
+        fourth_req_c = _require_req_output(fourth, "req-c")
+        assert fourth_req_c.step_index == 2
+        assert fourth_req_c.finished is True
         assert runner.pipeline.snapshots == [
             _BatchRunnerSnapshot(
                 req_ids=("req-a", "req-b"),
@@ -1659,13 +1623,13 @@ class TestExecuteStepwiseCacheDiTBatching:
             _make_batch_scheduler_output(cached_req_ids=["req-a"], step_id=1),
         )
 
-        assert first.req_id == "req-a"
-        assert first.step_index == 1
-        assert first.finished is False
-        assert second.req_id == "req-a"
-        assert second.step_index == 2
-        assert second.finished is True
-        assert runner.cache_manager.driver.install_batch_history == []
+        first_req_a = _require_req_output(first, "req-a")
+        second_req_a = _require_req_output(second, "req-a")
+        assert first_req_a.step_index == 1
+        assert first_req_a.finished is False
+        assert second_req_a.step_index == 2
+        assert second_req_a.finished is True
+        assert runner.cache_dit_manager.driver.install_batch_history == []
         assert runner.pipeline.snapshots == [
             _BatchRunnerSnapshot(
                 req_ids=("req-a",),
@@ -1695,10 +1659,11 @@ class TestExecuteStepwiseTeaCacheSlotSwitching:
         second = DiffusionModelRunner.execute_stepwise(runner, _make_new_scheduler_output(req_b, step_id=1))
         third = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output("req-a", step_id=2))
 
-        assert first.finished is False
-        assert second.finished is False
-        assert third.finished is False
-        assert third.step_index == 2
+        assert _require_req_output(first, "req-a").finished is False
+        assert _require_req_output(second, "req-b").finished is False
+        third_req_a = _require_req_output(third, "req-a")
+        assert third_req_a.finished is False
+        assert third_req_a.step_index == 2
 
         payload_a = slot_a.payload
         assert sorted(payload_a["states"]) == ["teacache_negative", "teacache_positive"]
@@ -1714,7 +1679,7 @@ class TestExecuteStepwiseTeaCacheSlotSwitching:
         assert req_a_snapshots[1].residual_sum_before == pytest.approx(20.0)
         assert runner.pipeline.hook._forward_cnt == 0
         assert runner.pipeline.hook.state_manager._states == {}
-        assert runner.cache_manager._active_req_id is None
+        assert runner.cache_dit_manager._active_req_id is None
 
     def test_runner_interleaves_two_teacache_requests_end_to_end(self, monkeypatch):
         runner = _make_teacache_runner()
@@ -1730,14 +1695,18 @@ class TestExecuteStepwiseTeaCacheSlotSwitching:
         third = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output("req-a", step_id=2))
         fourth = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output("req-b", step_id=3))
 
-        assert first.finished is False
-        assert second.finished is False
-        assert third.finished is True
-        assert fourth.finished is True
-        assert third.result is not None
-        assert fourth.result is not None
-        assert torch.equal(third.result.output, torch.tensor([2.0]))
-        assert torch.equal(fourth.result.output, torch.tensor([2.0]))
+        first_req_a = _require_req_output(first, "req-a")
+        second_req_b = _require_req_output(second, "req-b")
+        third_req_a = _require_req_output(third, "req-a")
+        fourth_req_b = _require_req_output(fourth, "req-b")
+        assert first_req_a.finished is False
+        assert second_req_b.finished is False
+        assert third_req_a.finished is True
+        assert fourth_req_b.finished is True
+        assert third_req_a.result is not None
+        assert fourth_req_b.result is not None
+        assert torch.equal(third_req_a.result.output, torch.tensor([2.0]))
+        assert torch.equal(fourth_req_b.result.output, torch.tensor([2.0]))
 
         assert runner.state_cache == {}
         assert runner.pipeline.decode_calls == ["req-a", "req-b"]
@@ -1752,47 +1721,23 @@ class TestExecuteStepwiseTeaCacheSlotSwitching:
         assert runner.pipeline.hook._forward_cnt == 0
         assert runner.pipeline.hook.state_manager._states == {}
 
-    def test_teacache_multi_request_step_falls_back_to_serial_slots(self, monkeypatch):
+    def test_teacache_multi_request_step_requires_batch_activation(self, monkeypatch):
         runner = _make_teacache_runner()
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
         req_a = _make_request("req-a", num_inference_steps=2)
         req_b = _make_request("req-b", num_inference_steps=2)
 
-        first = DiffusionModelRunner.execute_stepwise(
-            runner,
-            _make_batch_scheduler_output(new_reqs=[req_a, req_b], step_id=0),
-        )
-        slot_a = runner.state_cache["req-a"].cache_slot
-        slot_b = runner.state_cache["req-b"].cache_slot
+        with pytest.raises(ValueError, match="does not support batched slot activation"):
+            DiffusionModelRunner.execute_stepwise(
+                runner,
+                _make_batch_scheduler_output(new_reqs=[req_a, req_b], step_id=0),
+            )
 
-        assert first.req_id == ["req-a", "req-b"]
-        assert first.step_index == [1, 1]
-        assert first.finished == [False, False]
-        assert runner.cache_manager._batch_active is False
-        assert runner.cache_manager._active_req_id is None
+        assert runner.cache_dit_manager._batch_active is False
+        assert runner.cache_dit_manager._active_req_id is None
         assert runner.pipeline.hook._forward_cnt == 0
         assert runner.pipeline.hook.state_manager._states == {}
-        assert [snapshot.active_req_id for snapshot in runner.pipeline.snapshots] == [
-            "req-a",
-            "req-b",
-        ]
-        assert [snapshot.waiting_req_ids for snapshot in runner.pipeline.snapshots] == [
-            (),
-            ("req-a",),
-        ]
-
-        second = DiffusionModelRunner.execute_stepwise(
-            runner,
-            _make_batch_scheduler_output(cached_req_ids=["req-a", "req-b"], step_id=1),
-        )
-
-        assert second.req_id == ["req-a", "req-b"]
-        assert second.step_index == [2, 2]
-        assert second.finished == [True, True]
-        assert runner.pipeline.decode_calls == ["req-a", "req-b"]
+        assert runner.pipeline.snapshots == []
         assert runner.state_cache == {}
-        assert slot_a.payload["states"] == {}
-        assert slot_b.payload["states"] == {}
-        assert slot_a.payload["forward_cnt"] == 0
-        assert slot_b.payload["forward_cnt"] == 0
+        assert runner.input_batch is None

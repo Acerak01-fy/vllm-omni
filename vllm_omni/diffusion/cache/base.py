@@ -97,9 +97,9 @@ class CacheBackend(ABC):
             True if cache is enabled, False otherwise.
         """
         return self.enabled
-    
+
     def create_state_driver(self, pipeline: Any) -> Any | None:
-        """Create an optional stepwise resident-state driver for this backend."""
+        """Create an optional cache pool driver for stepwise execution."""
         del pipeline
         return None
 

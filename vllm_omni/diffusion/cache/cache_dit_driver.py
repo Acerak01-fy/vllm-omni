@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Stepwise resident-state driver for cache-dit."""
+"""Cache pool driver for cache-dit."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from vllm_omni.diffusion.cache.cache_dit_batch import (
     clear_batch_contexts,
     set_batch_contexts,
 )
-from vllm_omni.diffusion.cache.cache_manager import CacheStateDriver
+from vllm_omni.diffusion.cache.cache_dit_manager import CacheDiTStateDriverBase
 from vllm_omni.diffusion.worker.utils import CacheBackendSlot, DiffusionRequestState
 
 
@@ -26,7 +26,7 @@ class _CacheDiTHandle:
     templates: dict[str, Any]
 
 
-class CacheDiTStateDriver(CacheStateDriver):
+class CacheDiTStateDriver(CacheDiTStateDriverBase):
     """Manage per-request cache-dit context dictionaries for stepwise serving."""
 
     def __init__(self, backend: Any, pipeline: Any):

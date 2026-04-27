@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Stepwise resident-state driver for TeaCache."""
+"""Cache pool driver for TeaCache."""
 
 from __future__ import annotations
 
@@ -8,12 +8,12 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.cache.cache_manager import CacheStateDriver
+from vllm_omni.diffusion.cache.cache_dit_manager import CacheDiTStateDriverBase
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
 from vllm_omni.diffusion.worker.utils import CacheBackendSlot
 
 
-class TeaCacheStateDriver(CacheStateDriver):
+class TeaCacheStateDriver(CacheDiTStateDriverBase):
     """Manage per-request TeaCache hook state for stepwise serving."""
 
     def __init__(self, pipeline: Any):

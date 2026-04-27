@@ -1582,7 +1582,6 @@ class CacheDiTBackend(CacheBackend):
             return None
         return CacheDiTStateDriver(self, pipeline)
 
-
     def is_enabled(self) -> bool:
         """Check if cache-dit is enabled on this pipeline.
 
