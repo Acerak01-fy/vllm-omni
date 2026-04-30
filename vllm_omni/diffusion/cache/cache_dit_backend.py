@@ -706,14 +706,18 @@ def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], No
         if cache_config.scm_steps_mask_policy is None:
             cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
         else:
+            if num_inference_steps < 2:
+                steps_computation_mask = [1] * num_inference_steps
+            else:
+                steps_computation_mask = cache_dit.steps_mask(
+                    mask_policy=cache_config.scm_steps_mask_policy,
+                    total_steps=num_inference_steps,
+                )
             cache_dit.refresh_context(
                 transformer,
                 cache_config=DBCacheConfig().reset(
                     num_inference_steps=num_inference_steps,
-                    steps_computation_mask=cache_dit.steps_mask(
-                        mask_policy=cache_config.scm_steps_mask_policy,
-                        total_steps=num_inference_steps,
-                    ),
+                    steps_computation_mask=steps_computation_mask,
                     steps_computation_policy=cache_config.scm_steps_policy,
                 ),
                 verbose=verbose,

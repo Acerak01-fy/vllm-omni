@@ -273,7 +273,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and self.cache_backend.is_enabled()
                 and req.sampling_params.num_inference_steps is not None
             ):
-                self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
+                refresh_cache_context = self.cache_backend.refresh
+                if self.od_config.cache_backend == "cache_dit":
+                    refresh_cache_context = getattr(self.cache_backend, "force_refresh", refresh_cache_context)
+                refresh_cache_context(self.pipeline, req.sampling_params.num_inference_steps)
 
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if is_primary:
@@ -353,6 +356,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         return resolved, new_req_id
 
     def _prepare_batch_inputs(self, states: list[DiffusionRequestState], new_request_ids: list[str]) -> InputBatch:
+        if new_request_ids and len(new_request_ids) == len(states) and self.cache_backend is not None:
+            new_states = [state for state in states if state.req_id in new_request_ids]
+            num_inference_steps = new_states[0].sampling.num_inference_steps
+            if any(state.sampling.num_inference_steps != num_inference_steps for state in new_states):
+                raise ValueError("Stepwise cache refresh requires new requests to use the same num_inference_steps.")
+            self.cache_backend.refresh(self.pipeline, num_inference_steps)
+
         # process new reqs
         for state in states:
             if state.req_id in new_request_ids:
