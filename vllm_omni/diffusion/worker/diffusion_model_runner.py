@@ -22,8 +22,8 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
-from vllm_omni.diffusion.cache.cache_dit_manager import CacheDiTManager
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
+from vllm_omni.diffusion.cache.cache_dit_manager import CacheDiTManager
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -422,11 +422,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         pipeline_interrupted: bool,
     ) -> list[RunnerOutput]:
         if noise_pred is None:
-            error = (
-                "stepwise denoise interrupted"
-                if pipeline_interrupted
-                else "stepwise denoise returned None"
-            )
+            error = "stepwise denoise interrupted" if pipeline_interrupted else "stepwise denoise returned None"
             runner_output_list = [
                 RunnerOutput(
                     req_id=state.req_id,

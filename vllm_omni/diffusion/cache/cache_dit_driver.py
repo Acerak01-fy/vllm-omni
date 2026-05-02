@@ -181,10 +181,7 @@ class CacheDiTStateDriver(CacheDiTStateDriverBase):
         return fresh_context
 
     def _build_fresh_contexts(self, handle: _CacheDiTHandle) -> dict[str, Any]:
-        return {
-            name: self._clone_fresh_context(handle.templates[name])
-            for name in handle.context_names
-        }
+        return {name: self._clone_fresh_context(handle.templates[name]) for name in handle.context_names}
 
     @staticmethod
     def _get_payload(slot: CacheBackendSlot) -> tuple[dict[str, Any], ...]:

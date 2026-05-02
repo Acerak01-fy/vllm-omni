@@ -193,6 +193,7 @@ class TeaCacheBackend(CacheBackend):
         else:
             if verbose:
                 logger.warning("Transformer has no hook registry, TeaCache may not be applied")
+
     def create_state_driver(self, pipeline: Any) -> Any | None:
         from vllm_omni.diffusion.cache.teacache.driver import TeaCacheStateDriver
 
