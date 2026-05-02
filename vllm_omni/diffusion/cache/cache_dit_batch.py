@@ -130,9 +130,7 @@ def _trim_encoder_slice(
 ) -> tuple[torch.Tensor | None, int | None]:
     if encoder_slice is None:
         return None, None
-    seq_len = _request_encoder_seq_len(
-        kwargs, request_index, row_start, row_end, int(encoder_slice.shape[1])
-    )
+    seq_len = _request_encoder_seq_len(kwargs, request_index, row_start, row_end, int(encoder_slice.shape[1]))
     return encoder_slice[:, :seq_len], seq_len
 
 
@@ -174,9 +172,7 @@ def _forward_batched(
     parallelized = self._is_parallelized()
     fn_check_prefix = f"{prefix}_Fn_hidden_states" if use_l1 else f"{prefix}_Fn_residual"
     bn_hs_prefix = f"{prefix}_Bn_residual" if cm.is_cache_residual() else f"{prefix}_Bn_hidden_states"
-    bn_enc_prefix = (
-        f"{prefix}_Bn_residual" if cm.is_encoder_cache_residual() else f"{prefix}_Bn_hidden_states"
-    )
+    bn_enc_prefix = f"{prefix}_Bn_residual" if cm.is_encoder_cache_residual() else f"{prefix}_Bn_hidden_states"
 
     # Stage 1: Fn blocks on full batch.
     original_hs = hidden_states
@@ -214,15 +210,11 @@ def _forward_batched(
 
         compute_hs = torch.index_select(hidden_states, 0, row_index)
         if is_pattern_345:
-            mn_hs, mn_enc, mn_hs_residual = self.call_Mn_blocks(
-                compute_hs, *args, **compute_kwargs
-            )
+            mn_hs, mn_enc, mn_hs_residual = self.call_Mn_blocks(compute_hs, *args, **compute_kwargs)
             mn_enc_residual = None
         else:
             compute_enc = (
-                torch.index_select(encoder_hidden_states, 0, row_index)
-                if encoder_hidden_states is not None
-                else None
+                torch.index_select(encoder_hidden_states, 0, row_index) if encoder_hidden_states is not None else None
             )
             mn_hs, mn_enc, mn_hs_residual, mn_enc_residual = self.call_Mn_blocks(
                 compute_hs, compute_enc, *args, **compute_kwargs
@@ -244,29 +236,24 @@ def _forward_batched(
                 cm.set_Fn_buffer(fn_hs[bs : bs + nr], f"{prefix}_Fn_hidden_states")
 
             if cm.is_cache_residual():
-                cm.set_Bn_buffer(
-                    mn_hs_residual[local : local + nr], prefix=f"{prefix}_Bn_residual"
-                )
+                cm.set_Bn_buffer(mn_hs_residual[local : local + nr], prefix=f"{prefix}_Bn_residual")
             else:
-                cm.set_Bn_buffer(
-                    mn_hs[local : local + nr], prefix=f"{prefix}_Bn_hidden_states"
-                )
+                cm.set_Bn_buffer(mn_hs[local : local + nr], prefix=f"{prefix}_Bn_hidden_states")
 
             if can_store_enc:
-                req_mn_enc, _ = _trim_encoder_slice(
-                    mn_enc[local : local + nr], kwargs, i, bs, bs + nr
-                )
+                req_mn_enc, _ = _trim_encoder_slice(mn_enc[local : local + nr], kwargs, i, bs, bs + nr)
                 if cm.is_encoder_cache_residual():
                     if is_pattern_345:
                         old_enc, _ = _trim_encoder_slice(
                             pre_mn_encoder[bs : bs + nr] if pre_mn_encoder is not None else None,
-                            kwargs, i, bs, bs + nr,
+                            kwargs,
+                            i,
+                            bs,
+                            bs + nr,
                         )
                         enc_res = req_mn_enc - old_enc if old_enc is not None else req_mn_enc
                     else:
-                        enc_res, _ = _trim_encoder_slice(
-                            mn_enc_residual[local : local + nr], kwargs, i, bs, bs + nr
-                        )
+                        enc_res, _ = _trim_encoder_slice(mn_enc_residual[local : local + nr], kwargs, i, bs, bs + nr)
                     cm.set_Bn_encoder_buffer(enc_res, prefix=f"{prefix}_Bn_residual")
                 else:
                     cm.set_Bn_encoder_buffer(req_mn_enc, prefix=f"{prefix}_Bn_hidden_states")
@@ -278,9 +265,7 @@ def _forward_batched(
         hidden_states.index_copy_(0, row_index, mn_hs)
         if mn_enc is not None:
             encoder_hidden_states = (
-                torch.zeros_like(hidden_states)
-                if encoder_hidden_states is None
-                else encoder_hidden_states.clone()
+                torch.zeros_like(hidden_states) if encoder_hidden_states is None else encoder_hidden_states.clone()
             )
             encoder_hidden_states.index_copy_(0, row_index, mn_enc)
 
@@ -303,16 +288,12 @@ def _forward_batched(
         )
         hidden_states[start:end] = cached_hs
         if encoder_hidden_states is not None and cached_enc is not None:
-            encoder_hidden_states[start:end] = _restore_encoder_slice(
-                cached_enc, enc_slice, seq_len
-            )
+            encoder_hidden_states[start:end] = _restore_encoder_slice(cached_enc, enc_slice, seq_len)
 
     # Stage 4: Bn blocks on full batch (Pattern 3/4/5 may skip entirely).
     if not is_pattern_345 or cm.Bn_compute_blocks() > 0:
         if is_pattern_345:
-            hidden_states, encoder_hidden_states = self.call_Bn_blocks(
-                hidden_states, *args, **kwargs
-            )
+            hidden_states, encoder_hidden_states = self.call_Bn_blocks(hidden_states, *args, **kwargs)
         else:
             hidden_states, encoder_hidden_states = self.call_Bn_blocks(
                 hidden_states, encoder_hidden_states, *args, **kwargs
@@ -331,8 +312,12 @@ def _forward_batched_base(
 ) -> Any:
     """Batch-aware forward for ``CachedBlocks_Pattern_Base`` (Pattern 0/1/2)."""
     return _forward_batched(
-        self, hidden_states, encoder_hidden_states, *args,
-        is_pattern_345=False, **kwargs,
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        *args,
+        is_pattern_345=False,
+        **kwargs,
     )
 
 
@@ -344,8 +329,12 @@ def _forward_batched_345(
 ) -> Any:
     """Batch-aware forward for ``CachedBlocks_Pattern_3_4_5`` (Pattern 3/4/5)."""
     return _forward_batched(
-        self, hidden_states, None, *args,
-        is_pattern_345=True, **kwargs,
+        self,
+        hidden_states,
+        None,
+        *args,
+        is_pattern_345=True,
+        **kwargs,
     )
 
 

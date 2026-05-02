@@ -25,7 +25,6 @@ class CacheBackendSlot:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-
 @dataclass
 class DiffusionRequestState:
     """Per-request mutable state across all pipeline stages.

@@ -91,10 +91,7 @@ def _make_batch_scheduler_output(
     cached_req_ids = [] if cached_req_ids is None else list(cached_req_ids)
     return DiffusionSchedulerOutput(
         step_id=step_id,
-        scheduled_new_reqs=[
-            NewRequestData(sched_req_id=req.request_ids[0], req=req)
-            for req in new_reqs
-        ],
+        scheduled_new_reqs=[NewRequestData(sched_req_id=req.request_ids[0], req=req) for req in new_reqs],
         scheduled_cached_reqs=CachedRequestData(sched_req_ids=cached_req_ids),
         finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
         num_running_reqs=len(new_reqs) + len(cached_req_ids),
@@ -406,9 +403,7 @@ class _FakeBatchedPatternBase:
         new_hs = hidden_states + 2
         new_enc = None if encoder_hidden_states is None else encoder_hidden_states + 20
         hs_residual = torch.full_like(hidden_states, 5)
-        enc_residual = None if encoder_hidden_states is None else torch.full_like(
-            encoder_hidden_states, 7
-        )
+        enc_residual = None if encoder_hidden_states is None else torch.full_like(encoder_hidden_states, 7)
         return new_hs, new_enc, hs_residual, enc_residual
 
     def call_Bn_blocks(self, hidden_states, encoder_hidden_states, *args, **kwargs):
@@ -486,16 +481,8 @@ def _run_serial_base(pattern, batch_contexts, hidden_states, encoder_hidden_stat
             hs_slice, enc_slice = cm.apply_cache(
                 hs_slice,
                 enc_slice,
-                prefix=(
-                    "fake_Bn_residual"
-                    if cm.is_cache_residual()
-                    else "fake_Bn_hidden_states"
-                ),
-                encoder_prefix=(
-                    "fake_Bn_residual"
-                    if cm.is_encoder_cache_residual()
-                    else "fake_Bn_hidden_states"
-                ),
+                prefix=("fake_Bn_residual" if cm.is_cache_residual() else "fake_Bn_hidden_states"),
+                encoder_prefix=("fake_Bn_residual" if cm.is_encoder_cache_residual() else "fake_Bn_hidden_states"),
             )
         else:
             cm.set_Fn_buffer(fn_residual, prefix="fake_Fn_residual")
@@ -544,16 +531,8 @@ def _run_serial_345(pattern, batch_contexts, hidden_states):
             hs_slice, enc_slice = cm.apply_cache(
                 hs_slice,
                 enc_slice,
-                prefix=(
-                    "fake_Bn_residual"
-                    if cm.is_cache_residual()
-                    else "fake_Bn_hidden_states"
-                ),
-                encoder_prefix=(
-                    "fake_Bn_residual"
-                    if cm.is_encoder_cache_residual()
-                    else "fake_Bn_hidden_states"
-                ),
+                prefix=("fake_Bn_residual" if cm.is_cache_residual() else "fake_Bn_hidden_states"),
+                encoder_prefix=("fake_Bn_residual" if cm.is_encoder_cache_residual() else "fake_Bn_hidden_states"),
             )
         else:
             cm.set_Fn_buffer(fn_residual, prefix="fake_Fn_residual")
@@ -678,9 +657,7 @@ class _FakeRunnerBatchCacheDiTDriver(CacheDiTStateDriverBase):
         self.install_batch_history.append(tuple(state.req_id for state in states))
         self.pipeline.live_batch_req_ids = [state.req_id for state in states]
         for state in states:
-            state.cache_slot.payload["cache_plan"] = tuple(
-                getattr(state.sampling, "cache_plan", ())
-            )
+            state.cache_slot.payload["cache_plan"] = tuple(getattr(state.sampling, "cache_plan", ()))
 
     def deactivate_batch_slots(self):
         self.deactivate_batch_calls += 1
@@ -713,10 +690,7 @@ class _BatchCacheDiTPipeline:
         del kwargs
         assert self.runner is not None
         states = [self.runner.state_cache[req_id] for req_id in input_batch.req_ids]
-        decisions = tuple(
-            state.step_index in state.extra.get("cache_plan", ())
-            for state in states
-        )
+        decisions = tuple(state.step_index in state.extra.get("cache_plan", ()) for state in states)
         self.snapshots.append(
             _BatchRunnerSnapshot(
                 req_ids=tuple(input_batch.req_ids),
@@ -772,10 +746,7 @@ class _FakeDriverContext:
 
 class _FakeDriverContextManager:
     def __init__(self, *context_names: str):
-        self._cached_context_manager = {
-            name: _FakeDriverContext(name)
-            for name in context_names
-        }
+        self._cached_context_manager = {name: _FakeDriverContext(name) for name in context_names}
         self._current_context = None
         self._batch_contexts = None
         self._batch_row_offsets = None
@@ -798,9 +769,7 @@ class _FakeCacheDiTBackend:
                 continue
             for context in context_manager._cached_context_manager.values():
                 context.config_steps = num_inference_steps
-                context.buffers["config_steps"] = torch.tensor(
-                    [num_inference_steps], dtype=torch.float32
-                )
+                context.buffers["config_steps"] = torch.tensor([num_inference_steps], dtype=torch.float32)
 
 
 def _make_cache_dit_driver():
@@ -847,11 +816,7 @@ def _seed_cached_buffers(
     encoder_cache_residual: bool = False,
 ) -> None:
     hidden_prefix = "fake_Bn_residual" if cache_residual else "fake_Bn_hidden_states"
-    encoder_prefix = (
-        "fake_Bn_residual"
-        if encoder_cache_residual
-        else "fake_Bn_hidden_states"
-    )
+    encoder_prefix = "fake_Bn_residual" if encoder_cache_residual else "fake_Bn_hidden_states"
     ctx.buffers[hidden_prefix] = torch.full(hidden_shape, 50.0)
     if encoder_shape is not None:
         ctx.buffers[f"{encoder_prefix}_encoder"] = torch.full(encoder_shape, 70.0)

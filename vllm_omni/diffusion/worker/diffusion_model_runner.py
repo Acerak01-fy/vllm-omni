@@ -22,8 +22,8 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
-from vllm_omni.diffusion.cache.cache_dit_manager import CacheDiTManager
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
+from vllm_omni.diffusion.cache.cache_dit_manager import CacheDiTManager
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
     resolve_prompt_embed_cache_config,
@@ -233,9 +233,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if not isinstance(payload, tuple):
             return
 
-        total_steps = request_state.total_steps or int(
-            getattr(request_state.sampling, "num_inference_steps", 0) or 0
-        )
+        total_steps = request_state.total_steps or int(getattr(request_state.sampling, "num_inference_steps", 0) or 0)
         prompt_preview = self._prompt_preview_for_log(request_state.prompts)
         seed_value = self._sampling_seed_for_log(request_state.sampling)
         seen_context_ids: set[int] = set()
@@ -344,7 +342,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             self.od_config.cache_backend,
         )
         logger.info("[StepBatch] request_meta=%s", request_meta)
-
 
     def load_model(
         self,
@@ -731,11 +728,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     ) -> list[RunnerOutput]:
         runner_output_list: list[RunnerOutput] = []
         if noise_pred is None:
-            error = (
-                "stepwise denoise interrupted"
-                if pipeline_interrupted
-                else "stepwise denoise returned None"
-            )
+            error = "stepwise denoise interrupted" if pipeline_interrupted else "stepwise denoise returned None"
             for state in states:
                 runner_output_list.append(
                     self._build_stepwise_output(
