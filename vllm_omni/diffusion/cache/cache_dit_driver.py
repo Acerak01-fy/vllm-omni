@@ -15,7 +15,7 @@ from vllm_omni.diffusion.cache.cache_dit_batch import (
     clear_batch_contexts,
     set_batch_contexts,
 )
-from vllm_omni.diffusion.cache.cache_dit_manager import CacheDiTStateDriverBase
+from vllm_omni.diffusion.cache.dit_cache_manager import DiTCacheStateDriverBase
 from vllm_omni.diffusion.worker.utils import CacheBackendSlot, DiffusionRequestState
 
 
@@ -26,7 +26,7 @@ class _CacheDiTHandle:
     templates: dict[str, Any]
 
 
-class CacheDiTStateDriver(CacheDiTStateDriverBase):
+class CacheDiTStateDriver(DiTCacheStateDriverBase):
     """Manage per-request cache-dit context dictionaries for stepwise serving."""
 
     def __init__(self, backend: Any, pipeline: Any):

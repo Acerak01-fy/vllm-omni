@@ -1,9 +1,9 @@
-# Cache-DiT Pool for Step-Wise Batching
+# DiT Cache Pool for Step-Wise Batching
 
-This document describes the Cache-DiT Pool extension built on top of
+This document describes the DiT Cache Pool extension built on top of
 [Diffusion Step Execution](diffusion_step_execution.md) and
 [Continuous Batching for Step-Wise Diffusion](diffusion_continuous_batching.md).
-The base step-execution contract is unchanged. Cache-DiT Pool adds
+The base step-execution contract is unchanged. DiT Cache Pool adds
 request-local Cache-DiT state management so compatible requests can share one
 step-wise denoise forward while keeping independent cache decisions.
 
@@ -14,8 +14,8 @@ one `denoise_step(input_batch)` call. Cache-DiT acceleration also needs mutable
 state across denoise steps: cached block outputs, residual history, warmup
 state, and hit/miss decisions.
 
-Without request-local cache slots, those mutable Cache-DiT objects would be
-shared globally on the pipeline and could bleed across requests. Cache-DiT Pool
+Without request-local cache slots, those mutable DiT cache objects would be
+shared globally on the pipeline and could bleed across requests. DiT Cache Pool
 keeps the acceleration state attached to each live request and installs the
 right state before each scheduler tick.
 
@@ -35,9 +35,9 @@ owns an optional `cache_slot`. The slot is a
 backend-owned payload, compatibility metadata, and a lightweight resident-byte
 estimate.
 
-The runner does not inspect Cache-DiT internals. It delegates cache lifecycle
-to [`CacheDiTManager`](gh-file:vllm_omni/diffusion/cache/cache_dit_manager.py),
-which uses a backend-specific `CacheDiTStateDriverBase` implementation:
+The runner does not inspect backend internals. It delegates cache lifecycle
+to [`DiTCacheManager`](gh-file:vllm_omni/diffusion/cache/dit_cache_manager.py),
+which uses a backend-specific `DiTCacheStateDriverBase` implementation:
 
 - Cache-DiT uses
   [`CacheDiTStateDriver`](gh-file:vllm_omni/diffusion/cache/cache_dit_driver.py).
@@ -51,7 +51,7 @@ Cache-DiT driver then maps each input row to the correct per-request cache
 context.
 
 The normal runner execution shape remains one batched denoise call per
-scheduler tick. Cache-DiT Pool only adds cache activation and cleanup around
+scheduler tick. DiT Cache Pool only adds cache activation and cleanup around
 that call.
 
 ## Enablement
@@ -90,12 +90,12 @@ one.
 The slot lifecycle is request-local:
 
 1. A new request enters the runner state cache.
-2. `CacheDiTManager.activate(states)` creates or restores each request slot.
+2. `DiTCacheManager.activate(states)` creates or restores each request slot.
 3. Fresh slots are initialized with the request's `num_inference_steps`.
 4. The Cache-DiT driver installs per-request cache contexts for the active
    batch.
 5. The runner executes one `denoise_step(input_batch)`.
-6. `CacheDiTManager.deactivate(states)` captures mutable cache state back into
+6. `DiTCacheManager.deactivate(states)` captures mutable cache state back into
    the request slots.
 7. Completed, aborted, or interrupted requests free their slots.
 
@@ -172,11 +172,11 @@ The current tests cover:
   [`vllm_omni/diffusion/worker/utils.py`](gh-file:vllm_omni/diffusion/worker/utils.py)
 - Input batch:
   [`vllm_omni/diffusion/worker/input_batch.py`](gh-file:vllm_omni/diffusion/worker/input_batch.py)
-- Cache-DiT manager:
-  [`vllm_omni/diffusion/cache/cache_dit_manager.py`](gh-file:vllm_omni/diffusion/cache/cache_dit_manager.py)
+- DiT cache manager:
+  [`vllm_omni/diffusion/cache/dit_cache_manager.py`](gh-file:vllm_omni/diffusion/cache/dit_cache_manager.py)
 - Cache-DiT driver:
   [`vllm_omni/diffusion/cache/cache_dit_driver.py`](gh-file:vllm_omni/diffusion/cache/cache_dit_driver.py)
 - TeaCache driver:
   [`vllm_omni/diffusion/cache/teacache/driver.py`](gh-file:vllm_omni/diffusion/cache/teacache/driver.py)
 - Tests:
-  [`tests/diffusion/test_cache_dit_pool.py`](gh-file:tests/diffusion/test_cache_dit_pool.py)
+  [`tests/diffusion/test_dit_cache_pool.py`](gh-file:tests/diffusion/test_dit_cache_pool.py)

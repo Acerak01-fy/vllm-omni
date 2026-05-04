@@ -19,7 +19,7 @@ from vllm_omni.diffusion.cache.cache_dit_batch import (
     set_batch_contexts,
 )
 from vllm_omni.diffusion.cache.cache_dit_driver import CacheDiTStateDriver
-from vllm_omni.diffusion.cache.cache_dit_manager import CacheDiTManager, CacheDiTStateDriverBase
+from vllm_omni.diffusion.cache.dit_cache_manager import DiTCacheManager, DiTCacheStateDriverBase
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.driver import TeaCacheStateDriver
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
@@ -121,7 +121,7 @@ class _CacheDiTSnapshot:
     trace_before: tuple[str, ...]
 
 
-class _FakeCacheDiTDriver(CacheDiTStateDriverBase):
+class _FakeCacheDiTDriver(DiTCacheStateDriverBase):
     def __init__(self, pipeline):
         self.pipeline = pipeline
         self._next_slot_id = 0
@@ -197,7 +197,7 @@ class _CacheDiTPipeline:
     def denoise_step(self, input_batch, **kwargs):
         del input_batch, kwargs
         assert self.runner is not None
-        active_req_id = self.runner.cache_dit_manager._active_req_id
+        active_req_id = self.runner.dit_cache_manager._active_req_id
         if active_req_id is None:
             raise AssertionError("cache manager must activate one request before denoise_step")
         state = self.runner.state_cache[active_req_id]
@@ -252,7 +252,7 @@ def _make_cache_dit_runner():
     runner.device = torch.device("cpu")
     runner.pipeline = _CacheDiTPipeline()
     runner.cache_backend = SimpleNamespace(is_enabled=lambda: True)
-    runner.cache_dit_manager = CacheDiTManager(_FakeCacheDiTDriver(runner.pipeline))
+    runner.dit_cache_manager = DiTCacheManager(_FakeCacheDiTDriver(runner.pipeline))
     runner.offload_backend = None
     runner.state_cache = {}
     runner.kv_transfer_manager = SimpleNamespace()
@@ -557,7 +557,7 @@ def _run_serial_345(pattern, batch_contexts, hidden_states):
     return torch.cat(outputs_hs, dim=0), torch.cat(outputs_enc, dim=0)
 
 
-class _FakeBatchCacheLifecycleDriver(CacheDiTStateDriverBase):
+class _FakeBatchCacheLifecycleDriver(DiTCacheStateDriverBase):
     def __init__(self):
         self._next_slot_id = 0
         self.initialize_history: list[tuple[int, int]] = []
@@ -613,7 +613,7 @@ class _BatchRunnerSnapshot:
     batch_active: bool
 
 
-class _FakeRunnerBatchCacheDiTDriver(CacheDiTStateDriverBase):
+class _FakeRunnerBatchCacheDiTDriver(DiTCacheStateDriverBase):
     def __init__(self, pipeline):
         self.pipeline = pipeline
         self._next_slot_id = 0
@@ -696,7 +696,7 @@ class _BatchCacheDiTPipeline:
                 req_ids=tuple(input_batch.req_ids),
                 step_indices=tuple(state.step_index for state in states),
                 cache_decisions=decisions,
-                batch_active=self.runner.cache_dit_manager._batch_active,
+                batch_active=self.runner.dit_cache_manager._batch_active,
             )
         )
         for state in states:
@@ -723,7 +723,7 @@ def _make_batch_cache_dit_runner():
     runner.device = torch.device("cpu")
     runner.pipeline = _BatchCacheDiTPipeline()
     runner.cache_backend = SimpleNamespace(is_enabled=lambda: True)
-    runner.cache_dit_manager = CacheDiTManager(_FakeRunnerBatchCacheDiTDriver(runner.pipeline))
+    runner.dit_cache_manager = DiTCacheManager(_FakeRunnerBatchCacheDiTDriver(runner.pipeline))
     runner.offload_backend = None
     runner.state_cache = {}
     runner.kv_transfer_manager = SimpleNamespace()
@@ -895,7 +895,7 @@ class _TeaCachePipeline:
     def denoise_step(self, input_batch, **kwargs):
         del input_batch, kwargs
         assert self.runner is not None
-        active_req_id = self.runner.cache_dit_manager._active_req_id
+        active_req_id = self.runner.dit_cache_manager._active_req_id
         if active_req_id is None:
             raise AssertionError("cache manager must activate one request before denoise_step")
         state = self.runner.state_cache[active_req_id]
@@ -967,7 +967,7 @@ def _make_teacache_runner():
     runner.device = torch.device("cpu")
     runner.pipeline = _TeaCachePipeline()
     runner.cache_backend = SimpleNamespace(is_enabled=lambda: True)
-    runner.cache_dit_manager = CacheDiTManager(TeaCacheStateDriver(runner.pipeline))
+    runner.dit_cache_manager = DiTCacheManager(TeaCacheStateDriver(runner.pipeline))
     runner.offload_backend = None
     runner.state_cache = {}
     runner.kv_transfer_manager = SimpleNamespace()
@@ -975,7 +975,7 @@ def _make_teacache_runner():
     return runner
 
 
-class TestExecuteStepwiseCacheDiTPool:
+class TestExecuteStepwiseDiTCachePool:
     def test_cache_dit_switching_keeps_acceleration_state(self, monkeypatch):
         runner = _make_cache_dit_runner()
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
@@ -1006,8 +1006,8 @@ class TestExecuteStepwiseCacheDiTPool:
             (),
             ("req-a:0",),
         ]
-        assert runner.cache_dit_manager.driver.initialize_history == [(1, 3), (2, 3)]
-        assert runner.cache_dit_manager._active_req_id is None
+        assert runner.dit_cache_manager.driver.initialize_history == [(1, 3), (2, 3)]
+        assert runner.dit_cache_manager._active_req_id is None
         assert runner.pipeline.live_cache_slot is None
 
     def test_hbm_can_hold_multiple_waiting_slots_while_one_request_runs(self, monkeypatch):
@@ -1031,7 +1031,7 @@ class TestExecuteStepwiseCacheDiTPool:
         assert set(resident_slots) == {"req-a", "req-b", "req-c"}
         assert len({slot.payload["slot_id"] for slot in resident_slots.values()}) == 3
         assert all(slot.resident_bytes > 0 for slot in resident_slots.values())
-        assert runner.cache_dit_manager._active_req_id is None
+        assert runner.dit_cache_manager._active_req_id is None
         assert runner.pipeline.live_cache_slot is None
 
     def test_finished_req_ids_free_resident_slot_before_next_run(self, monkeypatch):
@@ -1053,7 +1053,7 @@ class TestExecuteStepwiseCacheDiTPool:
         assert "req-a" not in runner.state_cache
         assert slot_a.metadata == {}
         assert slot_a.resident_bytes == 0
-        assert runner.cache_dit_manager.driver.clear_history == [slot_a.payload["slot_id"]]
+        assert runner.dit_cache_manager.driver.clear_history == [slot_a.payload["slot_id"]]
         assert runner.state_cache["req-b"].cache_slot.payload["trace"] == ["req-b:0"]
 
     def test_denoise_none_path_cleans_up_cache_slot(self, monkeypatch):
@@ -1072,9 +1072,9 @@ class TestExecuteStepwiseCacheDiTPool:
         assert req_output.result is not None
         assert req_output.result.error == "stepwise denoise returned None"
         assert "req-a" not in runner.state_cache
-        assert runner.cache_dit_manager.driver.deactivate_history == [1]
-        assert runner.cache_dit_manager.driver.clear_history == [1]
-        assert runner.cache_dit_manager._active_req_id is None
+        assert runner.dit_cache_manager.driver.deactivate_history == [1]
+        assert runner.dit_cache_manager.driver.clear_history == [1]
+        assert runner.dit_cache_manager._active_req_id is None
         assert runner.pipeline.live_cache_slot is None
 
     def test_pipeline_error_still_deactivates_active_slot(self, monkeypatch):
@@ -1088,17 +1088,17 @@ class TestExecuteStepwiseCacheDiTPool:
                 _make_new_scheduler_output(_make_request("req-a", num_inference_steps=3), step_id=0),
             )
 
-        assert runner.cache_dit_manager.driver.deactivate_history == [1]
-        assert runner.cache_dit_manager._active_req_id is None
+        assert runner.dit_cache_manager.driver.deactivate_history == [1]
+        assert runner.dit_cache_manager._active_req_id is None
         assert runner.pipeline.live_cache_slot is None
         assert runner.state_cache == {}
         assert runner.input_batch is None
 
 
-class TestCacheDiTManagerBatchLifecycle:
+class TestDiTCacheManagerBatchLifecycle:
     def test_activate_batch_mixes_restored_and_fresh_slots(self):
         driver = _FakeBatchCacheLifecycleDriver()
-        manager = CacheDiTManager(driver)
+        manager = DiTCacheManager(driver)
 
         old_slot = driver.create_empty_slot()
         old_slot.metadata["num_inference_steps"] = 4
@@ -1122,7 +1122,7 @@ class TestCacheDiTManagerBatchLifecycle:
 
     def test_free_during_batch_activation_releases_only_target_slot(self):
         driver = _FakeBatchCacheLifecycleDriver()
-        manager = CacheDiTManager(driver)
+        manager = DiTCacheManager(driver)
 
         req_a = _make_cache_state("req-a", num_inference_steps=3)
         req_b = _make_cache_state("req-b", num_inference_steps=3)
@@ -1144,7 +1144,7 @@ class TestCacheDiTManagerBatchLifecycle:
 
     def test_single_item_list_uses_single_request_lifecycle(self):
         driver = _FakeBatchCacheLifecycleDriver()
-        manager = CacheDiTManager(driver)
+        manager = DiTCacheManager(driver)
         req = _make_cache_state("req-a", num_inference_steps=2)
 
         restored = manager.activate([req])
@@ -1480,12 +1480,12 @@ class TestExecuteStepwiseCacheDiTBatching:
                 batch_active=True,
             ),
         ]
-        assert runner.cache_dit_manager.driver.install_batch_history == [
+        assert runner.dit_cache_manager.driver.install_batch_history == [
             ("req-a", "req-b"),
             ("req-a", "req-b"),
             ("req-a", "req-b"),
         ]
-        assert runner.cache_dit_manager.driver.deactivate_batch_calls == 3
+        assert runner.dit_cache_manager.driver.deactivate_batch_calls == 3
 
     def test_runner_allows_mixed_cache_decisions_in_same_step(self, monkeypatch):
         runner = _make_batch_cache_dit_runner()
@@ -1594,7 +1594,7 @@ class TestExecuteStepwiseCacheDiTBatching:
         assert first_req_a.finished is False
         assert second_req_a.step_index == 2
         assert second_req_a.finished is True
-        assert runner.cache_dit_manager.driver.install_batch_history == []
+        assert runner.dit_cache_manager.driver.install_batch_history == []
         assert runner.pipeline.snapshots == [
             _BatchRunnerSnapshot(
                 req_ids=("req-a",),
@@ -1644,7 +1644,7 @@ class TestExecuteStepwiseTeaCacheSlotSwitching:
         assert req_a_snapshots[1].residual_sum_before == pytest.approx(20.0)
         assert runner.pipeline.hook._forward_cnt == 0
         assert runner.pipeline.hook.state_manager._states == {}
-        assert runner.cache_dit_manager._active_req_id is None
+        assert runner.dit_cache_manager._active_req_id is None
 
     def test_runner_interleaves_two_teacache_requests_end_to_end(self, monkeypatch):
         runner = _make_teacache_runner()
@@ -1699,8 +1699,8 @@ class TestExecuteStepwiseTeaCacheSlotSwitching:
                 _make_batch_scheduler_output(new_reqs=[req_a, req_b], step_id=0),
             )
 
-        assert runner.cache_dit_manager._batch_active is False
-        assert runner.cache_dit_manager._active_req_id is None
+        assert runner.dit_cache_manager._batch_active is False
+        assert runner.dit_cache_manager._active_req_id is None
         assert runner.pipeline.hook._forward_cnt == 0
         assert runner.pipeline.hook.state_manager._states == {}
         assert runner.pipeline.snapshots == []

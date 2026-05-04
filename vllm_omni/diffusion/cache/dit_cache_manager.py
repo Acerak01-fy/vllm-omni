@@ -10,8 +10,8 @@ from typing import Any
 from vllm_omni.diffusion.worker.utils import CacheBackendSlot, DiffusionRequestState
 
 
-class CacheDiTStateDriverBase(ABC):
-    """Backend-specific adapter used by ``CacheDiTManager``."""
+class DiTCacheStateDriverBase(ABC):
+    """Backend-specific adapter used by ``DiTCacheManager``."""
 
     @property
     @abstractmethod
@@ -47,7 +47,7 @@ class CacheDiTStateDriverBase(ABC):
         """Estimate resident bytes currently owned by the slot."""
 
 
-class CacheDiTManager:
+class DiTCacheManager:
     """Runner-facing lifecycle manager for request-local cache slots.
 
     ``activate`` / ``deactivate`` accept either a single
@@ -57,7 +57,7 @@ class CacheDiTManager:
     backend can keep per-request cache state during one batched forward pass.
     """
 
-    def __init__(self, driver: CacheDiTStateDriverBase):
+    def __init__(self, driver: DiTCacheStateDriverBase):
         self.driver = driver
         # Single-request tracking (used when activate receives one state).
         self._active_req_id: str | None = None
@@ -216,7 +216,7 @@ class CacheDiTManager:
         sampling = state.sampling
         timesteps = getattr(sampling, "timesteps", None)
         if timesteps is not None:
-            return CacheDiTManager._sequence_length(timesteps)
+            return DiTCacheManager._sequence_length(timesteps)
 
         sigmas = getattr(sampling, "sigmas", None)
         if sigmas is not None:

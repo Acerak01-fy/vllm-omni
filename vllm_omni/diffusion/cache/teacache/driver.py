@@ -8,12 +8,12 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.cache.cache_dit_manager import CacheDiTStateDriverBase
+from vllm_omni.diffusion.cache.dit_cache_manager import DiTCacheStateDriverBase
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
 from vllm_omni.diffusion.worker.utils import CacheBackendSlot
 
 
-class TeaCacheStateDriver(CacheDiTStateDriverBase):
+class TeaCacheStateDriver(DiTCacheStateDriverBase):
     """Manage per-request TeaCache hook state for stepwise serving."""
 
     def __init__(self, pipeline: Any):
