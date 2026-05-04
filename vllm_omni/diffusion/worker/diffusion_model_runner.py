@@ -23,7 +23,7 @@ from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
-from vllm_omni.diffusion.cache.cache_dit_manager import CacheDiTManager
+from vllm_omni.diffusion.cache.dit_cache_manager import DiTCacheManager
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -71,7 +71,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.device = device
         self.pipeline = None
         self.cache_backend = None
-        self.cache_dit_manager: CacheDiTManager | None = None
+        self.dit_cache_manager: DiTCacheManager | None = None
         self.offload_backend = None
 
         # Cache for per-request stepwise state.
@@ -176,7 +176,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         # Setup cache backend
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
-        self.cache_dit_manager = None
+        self.dit_cache_manager = None
 
         if self.cache_backend is not None:
             if self.od_config.model_class_name in _NO_CACHE_ACCELERATION:
@@ -191,7 +191,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self.cache_backend.enable(self.pipeline)
                 cache_pool_driver = self.cache_backend.create_state_driver(self.pipeline)
                 if cache_pool_driver is not None:
-                    self.cache_dit_manager = CacheDiTManager(cache_pool_driver)
+                    self.dit_cache_manager = DiTCacheManager(cache_pool_driver)
 
         logger.info("Model runner: Initialization complete.")
 
@@ -309,11 +309,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self, scheduler_output: DiffusionSchedulerOutput
     ) -> tuple[list[DiffusionRequestState], list[str]]:
         """Step-before update: cleanup finished requests and get/create one running state."""
-        cache_dit_manager = getattr(self, "cache_dit_manager", None)
+        dit_cache_manager = getattr(self, "dit_cache_manager", None)
         for req_id in scheduler_output.finished_req_ids:
             state = self.state_cache.pop(req_id, None)
-            if state is not None and cache_dit_manager is not None:
-                cache_dit_manager.free(state)
+            if state is not None and dit_cache_manager is not None:
+                dit_cache_manager.free(state)
 
         resolved: list[DiffusionRequestState] = []
         new_req_id: list[str] = []
@@ -382,7 +382,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         interrupted: bool = False,
     ):
         """Step-after update: clear cached state for completed request."""
-        cache_dit_manager = getattr(self, "cache_dit_manager", None)
+        dit_cache_manager = getattr(self, "dit_cache_manager", None)
         gathered_latents = torch.cat([state.latents for state in states], dim=0)
         if (
             input_batch.latents.size() == gathered_latents.size()
@@ -399,8 +399,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         for state in states:
             if interrupted or state.denoise_completed:
                 removed = self.state_cache.pop(state.req_id, None)
-                if removed is not None and cache_dit_manager is not None:
-                    cache_dit_manager.free(state)
+                if removed is not None and dit_cache_manager is not None:
+                    dit_cache_manager.free(state)
 
         if not self.state_cache:
             self.input_batch = None
@@ -466,7 +466,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self,
         states: list[DiffusionRequestState],
         input_batch: InputBatch,
-        cache_dit_manager: CacheDiTManager | None,
+        dit_cache_manager: DiTCacheManager | None,
     ) -> torch.Tensor | None:
         attn_metadata = self._prepare_attn_metadata(input_batch)
         with set_forward_context(
@@ -475,21 +475,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             attn_metadata=attn_metadata,
         ):
             try:
-                if cache_dit_manager is not None:
-                    cache_dit_manager.activate(states)
+                if dit_cache_manager is not None:
+                    dit_cache_manager.activate(states)
                 return self.pipeline.denoise_step(input_batch)
             finally:
-                if cache_dit_manager is not None:
-                    cache_dit_manager.deactivate(states)
+                if dit_cache_manager is not None:
+                    dit_cache_manager.deactivate(states)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not self.supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
-        cache_dit_manager = getattr(self, "cache_dit_manager", None)
+        dit_cache_manager = getattr(self, "dit_cache_manager", None)
         if self.od_config.cache_backend not in (None, "none"):
-            if cache_dit_manager is None:
+            if dit_cache_manager is None:
                 raise ValueError(
                     f"Step mode cache backend '{self.od_config.cache_backend}' has no resident-state driver."
                 )
@@ -505,7 +505,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 noise_pred = self._denoise_step_with_cache(
                     states,
                     input_batch,
-                    cache_dit_manager,
+                    dit_cache_manager,
                 )
                 pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
                 runner_output_list = self._build_stepwise_outputs(
@@ -517,11 +517,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
                 return BatchRunnerOutput.from_list(runner_output_list)
             except Exception:
-                if cache_dit_manager is not None:
-                    cache_dit_manager.deactivate(states)
+                if dit_cache_manager is not None:
+                    dit_cache_manager.deactivate(states)
                 for state in states:
                     self.state_cache.pop(state.req_id, None)
-                    if cache_dit_manager is not None:
-                        cache_dit_manager.free(state)
+                    if dit_cache_manager is not None:
+                        dit_cache_manager.free(state)
                 self.input_batch = None
                 raise
