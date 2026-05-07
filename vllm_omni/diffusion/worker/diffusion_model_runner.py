@@ -414,6 +414,20 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return {}
         return prepare_attn(input_batch)
 
+    @staticmethod
+    def _build_stepwise_output(
+        state: DiffusionRequestState,
+        *,
+        finished: bool,
+        result: DiffusionOutput | None,
+    ) -> RunnerOutput:
+        return RunnerOutput(
+            req_id=state.req_id,
+            step_index=state.step_index,
+            finished=finished,
+            result=result,
+        )
+
     def _build_stepwise_outputs(
         self,
         states: list[DiffusionRequestState],
@@ -421,29 +435,31 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         noise_pred: torch.Tensor | None,
         pipeline_interrupted: bool,
     ) -> list[RunnerOutput]:
+        runner_outputs: list[RunnerOutput] = []
         if noise_pred is None:
-            error = "stepwise denoise interrupted" if pipeline_interrupted else "stepwise denoise returned None"
-            runner_output_list = [
-                RunnerOutput(
-                    req_id=state.req_id,
-                    step_index=state.step_index,
-                    finished=True,
-                    result=DiffusionOutput(error=error),
+            error = (
+                "stepwise denoise interrupted"
+                if pipeline_interrupted
+                else "stepwise denoise returned None"
+            )
+            for state in states:
+                runner_outputs.append(
+                    self._build_stepwise_output(
+                        state,
+                        finished=True,
+                        result=DiffusionOutput(error=error),
+                    )
                 )
-                for state in states
-            ]
         else:
-            runner_output_list = []
             offset = 0
             for state in states:
                 next_offset = offset + state.latents.shape[0]
                 self.pipeline.step_scheduler(state, noise_pred[offset:next_offset])
                 offset = next_offset
                 result = self.pipeline.post_decode(state) if state.denoise_completed else None
-                runner_output_list.append(
-                    RunnerOutput(
-                        req_id=state.req_id,
-                        step_index=state.step_index,
+                runner_outputs.append(
+                    self._build_stepwise_output(
+                        state,
                         finished=state.denoise_completed,
                         result=result,
                     )
@@ -460,7 +476,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             input_batch,
             interrupted=pipeline_interrupted or noise_pred is None,
         )
-        return runner_output_list
+        return runner_outputs
 
     def _denoise_step_with_cache(
         self,
