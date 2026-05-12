@@ -139,12 +139,16 @@ class DiTCacheManager:
             state.cache_slot = slot
             restored_existing = False
 
-        self.driver.install_slot(slot)
-        if not restored_existing:
-            self.driver.initialize_fresh_slot(slot, num_inference_steps)
-            slot.metadata["num_inference_steps"] = num_inference_steps
+        try:
+            self.driver.install_slot(slot)
+            if not restored_existing:
+                self.driver.initialize_fresh_slot(slot, num_inference_steps)
+                slot.metadata["num_inference_steps"] = num_inference_steps
+            slot.resident_bytes = self.driver.estimate_slot_bytes(slot)
+        except Exception:
+            self.driver.deactivate_slot(slot)
+            raise
 
-        slot.resident_bytes = self.driver.estimate_slot_bytes(slot)
         self._active_req_id = state.req_id
         self._active_slot = slot
         return restored_existing
@@ -189,15 +193,24 @@ class DiTCacheManager:
                 # Fresh slot: must install + init *before* entering batch mode
                 # because initialize_fresh_slot calls install_slot + force_refresh
                 # which operate in single-request mode.
-                self.driver.install_slot(slot)
-                self.driver.initialize_fresh_slot(slot, num_inference_steps)
-                slot.metadata["num_inference_steps"] = num_inference_steps
-
-            slot.resident_bytes = self.driver.estimate_slot_bytes(slot)
+                try:
+                    self.driver.install_slot(slot)
+                    self.driver.initialize_fresh_slot(slot, num_inference_steps)
+                    slot.metadata["num_inference_steps"] = num_inference_steps
+                    slot.resident_bytes = self.driver.estimate_slot_bytes(slot)
+                except Exception:
+                    self.driver.deactivate_slot(slot)
+                    raise
+            else:
+                slot.resident_bytes = self.driver.estimate_slot_bytes(slot)
             restored_flags.append(restored)
 
         # Switch into batch mode (sets _batch_contexts on context managers).
-        self.driver.install_batch_slots(states)
+        try:
+            self.driver.install_batch_slots(states)
+        except Exception:
+            self.driver.deactivate_batch_slots()
+            raise
         self._batch_active = True
         return restored_flags
 

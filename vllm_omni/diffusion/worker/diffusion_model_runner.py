@@ -34,7 +34,7 @@ from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
+from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
@@ -383,18 +383,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     ):
         """Step-after update: clear cached state for completed request."""
         dit_cache_manager = getattr(self, "dit_cache_manager", None)
-        gathered_latents = torch.cat([state.latents for state in states], dim=0)
-        if (
-            input_batch.latents.size() == gathered_latents.size()
-            and input_batch.latents.dtype == gathered_latents.dtype
-            and input_batch.latents.device == gathered_latents.device
-        ):
-            input_batch.latents.copy_(gathered_latents)
-        else:
-            input_batch.latents = gathered_latents.clone()
-
         self.input_batch = input_batch
-        scatter_latents(states, input_batch)
 
         for state in states:
             if interrupted or state.denoise_completed:

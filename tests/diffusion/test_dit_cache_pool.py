@@ -561,9 +561,12 @@ class _FakeBatchCacheLifecycleDriver(DiTCacheStateDriverBase):
     def __init__(self):
         self._next_slot_id = 0
         self.initialize_history: list[tuple[int, int]] = []
+        self.deactivate_history: list[int] = []
         self.install_batch_history: list[tuple[str, ...]] = []
         self.deactivate_batch_calls = 0
         self.clear_history: list[int] = []
+        self.active_slot: CacheBackendSlot | None = None
+        self.fail_initialize_slot_ids: set[int] = set()
 
     @property
     def backend_name(self) -> str:
@@ -578,8 +581,11 @@ class _FakeBatchCacheLifecycleDriver(DiTCacheStateDriverBase):
 
     def install_slot(self, slot: CacheBackendSlot) -> None:
         slot.payload["installed_single"] = True
+        self.active_slot = slot
 
     def initialize_fresh_slot(self, slot: CacheBackendSlot, num_inference_steps: int) -> None:
+        if slot.payload["slot_id"] in self.fail_initialize_slot_ids:
+            raise RuntimeError(f"init-boom-{slot.payload['slot_id']}")
         slot.payload["initialized_for_steps"] = num_inference_steps
         self.initialize_history.append((slot.payload["slot_id"], num_inference_steps))
 
@@ -587,13 +593,18 @@ class _FakeBatchCacheLifecycleDriver(DiTCacheStateDriverBase):
         return slot.metadata.get("num_inference_steps") == num_inference_steps
 
     def deactivate_slot(self, slot: CacheBackendSlot | None) -> None:
-        del slot
+        if slot is not None:
+            self.deactivate_history.append(slot.payload["slot_id"])
+        if self.active_slot is slot:
+            self.active_slot = None
 
     def clear_slot(self, slot: CacheBackendSlot) -> None:
         self.clear_history.append(slot.payload["slot_id"])
         slot.payload["cleared"] = True
         slot.metadata.clear()
         slot.resident_bytes = 0
+        if self.active_slot is slot:
+            self.active_slot = None
 
     def estimate_slot_bytes(self, slot: CacheBackendSlot) -> int:
         return 256 + slot.payload["slot_id"]
@@ -1119,6 +1130,34 @@ class TestDiTCacheManagerBatchLifecycle:
 
         assert manager._batch_active is False
         assert driver.deactivate_batch_calls == 1
+
+    def test_activate_batch_deactivates_installed_slot_when_initialize_fails(self):
+        driver = _FakeBatchCacheLifecycleDriver()
+        manager = DiTCacheManager(driver)
+        driver.fail_initialize_slot_ids.add(1)
+        req_a = _make_cache_state("req-a", num_inference_steps=3)
+        req_b = _make_cache_state("req-b", num_inference_steps=3)
+
+        with pytest.raises(RuntimeError, match="init-boom-1"):
+            manager.activate([req_a, req_b])
+
+        assert driver.deactivate_history == [1]
+        assert driver.active_slot is None
+        assert driver.install_batch_history == []
+        assert manager._batch_active is False
+
+    def test_activate_single_deactivates_installed_slot_when_initialize_fails(self):
+        driver = _FakeBatchCacheLifecycleDriver()
+        manager = DiTCacheManager(driver)
+        driver.fail_initialize_slot_ids.add(1)
+        req = _make_cache_state("req-a", num_inference_steps=3)
+
+        with pytest.raises(RuntimeError, match="init-boom-1"):
+            manager.activate(req)
+
+        assert driver.deactivate_history == [1]
+        assert driver.active_slot is None
+        assert manager._active_req_id is None
 
     def test_free_during_batch_activation_releases_only_target_slot(self):
         driver = _FakeBatchCacheLifecycleDriver()
