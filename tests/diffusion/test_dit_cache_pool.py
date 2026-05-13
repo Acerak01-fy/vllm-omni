@@ -1105,6 +1105,38 @@ class TestExecuteStepwiseDiTCachePool:
         assert runner.state_cache == {}
         assert runner.input_batch is None
 
+    def test_update_states_error_defensively_deactivates_active_slot(self):
+        runner = _make_cache_dit_runner()
+        active_state = _make_cache_state("req-active", num_inference_steps=3)
+        manager = runner.dit_cache_manager
+        manager.activate(active_state)
+
+        class _RecordingManager:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+                self.deactivate_args = []
+
+            def __getattr__(self, name):
+                return getattr(self._wrapped, name)
+
+            def deactivate(self, state=None):
+                self.deactivate_args.append(state)
+                self._wrapped.deactivate(state)
+
+        recording_manager = _RecordingManager(manager)
+        runner.dit_cache_manager = recording_manager
+
+        with pytest.raises(ValueError, match="Missing cached state for request req-missing"):
+            DiffusionModelRunner.execute_stepwise(
+                runner,
+                _make_cached_scheduler_output("req-missing", step_id=1),
+            )
+
+        assert recording_manager.deactivate_args == [None]
+        assert manager._active_req_id is None
+        assert runner.pipeline.live_cache_slot is None
+        assert runner.input_batch is None
+
 
 class TestDiTCacheManagerBatchLifecycle:
     def test_activate_batch_mixes_restored_and_fresh_slots(self):
@@ -1142,6 +1174,22 @@ class TestDiTCacheManagerBatchLifecycle:
             manager.activate([req_a, req_b])
 
         assert driver.deactivate_history == [1]
+        assert driver.active_slot is None
+        assert driver.install_batch_history == []
+        assert manager._batch_active is False
+
+    def test_activate_batch_deactivates_previous_slots_when_later_initialize_fails(self):
+        driver = _FakeBatchCacheLifecycleDriver()
+        manager = DiTCacheManager(driver)
+        driver.fail_initialize_slot_ids.add(2)
+        req_a = _make_cache_state("req-a", num_inference_steps=3)
+        req_b = _make_cache_state("req-b", num_inference_steps=3)
+
+        with pytest.raises(RuntimeError, match="init-boom-2"):
+            manager.activate([req_a, req_b])
+
+        assert driver.initialize_history == [(1, 3)]
+        assert driver.deactivate_history == [2, 1]
         assert driver.active_slot is None
         assert driver.install_batch_history == []
         assert manager._batch_active is False
@@ -1224,6 +1272,28 @@ class TestCacheDiTStateDriver:
         for manager in managers:
             assert manager._batch_contexts is None
             assert manager._current_context is None
+
+    def test_deactivate_slot_detaches_live_contexts_without_clearing_slot(self):
+        driver, backend, _, managers = _make_cache_dit_driver()
+        slot = driver.create_empty_slot()
+        driver.initialize_fresh_slot(slot, num_inference_steps=3)
+        payload = slot.payload
+
+        manager_a, manager_b = managers
+        manager_a._current_context = payload[0]["ctx_a"]
+        manager_b._current_context = payload[1]["ctx_c"]
+
+        driver.deactivate_slot(slot)
+
+        assert manager_a._current_context is None
+        assert manager_b._current_context is None
+        assert manager_a._cached_context_manager is not payload[0]
+        assert manager_b._cached_context_manager is not payload[1]
+        assert tuple(manager_a._cached_context_manager) == ("ctx_a", "ctx_b")
+        assert tuple(manager_b._cached_context_manager) == ("ctx_c",)
+        assert payload[0]["ctx_a"].buffers["config_steps"].item() == 3
+        assert payload[1]["ctx_c"].buffers["config_steps"].item() == 3
+        assert backend.force_refresh_history == [3]
 
 
 class TestCacheDiTBatchedForward:
