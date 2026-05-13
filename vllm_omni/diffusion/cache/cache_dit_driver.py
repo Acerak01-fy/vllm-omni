@@ -59,9 +59,11 @@ class CacheDiTStateDriver(DiTCacheStateDriverBase):
         return slot.metadata.get("num_inference_steps") == num_inference_steps
 
     def deactivate_slot(self, slot: CacheBackendSlot | None) -> None:
-        del slot
-        for handle in self._handles:
+        payload = self._get_payload(slot) if slot is not None else None
+        for handle_idx, handle in enumerate(self._handles):
             handle.context_manager._current_context = None
+            if payload is not None and handle.context_manager._cached_context_manager is payload[handle_idx]:
+                handle.context_manager._cached_context_manager = self._build_fresh_contexts(handle)
 
     def clear_slot(self, slot: CacheBackendSlot) -> None:
         for handle, contexts in zip(self._handles, self._get_payload(slot)):

@@ -523,7 +523,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 return BatchRunnerOutput.from_list(runner_output_list)
             except Exception:
                 if dit_cache_manager is not None:
-                    dit_cache_manager.deactivate(states)
+                    dit_cache_manager.deactivate()
                 for state in states:
                     self.state_cache.pop(state.req_id, None)
                     if dit_cache_manager is not None:
