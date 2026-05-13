@@ -16,6 +16,8 @@ from vllm_omni.diffusion.cache.cache_dit_batch import (
     set_batch_contexts,
 )
 from vllm_omni.diffusion.cache.cache_manager import CacheStateDriver
+from vllm_omni.diffusion.cache.paged_cache_context import PagedCacheContext
+from vllm_omni.diffusion.cache.paged_cache_pool import PagedCachePool
 from vllm_omni.diffusion.worker.utils import CacheBackendSlot, DiffusionRequestState
 
 
@@ -173,6 +175,8 @@ class CacheDiTStateDriver(CacheStateDriver):
 
     @staticmethod
     def _clone_fresh_context(source: Any) -> Any:
+        if isinstance(source, PagedCacheContext):
+            source = source.base_context
         init_args = copy.deepcopy(getattr(source, "_init_args", ()))
         init_kwargs = copy.deepcopy(getattr(source, "_init_kwargs", {}))
         fresh_context = type(source)(*init_args, **init_kwargs)
@@ -192,3 +196,66 @@ class CacheDiTStateDriver(CacheStateDriver):
         if not isinstance(payload, tuple):
             raise TypeError(f"Invalid cache-dit slot payload: {type(payload)}")
         return payload
+
+
+class PagedCacheDiTStateDriver(CacheDiTStateDriver):
+    """Cache-DiT state driver that stores eligible buffers in a page pool."""
+
+    def __init__(self, backend: Any, pipeline: Any, pool: PagedCachePool):
+        super().__init__(backend, pipeline)
+        self._pool = pool
+
+    @property
+    def backend_name(self) -> str:
+        return "cache_dit_paged"
+
+    @property
+    def pool(self) -> PagedCachePool:
+        return self._pool
+
+    def initialize_fresh_slot(self, slot: CacheBackendSlot, num_inference_steps: int) -> None:
+        self.install_slot(slot)
+        self._backend.force_refresh(self._pipeline, num_inference_steps, verbose=False)
+        self._wrap_payload_contexts(slot)
+        slot.metadata["num_inference_steps"] = num_inference_steps
+
+    def estimate_slot_bytes(self, slot: CacheBackendSlot) -> int:
+        total_bytes = 0
+        seen_tensor_ids: set[int] = set()
+        for contexts in self._get_payload(slot):
+            for context in contexts.values():
+                if isinstance(context, PagedCacheContext):
+                    total_bytes += context.resident_bytes()
+                    base_context = context.base_context
+                else:
+                    base_context = context
+
+                for value in getattr(base_context, "buffers", {}).values():
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    value_id = id(value)
+                    if value_id in seen_tensor_ids:
+                        continue
+                    seen_tensor_ids.add(value_id)
+                    total_bytes += value.nelement() * value.element_size()
+        return total_bytes
+
+    def _build_fresh_contexts(self, handle: _CacheDiTHandle) -> dict[str, Any]:
+        return {
+            name: PagedCacheContext(
+                self._clone_fresh_context(handle.templates[name]),
+                self._pool,
+            )
+            for name in handle.context_names
+        }
+
+    def _wrap_payload_contexts(self, slot: CacheBackendSlot) -> None:
+        for handle, contexts in zip(self._handles, self._get_payload(slot)):
+            self._wrap_contexts_in_place(contexts)
+            if handle.context_manager._cached_context_manager is contexts:
+                handle.context_manager._current_context = None
+
+    def _wrap_contexts_in_place(self, contexts: dict[str, Any]) -> None:
+        for name, context in list(contexts.items()):
+            if not isinstance(context, PagedCacheContext):
+                contexts[name] = PagedCacheContext(context, self._pool)

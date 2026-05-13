@@ -3,16 +3,22 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from cache_dit.caching.cache_contexts.cache_context import CachedContext
+from cache_dit.caching.cache_contexts.cache_manager import CachedContextManager
 
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTBackend
+from vllm_omni.diffusion.cache.cache_dit_driver import PagedCacheDiTStateDriver
 from vllm_omni.diffusion.cache.paged_cache_context import PagedCacheContext
 from vllm_omni.diffusion.cache.paged_cache_pool import (
     PagedCachePool,
     PagePoolExhaustedError,
     estimate_pool_size,
 )
+from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -186,3 +192,78 @@ class TestPagedCacheContext:
         assert pool.num_used_pages == 0
         assert context.page_tables == {}
         assert context.get_buffer("metadata") is metadata
+
+
+class _ReplacingRefreshBackend:
+    def force_refresh(self, pipeline, num_inference_steps: int, verbose: bool = False):
+        del verbose
+        manager = pipeline.transformer._context_manager
+        for name in pipeline.transformer._context_names:
+            current = manager.get_context(name)
+            init_kwargs = dict(getattr(current, "_init_kwargs", {}))
+            manager.remove_context(name)
+            refreshed = manager.reset_context(name, **init_kwargs)
+            refreshed.cache_config.num_inference_steps = num_inference_steps
+
+
+def _make_context_pipeline(hidden_dim: int = 2):
+    manager = CachedContextManager("paged-test", persistent_context=True)
+    manager.new_context(name="ctx")
+    transformer = torch.nn.Linear(hidden_dim, hidden_dim)
+    transformer._context_manager = manager
+    transformer._context_names = ("ctx",)
+    transformer.inner_dim = hidden_dim
+    return SimpleNamespace(transformer=transformer), manager
+
+
+class TestPagedCacheDiTStateDriver:
+    def test_initialize_rewraps_contexts_replaced_by_force_refresh(self):
+        pipeline, manager = _make_context_pipeline()
+        pool = PagedCachePool(
+            num_pages=8,
+            page_size=2,
+            hidden_dim=2,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        driver = PagedCacheDiTStateDriver(_ReplacingRefreshBackend(), pipeline, pool)
+        slot = driver.create_empty_slot()
+
+        driver.initialize_fresh_slot(slot, num_inference_steps=4)
+        payload = PagedCacheDiTStateDriver._get_payload(slot)
+        context = payload[0]["ctx"]
+
+        assert isinstance(context, PagedCacheContext)
+        assert manager.get_context("ctx") is context
+        assert context.cache_config.num_inference_steps == 4
+
+        data = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2)
+        context.set_buffer("hidden", data)
+
+        assert torch.equal(context.get_buffer("hidden"), data)
+        assert pool.num_used_pages == 3
+        assert driver.estimate_slot_bytes(slot) == 3 * 2 * 2 * 4
+
+        driver.clear_slot(slot)
+
+        assert pool.num_used_pages == 0
+        assert payload[0] == {}
+
+    def test_cache_dit_backend_creates_paged_driver_when_enabled(self):
+        pipeline, _ = _make_context_pipeline()
+        backend = CacheDiTBackend(
+            DiffusionCacheConfig(
+                enable_paged_cache=True,
+                paged_cache_num_pages=4,
+                paged_cache_page_size=2,
+                paged_cache_hidden_dim=2,
+            )
+        )
+        backend.enabled = True
+
+        driver = backend.create_state_driver(pipeline)
+
+        assert isinstance(driver, PagedCacheDiTStateDriver)
+        assert driver.pool.num_pages == 4
+        assert driver.pool.page_size == 2
+        assert driver.pool.hidden_dim == 2

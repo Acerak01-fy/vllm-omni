@@ -287,6 +287,22 @@ class DiffusionCacheConfig:
     # Policy for force refresh: "once" refreshes only at the hint step,
     # "repeat" refreshes every force_refresh_step_hint steps.
     force_refresh_step_policy: str = "once"
+    # Enable Phase-A paged Cache-DiT storage. This keeps cache-dit's compute path
+    # unchanged and stores eligible Fn/Bn buffers in a fixed-size page pool.
+    enable_paged_cache: bool = False
+    # Paged Cache-DiT pool sizing. If paged_cache_num_pages is not provided,
+    # paged_cache_max_seq_len is required and num_pages is estimated from the
+    # remaining fields.
+    paged_cache_num_pages: int | None = None
+    paged_cache_page_size: int = 16
+    paged_cache_max_seq_len: int | None = None
+    paged_cache_max_concurrent_requests: int = 1
+    paged_cache_num_blocks: int | None = None
+    paged_cache_buffers_per_block: int = 3
+    paged_cache_safety_factor: float = 1.15
+    # Optional override for models whose cache hidden dimension cannot be
+    # inferred from transformer/config attributes.
+    paged_cache_hidden_dim: int | None = None
 
     # Additional parameters that may be passed but not explicitly defined
     _extra_params: dict[str, Any] = field(default_factory=dict, repr=False)

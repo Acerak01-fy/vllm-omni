@@ -1254,6 +1254,7 @@ class CacheDiTBackend(CacheBackend):
         # Cache-dit specific attributes
         self._refresh_func: Callable[[Any, int, bool], None] | None = None
         self._last_num_inference_steps: int | None = None
+        self._paged_cache_pool: Any | None = None
 
     def enable(self, pipeline: Any) -> None:
         """Enable cache-dit on the pipeline if configured.
@@ -1327,11 +1328,178 @@ class CacheDiTBackend(CacheBackend):
         self._last_num_inference_steps = num_inference_steps
 
     def create_state_driver(self, pipeline: Any) -> Any | None:
-        from vllm_omni.diffusion.cache.cache_dit_driver import CacheDiTStateDriver
+        from vllm_omni.diffusion.cache.cache_dit_driver import (
+            CacheDiTStateDriver,
+            PagedCacheDiTStateDriver,
+        )
 
         if not self.enabled:
             return None
+        if self._use_paged_cache():
+            pool = self._get_or_create_paged_cache_pool(pipeline)
+            logger.info(
+                "Using paged Cache-DiT gather storage: pages=%s page_size=%s hidden_dim=%s dtype=%s device=%s",
+                pool.num_pages,
+                pool.page_size,
+                pool.hidden_dim,
+                pool.dtype,
+                pool.device,
+            )
+            return PagedCacheDiTStateDriver(self, pipeline, pool)
         return CacheDiTStateDriver(self, pipeline)
+
+    def _use_paged_cache(self) -> bool:
+        from vllm_omni.diffusion import experimental as diffusion_experimental
+
+        return bool(
+            getattr(self.config, "enable_paged_cache", False)
+            or diffusion_experimental.EXPERIMENT_PAGED_CACHE
+        )
+
+    def _get_or_create_paged_cache_pool(self, pipeline: Any) -> Any:
+        from vllm_omni.diffusion.cache.paged_cache_pool import (
+            PagedCachePool,
+            estimate_pool_size,
+        )
+
+        if self._paged_cache_pool is not None:
+            return self._paged_cache_pool
+
+        page_size = int(getattr(self.config, "paged_cache_page_size", 16))
+        hidden_dim = self._infer_paged_hidden_dim(pipeline)
+        dtype, device = self._infer_paged_dtype_device(pipeline)
+
+        num_pages = getattr(self.config, "paged_cache_num_pages", None)
+        if num_pages is None:
+            max_seq_len = getattr(self.config, "paged_cache_max_seq_len", None)
+            if max_seq_len is None:
+                raise ValueError(
+                    "Paged Cache-DiT requires either paged_cache_num_pages or "
+                    "paged_cache_max_seq_len in cache_config."
+                )
+            num_pages = estimate_pool_size(
+                max_concurrent_requests=int(
+                    getattr(self.config, "paged_cache_max_concurrent_requests", 1)
+                ),
+                max_seq_len=int(max_seq_len),
+                num_blocks=self._infer_paged_num_blocks(pipeline),
+                buffers_per_block=int(getattr(self.config, "paged_cache_buffers_per_block", 3)),
+                page_size=page_size,
+                safety_factor=float(getattr(self.config, "paged_cache_safety_factor", 1.15)),
+            )
+
+        self._paged_cache_pool = PagedCachePool(
+            num_pages=int(num_pages),
+            page_size=page_size,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            device=device,
+        )
+        return self._paged_cache_pool
+
+    def _infer_paged_hidden_dim(self, pipeline: Any) -> int:
+        configured = getattr(self.config, "paged_cache_hidden_dim", None)
+        if configured is not None:
+            return int(configured)
+
+        for module in self._candidate_modules_for_paged_cache(pipeline):
+            direct = self._read_positive_int_attr(
+                module, ("inner_dim", "hidden_dim", "hidden_size", "dim", "embed_dim")
+            )
+            if direct is not None:
+                return direct
+
+            config = getattr(module, "config", None)
+            configured_dim = self._read_positive_int_attr(
+                config, ("inner_dim", "hidden_dim", "hidden_size", "dim", "embed_dim")
+            )
+            if configured_dim is not None:
+                return configured_dim
+
+            num_heads = self._read_positive_int_attr(
+                module, ("num_attention_heads", "num_heads")
+            ) or self._read_positive_int_attr(config, ("num_attention_heads", "num_heads"))
+            head_dim = self._read_positive_int_attr(
+                module, ("attention_head_dim", "head_dim")
+            ) or self._read_positive_int_attr(config, ("attention_head_dim", "head_dim"))
+            if num_heads is not None and head_dim is not None:
+                return num_heads * head_dim
+
+        raise ValueError(
+            "Could not infer paged Cache-DiT hidden_dim. Set "
+            "paged_cache_hidden_dim in cache_config."
+        )
+
+    def _infer_paged_dtype_device(self, pipeline: Any) -> tuple[torch.dtype, torch.device]:
+        for module in self._candidate_modules_for_paged_cache(pipeline):
+            parameters = getattr(module, "parameters", None)
+            buffers = getattr(module, "buffers", None)
+            tensors = []
+            if callable(parameters):
+                tensors.extend(parameters(recurse=True))
+            if callable(buffers):
+                tensors.extend(buffers(recurse=True))
+            for tensor in tensors:
+                if torch.is_floating_point(tensor):
+                    return tensor.dtype, tensor.device
+
+            dtype = getattr(module, "dtype", None)
+            if isinstance(dtype, torch.dtype):
+                device = getattr(pipeline, "device", torch.device("cpu"))
+                return dtype, torch.device(device)
+
+        return torch.float32, torch.device("cpu")
+
+    def _infer_paged_num_blocks(self, pipeline: Any) -> int:
+        configured = getattr(self.config, "paged_cache_num_blocks", None)
+        if configured is not None:
+            return int(configured)
+
+        total = 0
+        for module in self._candidate_modules_for_paged_cache(pipeline):
+            for attr in ("blocks", "transformer_blocks", "single_transformer_blocks"):
+                blocks = getattr(module, attr, None)
+                if blocks is not None:
+                    total += len(blocks)
+        if total <= 0:
+            raise ValueError(
+                "Could not infer paged Cache-DiT num_blocks. Set "
+                "paged_cache_num_blocks or paged_cache_num_pages in cache_config."
+            )
+        return total
+
+    @staticmethod
+    def _candidate_modules_for_paged_cache(pipeline: Any) -> list[Any]:
+        modules: list[Any] = []
+        seen_ids: set[int] = set()
+
+        def add(module: Any) -> None:
+            if module is None:
+                return
+            module_id = id(module)
+            if module_id in seen_ids:
+                return
+            seen_ids.add(module_id)
+            modules.append(module)
+
+        add(pipeline)
+        add(getattr(pipeline, "transformer", None))
+        add(getattr(pipeline, "transformer_2", None))
+        add(getattr(pipeline, "bagel", None))
+        language_model = getattr(pipeline, "language_model", None)
+        add(language_model)
+        add(getattr(language_model, "model", None))
+        return modules
+
+    @staticmethod
+    def _read_positive_int_attr(obj: Any, names: tuple[str, ...]) -> int | None:
+        if obj is None:
+            return None
+        for name in names:
+            value = getattr(obj, name, None)
+            if isinstance(value, int) and value > 0:
+                return value
+        return None
 
     def is_enabled(self) -> bool:
         """Check if cache-dit is enabled on this pipeline.
