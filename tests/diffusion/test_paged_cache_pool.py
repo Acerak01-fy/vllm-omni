@@ -209,6 +209,33 @@ class TestPagedCacheContext:
         assert context.page_tables == {}
         assert context.get_buffer("metadata") is metadata
 
+    def test_apply_buffer_and_mean_abs_diff_cpu_fallback(self):
+        pool = PagedCachePool(
+            num_pages=4,
+            page_size=2,
+            hidden_dim=2,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        context = PagedCacheContext(CachedContext(name="ctx"), pool)
+        data = torch.arange(1, 13, dtype=torch.float32).reshape(2, 3, 2)
+        context.set_buffer("hidden", data)
+
+        target = torch.ones_like(data)
+        applied = context.apply_buffer("hidden", target, residual=True)
+
+        assert torch.equal(applied, data + 1)
+        assert torch.equal(target, data + 1)
+
+        copied = context.apply_buffer("hidden", torch.empty_like(data), residual=False)
+
+        assert torch.equal(copied, data)
+
+        probe = data + 2
+        expected_ratio = (probe - data).abs().sum() / data.abs().sum()
+
+        assert context.mean_abs_diff_ratio("hidden", probe) == pytest.approx(expected_ratio.item())
+
 
 class _ReplacingRefreshBackend:
     def force_refresh(self, pipeline, num_inference_steps: int, verbose: bool = False):

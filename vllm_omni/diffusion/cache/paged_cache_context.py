@@ -10,6 +10,11 @@ from typing import Any
 
 import torch
 
+from vllm_omni.diffusion.cache.kernels.paged_cache_ops import (
+    paged_abs_diff_stats,
+    paged_residual_add_,
+    paged_scatter_write,
+)
 from vllm_omni.diffusion.cache.paged_cache_pool import PagedCachePool
 
 __all__ = ["PagedBufferEntry", "PagedCacheContext"]
@@ -80,12 +85,14 @@ class PagedCacheContext:
         if not flat.is_contiguous():
             flat = flat.contiguous()
 
-        for page_idx, page_id in enumerate(entry.page_ids):
-            start = page_idx * self._pool.page_size
-            end = min(start + self._pool.page_size, entry.num_tokens)
-            if start >= end:
-                break
-            self._pool.get_page_tensor(page_id)[: end - start].copy_(flat[start:end])
+        paged_scatter_write(
+            flat,
+            self._pool.page_pool_tensor,
+            entry.page_table,
+            num_tokens=entry.num_tokens,
+            page_size=self._pool.page_size,
+            hidden_dim=self._pool.hidden_dim,
+        )
 
     def get_buffer(self, name: str) -> torch.Tensor | Any | None:
         """Return a contiguous tensor view of a paged logical buffer."""
@@ -102,6 +109,62 @@ class PagedCacheContext:
     def remove_buffer(self, name: str) -> None:
         self._free_paged_buffer(name)
         self._remove_base_buffer(name)
+
+    def apply_buffer(self, name: str, target: torch.Tensor, *, residual: bool) -> torch.Tensor | None:
+        """Apply a cached buffer to ``target`` without materializing a gather copy."""
+        entry = self._paged_buffers.get(name)
+        if entry is None:
+            base_buffer = self._get_base_buffer(name)
+            if base_buffer is None:
+                return None
+            if residual:
+                return (base_buffer + target).contiguous()
+            return base_buffer.contiguous()
+
+        if tuple(entry.shape) != tuple(target.shape) or not self._can_page(target):
+            cached = self.get_buffer(name)
+            if cached is None:
+                return None
+            if residual:
+                return (cached + target).contiguous()
+            return cached.contiguous()
+
+        copy_back = not target.is_contiguous()
+        output = target.contiguous() if copy_back else target
+        paged_residual_add_(
+            output,
+            self._pool.page_pool_tensor,
+            entry.page_table,
+            num_tokens=entry.num_tokens,
+            page_size=self._pool.page_size,
+            hidden_dim=self._pool.hidden_dim,
+            add_input=residual,
+        )
+        if copy_back:
+            target.copy_(output)
+            return target
+        return output
+
+    def mean_abs_diff_ratio(self, name: str, tensor: torch.Tensor) -> float | None:
+        """Compute cache-dit's default ``mean(abs(diff)) / mean(abs(cache))``."""
+        entry = self._paged_buffers.get(name)
+        if entry is None:
+            return None
+        if tuple(entry.shape) != tuple(tensor.shape) or not self._can_page(tensor):
+            return None
+
+        flat = tensor.detach().reshape(-1, self._pool.hidden_dim)
+        if not flat.is_contiguous():
+            flat = flat.contiguous()
+        stats = paged_abs_diff_stats(
+            flat,
+            self._pool.page_pool_tensor,
+            entry.page_table,
+            num_tokens=entry.num_tokens,
+            page_size=self._pool.page_size,
+            hidden_dim=self._pool.hidden_dim,
+        )
+        return (stats[0] / stats[1]).item()
 
     def clear_buffers(self) -> None:
         for entry in list(self._paged_buffers.values()):
@@ -120,7 +183,7 @@ class PagedCacheContext:
             return False
         if int(buffer.shape[-1]) != self._pool.hidden_dim:
             return False
-        if buffer.dtype != self._pool.dtype or buffer.device != self._pool.device:
+        if buffer.dtype != self._pool.dtype or buffer.device != self._pool.page_pool_tensor.device:
             return False
         return True
 
@@ -158,7 +221,7 @@ class PagedCacheContext:
             self._pool.free(entry.page_ids)
 
     def _make_page_table(self, page_ids: list[int]) -> torch.Tensor:
-        return torch.tensor(page_ids, dtype=torch.long, device=self._pool.device)
+        return torch.tensor(page_ids, dtype=torch.int32, device=self._pool.device)
 
     def _set_base_buffer(self, name: str, buffer: Any) -> None:
         if hasattr(self._base_context, "set_buffer"):

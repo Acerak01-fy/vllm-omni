@@ -17,6 +17,8 @@ from typing import Any
 
 import torch
 
+from vllm_omni.diffusion.cache.paged_cache_context import PagedCacheContext
+
 logger = logging.getLogger(__name__)
 
 # Kwargs whose leading dim aligns with the batch row dim; they get
@@ -130,9 +132,7 @@ def _trim_encoder_slice(
 ) -> tuple[torch.Tensor | None, int | None]:
     if encoder_slice is None:
         return None, None
-    seq_len = _request_encoder_seq_len(
-        kwargs, request_index, row_start, row_end, int(encoder_slice.shape[1])
-    )
+    seq_len = _request_encoder_seq_len(kwargs, request_index, row_start, row_end, int(encoder_slice.shape[1]))
     return encoder_slice[:, :seq_len], seq_len
 
 
@@ -147,6 +147,147 @@ def _restore_encoder_slice(
     n = min(int(seq_len), int(restored.shape[1]), int(encoder_slice.shape[1]))
     restored[:, :n] = encoder_slice[:, :n]
     return restored
+
+
+def _cache_buffer_name(context_manager: Any, prefix: str, *, encoder: bool = False) -> str:
+    if encoder:
+        suffix = "_encoder_buffer_cfg" if context_manager.is_separate_cfg_step() else "_encoder_buffer"
+    else:
+        suffix = "_buffer_cfg" if context_manager.is_separate_cfg_step() else "_buffer"
+    return f"{prefix}{suffix}"
+
+
+def _paged_can_cache(
+    context_manager: Any,
+    states_tensor: torch.Tensor,
+    *,
+    parallelized: bool,
+    prefix: str,
+) -> bool | None:
+    """Fast path for Cache-DiT's default similarity check on paged buffers."""
+    context = getattr(context_manager, "_current_context", None)
+    if not isinstance(context, PagedCacheContext) or parallelized:
+        return None
+
+    if context_manager.is_in_warmup():
+        return False
+
+    if context_manager.is_steps_computation_mask_enabled():
+        if context_manager.is_in_full_compute_steps():
+            return False
+        if context_manager.get_steps_computation_policy() == "static":
+            return True
+
+    max_cached_steps = context_manager.get_max_cached_steps()
+    cached_steps = (
+        context_manager.get_cached_steps()
+        if not context_manager.is_separate_cfg_step()
+        else context_manager.get_cfg_cached_steps()
+    )
+    if max_cached_steps >= 0 and len(cached_steps) >= max_cached_steps:
+        return False
+
+    max_continuous_cached_steps = context_manager.get_max_continuous_cached_steps()
+    continuous_cached_steps = (
+        context_manager.get_continuous_cached_steps()
+        if not context_manager.is_separate_cfg_step()
+        else context_manager.get_cfg_continuous_cached_steps()
+    )
+    if max_continuous_cached_steps >= 0 and continuous_cached_steps >= max_continuous_cached_steps:
+        cached_context = context_manager.get_context()
+        if not context_manager.is_separate_cfg_step():
+            cached_context.continuous_cached_steps = 0
+        else:
+            cached_context.cfg_continuous_cached_steps = 0
+        return False
+
+    max_accumulated_threshold = context_manager.max_accumulated_residual_diff_threshold()
+    if max_accumulated_threshold is not None and max_accumulated_threshold > 0.0:
+        accumulated = (
+            context_manager.get_accumulated_residual_diff()
+            if not context_manager.is_separate_cfg_step()
+            else context_manager.get_cfg_accumulated_residual_diff()
+        )
+        if accumulated >= max_accumulated_threshold:
+            return False
+
+    threshold = context_manager.get_residual_diff_threshold()
+    if threshold <= 0.0:
+        return False
+
+    buffer_name = _cache_buffer_name(context_manager, prefix)
+    if buffer_name not in context.paged_buffers:
+        return None
+
+    if threshold >= 1.0:
+        context_manager.add_residual_diff(-1.0)
+        return True
+
+    downsample_factor = context_manager.get_downsample_factor()
+    if downsample_factor > 1 and "Bn" not in prefix:
+        states_tensor = states_tensor[..., ::downsample_factor].contiguous()
+
+    if tuple(context.paged_buffers[buffer_name].shape) != tuple(states_tensor.shape):
+        context_manager.add_residual_diff(-2.0)
+        return False
+
+    if all(
+        (
+            context_manager.enable_separate_cfg(),
+            context_manager.is_separate_cfg_step(),
+            not context_manager.cfg_diff_compute_separate(),
+            context_manager.get_current_step_residual_diff() is not None,
+        )
+    ):
+        diff = context_manager.get_current_step_residual_diff()
+    elif context_manager.get_important_condition_threshold() > 0.0:
+        return None
+    else:
+        diff = context.mean_abs_diff_ratio(buffer_name, states_tensor)
+        if diff is None:
+            return None
+
+    context_manager.add_residual_diff(diff)
+    return diff < threshold
+
+
+def _paged_apply_cache(
+    context_manager: Any,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor | None,
+    *,
+    prefix: str,
+    encoder_prefix: str,
+) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+    """Fast path for applying paged Bn buffers without gather materialization."""
+    context = getattr(context_manager, "_current_context", None)
+    if not isinstance(context, PagedCacheContext):
+        return None
+
+    if "Bn" in prefix and context_manager.is_calibrator_enabled():
+        return None
+    if encoder_hidden_states is not None and "Bn" in encoder_prefix and context_manager.is_encoder_calibrator_enabled():
+        return None
+
+    hidden_name = _cache_buffer_name(context_manager, prefix)
+    hidden_states = context.apply_buffer(
+        hidden_name,
+        hidden_states,
+        residual=context_manager.is_cache_residual(),
+    )
+    if hidden_states is None:
+        return None
+
+    if encoder_hidden_states is not None:
+        encoder_name = _cache_buffer_name(context_manager, encoder_prefix, encoder=True)
+        cached_encoder = context.apply_buffer(
+            encoder_name,
+            encoder_hidden_states,
+            residual=context_manager.is_encoder_cache_residual(),
+        )
+        encoder_hidden_states = encoder_hidden_states.contiguous() if cached_encoder is None else cached_encoder
+
+    return hidden_states.contiguous(), encoder_hidden_states
 
 
 # --- batched forward (shared between Pattern 0/1/2 and Pattern 3/4/5) ---
@@ -167,15 +308,13 @@ def _forward_batched(
     ctx_name: str = self.cache_context
     prefix: str = self.cache_prefix
 
+    cm._current_context = batch_contexts[0][ctx_name]
     use_l1 = cm.is_l1_diff_enabled()
     parallelized = self._is_parallelized()
     fn_check_prefix = f"{prefix}_Fn_hidden_states" if use_l1 else f"{prefix}_Fn_residual"
     bn_hs_prefix = f"{prefix}_Bn_residual" if cm.is_cache_residual() else f"{prefix}_Bn_hidden_states"
-    bn_enc_prefix = (
-        f"{prefix}_Bn_residual" if cm.is_encoder_cache_residual() else f"{prefix}_Bn_hidden_states"
-    )
+    bn_enc_prefix = f"{prefix}_Bn_residual" if cm.is_encoder_cache_residual() else f"{prefix}_Bn_hidden_states"
 
-    cm._current_context = batch_contexts[0][ctx_name]
     self._check_cache_params()
 
     # Stage 1: Fn blocks on full batch.
@@ -198,7 +337,17 @@ def _forward_batched(
         start = row_offsets[i]
         end = start + row_counts[i]
         check = hidden_states[start:end] if use_l1 else fn_residual[start:end]
-        decisions.append(cm.can_cache(check, parallelized=parallelized, prefix=fn_check_prefix))
+        paged_decision = _paged_can_cache(
+            cm,
+            check,
+            parallelized=parallelized,
+            prefix=fn_check_prefix,
+        )
+        decisions.append(
+            paged_decision
+            if paged_decision is not None
+            else cm.can_cache(check, parallelized=parallelized, prefix=fn_check_prefix)
+        )
 
     compute_idx = [i for i, d in enumerate(decisions) if not d]
     cache_idx = [i for i, d in enumerate(decisions) if d]
@@ -214,15 +363,11 @@ def _forward_batched(
 
         compute_hs = torch.index_select(hidden_states, 0, row_index)
         if is_pattern_345:
-            mn_hs, mn_enc, mn_hs_residual = self.call_Mn_blocks(
-                compute_hs, *args, **compute_kwargs
-            )
+            mn_hs, mn_enc, mn_hs_residual = self.call_Mn_blocks(compute_hs, *args, **compute_kwargs)
             mn_enc_residual = None
         else:
             compute_enc = (
-                torch.index_select(encoder_hidden_states, 0, row_index)
-                if encoder_hidden_states is not None
-                else None
+                torch.index_select(encoder_hidden_states, 0, row_index) if encoder_hidden_states is not None else None
             )
             mn_hs, mn_enc, mn_hs_residual, mn_enc_residual = self.call_Mn_blocks(
                 compute_hs, compute_enc, *args, **compute_kwargs
@@ -244,29 +389,24 @@ def _forward_batched(
                 cm.set_Fn_buffer(fn_hs[bs : bs + nr], f"{prefix}_Fn_hidden_states")
 
             if cm.is_cache_residual():
-                cm.set_Bn_buffer(
-                    mn_hs_residual[local : local + nr], prefix=f"{prefix}_Bn_residual"
-                )
+                cm.set_Bn_buffer(mn_hs_residual[local : local + nr], prefix=f"{prefix}_Bn_residual")
             else:
-                cm.set_Bn_buffer(
-                    mn_hs[local : local + nr], prefix=f"{prefix}_Bn_hidden_states"
-                )
+                cm.set_Bn_buffer(mn_hs[local : local + nr], prefix=f"{prefix}_Bn_hidden_states")
 
             if can_store_enc:
-                req_mn_enc, _ = _trim_encoder_slice(
-                    mn_enc[local : local + nr], kwargs, i, bs, bs + nr
-                )
+                req_mn_enc, _ = _trim_encoder_slice(mn_enc[local : local + nr], kwargs, i, bs, bs + nr)
                 if cm.is_encoder_cache_residual():
                     if is_pattern_345:
                         old_enc, _ = _trim_encoder_slice(
                             pre_mn_encoder[bs : bs + nr] if pre_mn_encoder is not None else None,
-                            kwargs, i, bs, bs + nr,
+                            kwargs,
+                            i,
+                            bs,
+                            bs + nr,
                         )
                         enc_res = req_mn_enc - old_enc if old_enc is not None else req_mn_enc
                     else:
-                        enc_res, _ = _trim_encoder_slice(
-                            mn_enc_residual[local : local + nr], kwargs, i, bs, bs + nr
-                        )
+                        enc_res, _ = _trim_encoder_slice(mn_enc_residual[local : local + nr], kwargs, i, bs, bs + nr)
                     cm.set_Bn_encoder_buffer(enc_res, prefix=f"{prefix}_Bn_residual")
                 else:
                     cm.set_Bn_encoder_buffer(req_mn_enc, prefix=f"{prefix}_Bn_hidden_states")
@@ -278,9 +418,7 @@ def _forward_batched(
         hidden_states.index_copy_(0, row_index, mn_hs)
         if mn_enc is not None:
             encoder_hidden_states = (
-                torch.zeros_like(hidden_states)
-                if encoder_hidden_states is None
-                else encoder_hidden_states.clone()
+                torch.zeros_like(hidden_states) if encoder_hidden_states is None else encoder_hidden_states.clone()
             )
             encoder_hidden_states.index_copy_(0, row_index, mn_enc)
 
@@ -295,24 +433,30 @@ def _forward_batched(
         enc_slice = encoder_hidden_states[start:end] if encoder_hidden_states is not None else None
         trimmed_enc, seq_len = _trim_encoder_slice(enc_slice, kwargs, i, start, end)
 
-        cached_hs, cached_enc = cm.apply_cache(
+        paged_cache = _paged_apply_cache(
+            cm,
             hidden_states[start:end],
             trimmed_enc,
             prefix=bn_hs_prefix,
             encoder_prefix=bn_enc_prefix,
         )
+        if paged_cache is None:
+            cached_hs, cached_enc = cm.apply_cache(
+                hidden_states[start:end],
+                trimmed_enc,
+                prefix=bn_hs_prefix,
+                encoder_prefix=bn_enc_prefix,
+            )
+        else:
+            cached_hs, cached_enc = paged_cache
         hidden_states[start:end] = cached_hs
         if encoder_hidden_states is not None and cached_enc is not None:
-            encoder_hidden_states[start:end] = _restore_encoder_slice(
-                cached_enc, enc_slice, seq_len
-            )
+            encoder_hidden_states[start:end] = _restore_encoder_slice(cached_enc, enc_slice, seq_len)
 
     # Stage 4: Bn blocks on full batch (Pattern 3/4/5 may skip entirely).
     if not is_pattern_345 or cm.Bn_compute_blocks() > 0:
         if is_pattern_345:
-            hidden_states, encoder_hidden_states = self.call_Bn_blocks(
-                hidden_states, *args, **kwargs
-            )
+            hidden_states, encoder_hidden_states = self.call_Bn_blocks(hidden_states, *args, **kwargs)
         else:
             hidden_states, encoder_hidden_states = self.call_Bn_blocks(
                 hidden_states, encoder_hidden_states, *args, **kwargs
@@ -331,8 +475,12 @@ def _forward_batched_base(
 ) -> Any:
     """Batch-aware forward for ``CachedBlocks_Pattern_Base`` (Pattern 0/1/2)."""
     return _forward_batched(
-        self, hidden_states, encoder_hidden_states, *args,
-        is_pattern_345=False, **kwargs,
+        self,
+        hidden_states,
+        encoder_hidden_states,
+        *args,
+        is_pattern_345=False,
+        **kwargs,
     )
 
 
@@ -344,8 +492,12 @@ def _forward_batched_345(
 ) -> Any:
     """Batch-aware forward for ``CachedBlocks_Pattern_3_4_5`` (Pattern 3/4/5)."""
     return _forward_batched(
-        self, hidden_states, None, *args,
-        is_pattern_345=True, **kwargs,
+        self,
+        hidden_states,
+        None,
+        *args,
+        is_pattern_345=True,
+        **kwargs,
     )
 
 
