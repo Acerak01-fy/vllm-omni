@@ -117,6 +117,22 @@ class TestPagedCachePool:
             == 30
         )
 
+    def test_estimate_pool_size_matches_wan_512_resolution_mapping(self):
+        latent_seq_len = 16 * 16
+        txt_seq_len = 77
+
+        assert (
+            estimate_pool_size(
+                max_concurrent_requests=8,
+                max_seq_len=max(latent_seq_len, txt_seq_len),
+                num_blocks=40,
+                buffers_per_block=3,
+                page_size=16,
+                safety_factor=1.0,
+            )
+            == 15360
+        )
+
 
 class TestPagedCacheContext:
     def test_set_get_and_clear_paged_tensor(self):
@@ -267,3 +283,25 @@ class TestPagedCacheDiTStateDriver:
         assert driver.pool.num_pages == 4
         assert driver.pool.page_size == 2
         assert driver.pool.hidden_dim == 2
+
+    def test_cache_dit_backend_estimates_pool_size_from_model_shape(self):
+        pipeline, _ = _make_context_pipeline(hidden_dim=4)
+        pipeline.transformer.blocks = [object(), object(), object()]
+        backend = CacheDiTBackend(
+            DiffusionCacheConfig(
+                enable_paged_cache=True,
+                paged_cache_page_size=4,
+                paged_cache_max_seq_len=5,
+                paged_cache_max_concurrent_requests=2,
+                paged_cache_buffers_per_block=3,
+                paged_cache_safety_factor=1.0,
+            )
+        )
+        backend.enabled = True
+
+        driver = backend.create_state_driver(pipeline)
+
+        assert isinstance(driver, PagedCacheDiTStateDriver)
+        assert driver.pool.num_pages == 36
+        assert driver.pool.page_size == 4
+        assert driver.pool.hidden_dim == 4
