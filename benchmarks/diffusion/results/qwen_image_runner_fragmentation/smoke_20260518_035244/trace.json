@@ -1,0 +1,22 @@
+[
+  {
+    "req_id": "qwen-c-000",
+    "profile_name": "qwen_c_768_20",
+    "width": 768,
+    "height": 768,
+    "num_inference_steps": 20,
+    "arrival_tick": 0,
+    "seed": 7000,
+    "prompt": "a ceramic teapot on a wooden table, soft studio lighting"
+  },
+  {
+    "req_id": "qwen-c-001",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 0,
+    "seed": 7001,
+    "prompt": "a futuristic city skyline at sunset with clean architectural details"
+  }
+]

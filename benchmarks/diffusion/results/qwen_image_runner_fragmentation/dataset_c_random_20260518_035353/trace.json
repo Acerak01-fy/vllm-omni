@@ -1,0 +1,82 @@
+[
+  {
+    "req_id": "qwen-c-000",
+    "profile_name": "qwen_c_768_20",
+    "width": 768,
+    "height": 768,
+    "num_inference_steps": 20,
+    "arrival_tick": 0,
+    "seed": 7000,
+    "prompt": "a ceramic teapot on a wooden table, soft studio lighting"
+  },
+  {
+    "req_id": "qwen-c-001",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 0,
+    "seed": 7001,
+    "prompt": "a futuristic city skyline at sunset with clean architectural details"
+  },
+  {
+    "req_id": "qwen-c-002",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 0,
+    "seed": 7002,
+    "prompt": "a bowl of strawberries beside a glass of water, realistic texture"
+  },
+  {
+    "req_id": "qwen-c-003",
+    "profile_name": "qwen_c_512_20",
+    "width": 512,
+    "height": 512,
+    "num_inference_steps": 20,
+    "arrival_tick": 1,
+    "seed": 7003,
+    "prompt": "a small cabin in snowy mountains, clear sky, cinematic composition"
+  },
+  {
+    "req_id": "qwen-c-004",
+    "profile_name": "qwen_c_512_20",
+    "width": 512,
+    "height": 512,
+    "num_inference_steps": 20,
+    "arrival_tick": 2,
+    "seed": 7004,
+    "prompt": "a watercolor painting of a mountain lake with reflections"
+  },
+  {
+    "req_id": "qwen-c-005",
+    "profile_name": "qwen_c_512_20",
+    "width": 512,
+    "height": 512,
+    "num_inference_steps": 20,
+    "arrival_tick": 3,
+    "seed": 7005,
+    "prompt": "a vintage camera on a desk with notebooks and pencils"
+  },
+  {
+    "req_id": "qwen-c-006",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 3,
+    "seed": 7006,
+    "prompt": "a robot gardener watering flowers in a greenhouse"
+  },
+  {
+    "req_id": "qwen-c-007",
+    "profile_name": "qwen_c_512_20",
+    "width": 512,
+    "height": 512,
+    "num_inference_steps": 20,
+    "arrival_tick": 5,
+    "seed": 7007,
+    "prompt": "a minimalist product photo of running shoes on a white background"
+  }
+]

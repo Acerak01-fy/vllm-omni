@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460">
+<style>
+text{font-family:Arial,Helvetica,sans-serif;fill:#222}
+.title{font-size:18px;font-weight:700}
+.label{font-size:12px}
+.tick{font-size:11px;fill:#555}
+.grid{stroke:#d0d7de;stroke-width:1;opacity:.7}
+.axis{stroke:#24292f;stroke-width:1.2}
+</style>
+<text class="title" x="450.0" y="26" text-anchor="middle">Qwen-Image Runner Fragmentation Ratio</text>
+<text class="label" x="450.0" y="444" text-anchor="middle">event tick</text>
+<text class="label" transform="translate(18 224.0) rotate(-90)" text-anchor="middle">ratio</text>
+<line class="grid" x1="78" x2="876" y1="396.0" y2="396.0"/>
+<text class="tick" x="70" y="400.0" text-anchor="end">0.00</text>
+<line class="grid" x1="78" x2="876" y1="327.2" y2="327.2"/>
+<text class="tick" x="70" y="331.2" text-anchor="end">0.20</text>
+<line class="grid" x1="78" x2="876" y1="258.4" y2="258.4"/>
+<text class="tick" x="70" y="262.4" text-anchor="end">0.40</text>
+<line class="grid" x1="78" x2="876" y1="189.6" y2="189.6"/>
+<text class="tick" x="70" y="193.6" text-anchor="end">0.60</text>
+<line class="grid" x1="78" x2="876" y1="120.8" y2="120.8"/>
+<text class="tick" x="70" y="124.8" text-anchor="end">0.80</text>
+<line class="grid" x1="78" x2="876" y1="52.0" y2="52.0"/>
+<text class="tick" x="70" y="56.0" text-anchor="end">1.00</text>
+<line class="grid" x1="78.0" x2="78.0" y1="52" y2="396"/>
+<text class="tick" x="78.0" y="414" text-anchor="middle">0</text>
+<line class="grid" x1="140.0" x2="140.0" y1="52" y2="396"/>
+<text class="tick" x="140.0" y="414" text-anchor="middle">8</text>
+<line class="grid" x1="202.0" x2="202.0" y1="52" y2="396"/>
+<text class="tick" x="202.0" y="414" text-anchor="middle">16</text>
+<line class="grid" x1="263.9" x2="263.9" y1="52" y2="396"/>
+<text class="tick" x="263.9" y="414" text-anchor="middle">24</text>
+<line class="grid" x1="310.4" x2="310.4" y1="52" y2="396"/>
+<text class="tick" x="310.4" y="414" text-anchor="middle">30</text>
+<line class="grid" x1="364.7" x2="364.7" y1="52" y2="396"/>
+<text class="tick" x="364.7" y="414" text-anchor="middle">37</text>
+<line class="grid" x1="418.9" x2="418.9" y1="52" y2="396"/>
+<text class="tick" x="418.9" y="414" text-anchor="middle">44</text>
+<line class="grid" x1="473.1" x2="473.1" y1="52" y2="396"/>
+<text class="tick" x="473.1" y="414" text-anchor="middle">51</text>
+<line class="grid" x1="542.9" x2="542.9" y1="52" y2="396"/>
+<text class="tick" x="542.9" y="414" text-anchor="middle">60</text>
+<line class="grid" x1="597.1" x2="597.1" y1="52" y2="396"/>
+<text class="tick" x="597.1" y="414" text-anchor="middle">67</text>
+<line class="grid" x1="666.8" x2="666.8" y1="52" y2="396"/>
+<text class="tick" x="666.8" y="414" text-anchor="middle">76</text>
+<line class="grid" x1="736.5" x2="736.5" y1="52" y2="396"/>
+<text class="tick" x="736.5" y="414" text-anchor="middle">85</text>
+<line class="grid" x1="806.3" x2="806.3" y1="52" y2="396"/>
+<text class="tick" x="806.3" y="414" text-anchor="middle">94</text>
+<line class="grid" x1="876.0" x2="876.0" y1="52" y2="396"/>
+<text class="tick" x="876.0" y="414" text-anchor="middle">103</text>
+<line class="axis" x1="78" x2="78" y1="52" y2="396"/>
+<line class="axis" x1="78" x2="876" y1="396" y2="396"/>
+<polyline fill="none" stroke="#0072B2" stroke-width="2.2" stroke-linejoin="round" points="78.0,152.9 78.0,91.7 85.7,94.1 93.5,89.5 101.2,99.0 109.0,102.3 116.7,98.8 124.5,99.6 132.2,96.6 140.0,99.7 147.7,96.6 155.5,98.4 163.2,101.8 171.0,98.4 178.7,101.8 186.5,95.4 186.5,96.1 194.2,97.8 202.0,94.7 209.7,94.1 209.7,94.3 217.5,91.9 225.2,92.5 233.0,93.6 240.7,93.9 248.4,95.1 256.2,96.3 263.9,93.9 263.9,91.5 271.7,87.4 271.7,87.9 279.4,86.3 279.4,86.3 287.2,86.4 294.9,86.9 302.7,87.7 310.4,88.2 318.2,86.5 318.2,86.5 325.9,86.5 333.7,86.5 341.4,86.5 349.2,86.5 356.9,85.0 356.9,85.8 364.7,86.0 372.4,85.9 380.2,84.5 380.2,84.5 387.9,83.8 387.9,83.8 395.7,83.8 403.4,85.3 411.1,85.3 418.9,85.3 426.6,85.3 434.4,84.9 434.4,84.9 442.1,84.9 449.9,84.9 457.6,84.9 465.4,84.2 465.4,84.2 473.1,84.2 480.9,84.2 488.6,84.2 496.4,84.2 504.1,84.2 511.9,84.2 519.6,84.2 527.4,84.2 535.1,84.2 542.9,82.9 542.9,82.9 550.6,82.9 558.3,82.9 566.1,80.3 566.1,80.3 573.8,80.3 581.6,80.3 589.3,80.3 597.1,80.3 604.8,80.3 612.6,80.3 620.3,80.3 628.1,80.3 635.8,80.3 643.6,80.3 651.3,80.3 659.1,80.3 666.8,80.3 674.6,80.3 682.3,80.3 690.1,80.3 697.8,80.3 705.6,80.3 713.3,80.3 721.0,80.3 728.8,80.3 736.5,80.3 744.3,80.3 752.0,80.3 759.8,80.3 767.5,80.3 775.3,80.3 783.0,80.1 790.8,80.0 798.5,80.0 806.3,80.0 814.0,80.0 821.8,80.0 829.5,80.0 837.3,91.6 845.0,91.5 852.8,91.5 860.5,91.5 868.3,91.5 876.0,91.3"/>
+<line x1="90" x2="114" y1="70" y2="70" stroke="#0072B2" stroke-width="3"/>
+<text class="label" x="122" y="74">frag_ratio</text>
+</svg>

@@ -1,0 +1,56 @@
+{
+  "model": "/home/wangfuyin/.cache/modelscope/hub/models/Qwen/Qwen-Image",
+  "dataset": "qwen_image_dataset_c",
+  "num_requests": 2,
+  "seed": 7,
+  "oom_observed": false,
+  "error": "",
+  "max_frag_ratio": 0.8693437481932491,
+  "mean_frag_ratio": 0.8442771480461511,
+  "max_frag_tick": 7,
+  "max_frag_total_inactive_mib": 734.75244140625,
+  "max_frag_largest_inactive_mib": 96.0,
+  "max_reserved_mib": 55936.0,
+  "max_allocated_mib": 55202.24755859375,
+  "max_resident_cache_mib": 150.375,
+  "finished_requests": 0,
+  "released_requests": 2,
+  "pending_requests": 0,
+  "profiles": [
+    {
+      "name": "qwen_c_512_20",
+      "width": 512,
+      "height": 512,
+      "num_inference_steps": 20,
+      "weight": 0.15
+    },
+    {
+      "name": "qwen_c_768_20",
+      "width": 768,
+      "height": 768,
+      "num_inference_steps": 20,
+      "weight": 0.25
+    },
+    {
+      "name": "qwen_c_1024_25",
+      "width": 1024,
+      "height": 1024,
+      "num_inference_steps": 25,
+      "weight": 0.45
+    },
+    {
+      "name": "qwen_c_1536_35",
+      "width": 1536,
+      "height": 1536,
+      "num_inference_steps": 35,
+      "weight": 0.15
+    }
+  ],
+  "cache_config": {
+    "Fn_compute_blocks": 1,
+    "Bn_compute_blocks": 0,
+    "max_warmup_steps": 1,
+    "residual_diff_threshold": 0.24,
+    "max_continuous_cached_steps": 3
+  }
+}

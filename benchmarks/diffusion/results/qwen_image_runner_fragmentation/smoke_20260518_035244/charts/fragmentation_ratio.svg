@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460">
+<style>
+text{font-family:Arial,Helvetica,sans-serif;fill:#222}
+.title{font-size:18px;font-weight:700}
+.label{font-size:12px}
+.tick{font-size:11px;fill:#555}
+.grid{stroke:#d0d7de;stroke-width:1;opacity:.7}
+.axis{stroke:#24292f;stroke-width:1.2}
+</style>
+<text class="title" x="450.0" y="26" text-anchor="middle">Qwen-Image Runner Fragmentation Ratio</text>
+<text class="label" x="450.0" y="444" text-anchor="middle">event tick</text>
+<text class="label" transform="translate(18 224.0) rotate(-90)" text-anchor="middle">ratio</text>
+<line class="grid" x1="78" x2="876" y1="396.0" y2="396.0"/>
+<text class="tick" x="70" y="400.0" text-anchor="end">0.00</text>
+<line class="grid" x1="78" x2="876" y1="327.2" y2="327.2"/>
+<text class="tick" x="70" y="331.2" text-anchor="end">0.20</text>
+<line class="grid" x1="78" x2="876" y1="258.4" y2="258.4"/>
+<text class="tick" x="70" y="262.4" text-anchor="end">0.40</text>
+<line class="grid" x1="78" x2="876" y1="189.6" y2="189.6"/>
+<text class="tick" x="70" y="193.6" text-anchor="end">0.60</text>
+<line class="grid" x1="78" x2="876" y1="120.8" y2="120.8"/>
+<text class="tick" x="70" y="124.8" text-anchor="end">0.80</text>
+<line class="grid" x1="78" x2="876" y1="52.0" y2="52.0"/>
+<text class="tick" x="70" y="56.0" text-anchor="end">1.00</text>
+<line class="grid" x1="78.0" x2="78.0" y1="52" y2="396"/>
+<text class="tick" x="78.0" y="414" text-anchor="middle">0</text>
+<line class="grid" x1="78.0" x2="78.0" y1="52" y2="396"/>
+<text class="tick" x="78.0" y="414" text-anchor="middle">0</text>
+<line class="grid" x1="192.0" x2="192.0" y1="52" y2="396"/>
+<text class="tick" x="192.0" y="414" text-anchor="middle">1</text>
+<line class="grid" x1="306.0" x2="306.0" y1="52" y2="396"/>
+<text class="tick" x="306.0" y="414" text-anchor="middle">2</text>
+<line class="grid" x1="420.0" x2="420.0" y1="52" y2="396"/>
+<text class="tick" x="420.0" y="414" text-anchor="middle">3</text>
+<line class="grid" x1="534.0" x2="534.0" y1="52" y2="396"/>
+<text class="tick" x="534.0" y="414" text-anchor="middle">4</text>
+<line class="grid" x1="648.0" x2="648.0" y1="52" y2="396"/>
+<text class="tick" x="648.0" y="414" text-anchor="middle">5</text>
+<line class="grid" x1="762.0" x2="762.0" y1="52" y2="396"/>
+<text class="tick" x="762.0" y="414" text-anchor="middle">6</text>
+<line class="grid" x1="876.0" x2="876.0" y1="52" y2="396"/>
+<text class="tick" x="876.0" y="414" text-anchor="middle">7</text>
+<line class="axis" x1="78" x2="78" y1="52" y2="396"/>
+<line class="axis" x1="78" x2="876" y1="396" y2="396"/>
+<polyline fill="none" stroke="#0072B2" stroke-width="2.2" stroke-linejoin="round" points="78.0,152.9 78.0,104.9 192.0,101.1 306.0,100.1 420.0,100.0 534.0,100.1 648.0,97.0 762.0,97.0 876.0,96.9"/>
+<line x1="90" x2="114" y1="70" y2="70" stroke="#0072B2" stroke-width="3"/>
+<text class="label" x="122" y="74">frag_ratio</text>
+</svg>

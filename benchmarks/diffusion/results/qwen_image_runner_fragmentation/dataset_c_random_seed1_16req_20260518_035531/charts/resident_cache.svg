@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460">
+<style>
+text{font-family:Arial,Helvetica,sans-serif;fill:#222}
+.title{font-size:18px;font-weight:700}
+.label{font-size:12px}
+.tick{font-size:11px;fill:#555}
+.grid{stroke:#d0d7de;stroke-width:1;opacity:.7}
+.axis{stroke:#24292f;stroke-width:1.2}
+</style>
+<text class="title" x="450.0" y="26" text-anchor="middle">Resident Cache-DiT Slot Bytes</text>
+<text class="label" x="450.0" y="444" text-anchor="middle">event tick</text>
+<text class="label" transform="translate(18 224.0) rotate(-90)" text-anchor="middle">MiB</text>
+<line class="grid" x1="78" x2="876" y1="396.0" y2="396.0"/>
+<text class="tick" x="70" y="400.0" text-anchor="end">0.00</text>
+<line class="grid" x1="78" x2="876" y1="327.2" y2="327.2"/>
+<text class="tick" x="70" y="331.2" text-anchor="end">181.15</text>
+<line class="grid" x1="78" x2="876" y1="258.4" y2="258.4"/>
+<text class="tick" x="70" y="262.4" text-anchor="end">362.29</text>
+<line class="grid" x1="78" x2="876" y1="189.6" y2="189.6"/>
+<text class="tick" x="70" y="193.6" text-anchor="end">543.44</text>
+<line class="grid" x1="78" x2="876" y1="120.8" y2="120.8"/>
+<text class="tick" x="70" y="124.8" text-anchor="end">724.58</text>
+<line class="grid" x1="78" x2="876" y1="52.0" y2="52.0"/>
+<text class="tick" x="70" y="56.0" text-anchor="end">905.73</text>
+<line class="grid" x1="78.0" x2="78.0" y1="52" y2="396"/>
+<text class="tick" x="78.0" y="414" text-anchor="middle">0</text>
+<line class="grid" x1="140.0" x2="140.0" y1="52" y2="396"/>
+<text class="tick" x="140.0" y="414" text-anchor="middle">8</text>
+<line class="grid" x1="202.0" x2="202.0" y1="52" y2="396"/>
+<text class="tick" x="202.0" y="414" text-anchor="middle">16</text>
+<line class="grid" x1="263.9" x2="263.9" y1="52" y2="396"/>
+<text class="tick" x="263.9" y="414" text-anchor="middle">24</text>
+<line class="grid" x1="310.4" x2="310.4" y1="52" y2="396"/>
+<text class="tick" x="310.4" y="414" text-anchor="middle">30</text>
+<line class="grid" x1="364.7" x2="364.7" y1="52" y2="396"/>
+<text class="tick" x="364.7" y="414" text-anchor="middle">37</text>
+<line class="grid" x1="418.9" x2="418.9" y1="52" y2="396"/>
+<text class="tick" x="418.9" y="414" text-anchor="middle">44</text>
+<line class="grid" x1="473.1" x2="473.1" y1="52" y2="396"/>
+<text class="tick" x="473.1" y="414" text-anchor="middle">51</text>
+<line class="grid" x1="542.9" x2="542.9" y1="52" y2="396"/>
+<text class="tick" x="542.9" y="414" text-anchor="middle">60</text>
+<line class="grid" x1="597.1" x2="597.1" y1="52" y2="396"/>
+<text class="tick" x="597.1" y="414" text-anchor="middle">67</text>
+<line class="grid" x1="666.8" x2="666.8" y1="52" y2="396"/>
+<text class="tick" x="666.8" y="414" text-anchor="middle">76</text>
+<line class="grid" x1="736.5" x2="736.5" y1="52" y2="396"/>
+<text class="tick" x="736.5" y="414" text-anchor="middle">85</text>
+<line class="grid" x1="806.3" x2="806.3" y1="52" y2="396"/>
+<text class="tick" x="806.3" y="414" text-anchor="middle">94</text>
+<line class="grid" x1="876.0" x2="876.0" y1="52" y2="396"/>
+<text class="tick" x="876.0" y="414" text-anchor="middle">103</text>
+<line class="axis" x1="78" x2="78" y1="52" y2="396"/>
+<line class="axis" x1="78" x2="876" y1="396" y2="396"/>
+<polyline fill="none" stroke="#009E73" stroke-width="2.2" stroke-linejoin="round" points="78.0,396.0 78.0,391.4 85.7,386.8 93.5,386.8 101.2,368.5 109.0,350.3 116.7,332.0 124.5,327.4 132.2,309.2 140.0,290.9 147.7,272.6 155.5,262.3 163.2,244.1 171.0,225.8 178.7,207.5 186.5,244.1 186.5,239.5 194.2,229.2 202.0,188.1 209.7,197.3 209.7,192.7 217.5,151.7 225.2,141.4 233.0,123.1 240.7,118.5 248.4,100.3 256.2,82.0 263.9,118.5 263.9,77.5 271.7,159.6 271.7,149.3 279.4,185.8 279.4,185.8 287.2,181.2 294.9,170.9 302.7,152.7 310.4,142.4 318.2,178.9 318.2,178.9 325.9,178.9 333.7,178.9 341.4,178.9 349.2,178.9 356.9,215.4 356.9,197.2 364.7,192.6 372.4,192.6 380.2,229.1 380.2,229.1 387.9,249.7 387.9,249.7 395.7,249.7 403.4,208.6 411.1,208.6 418.9,208.6 426.6,208.6 434.4,217.8 434.4,217.8 442.1,217.8 449.9,217.8 457.6,217.8 465.4,238.4 465.4,238.4 473.1,238.4 480.9,238.4 488.6,238.4 496.4,238.4 504.1,238.4 511.9,238.4 519.6,238.4 527.4,238.4 535.1,238.4 542.9,274.9 542.9,274.9 550.6,274.9 558.3,274.9 566.1,357.0 566.1,357.0 573.8,357.0 581.6,357.0 589.3,357.0 597.1,357.0 604.8,357.0 612.6,357.0 620.3,357.0 628.1,357.0 635.8,357.0 643.6,357.0 651.3,357.0 659.1,357.0 666.8,357.0 674.6,357.0 682.3,357.0 690.1,357.0 697.8,357.0 705.6,357.0 713.3,357.0 721.0,357.0 728.8,357.0 736.5,357.0 744.3,357.0 752.0,357.0 759.8,357.0 767.5,357.0 775.3,357.0 783.0,366.2 790.8,366.2 798.5,366.2 806.3,366.2 814.0,366.2 821.8,366.2 829.5,366.2 837.3,386.8 845.0,386.8 852.8,386.8 860.5,386.8 868.3,386.8 876.0,396.0"/>
+<line x1="90" x2="114" y1="70" y2="70" stroke="#009E73" stroke-width="3"/>
+<text class="label" x="122" y="74">resident cache</text>
+</svg>

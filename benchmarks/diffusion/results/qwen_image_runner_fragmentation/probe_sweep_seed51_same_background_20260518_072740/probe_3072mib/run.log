@@ -1,0 +1,329 @@
+Modular Diffusers is currently an experimental feature under active development. The API is subject to breaking changes in future releases.
+INFO 05-18 07:27:49 [scheduler.py:231] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 05-18 07:27:49 [vllm.py:754] Asynchronous scheduling is enabled.
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+INFO 05-18 07:27:49 [parallel_state.py:588] Building SP subgroups from explicit sp_group_ranks (sp_size=1, ulysses=1, ring=1, use_ulysses_low=True).
+INFO 05-18 07:27:49 [parallel_state.py:630] SP group details for rank 0: sp_group=[0], ulysses_group=[0], ring_group=[0]
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+[Gloo] Rank 0 is connected to 0 peer ranks. Expected number of connected peer ranks is : 0
+
+Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]
+Loading checkpoint shards:  25%|██▌       | 1/4 [00:01<00:03,  1.00s/it]
+Loading checkpoint shards:  50%|█████     | 2/4 [00:01<00:01,  1.07it/s]
+Loading checkpoint shards:  75%|███████▌  | 3/4 [00:02<00:00,  1.11it/s]
+Loading checkpoint shards: 100%|██████████| 4/4 [00:03<00:00,  1.54it/s]
+Loading checkpoint shards: 100%|██████████| 4/4 [00:03<00:00,  1.33it/s]
+INFO 05-18 07:27:54 [platform.py:77] Defaulting to diffusion attention backend FLASH_ATTN
+
+Multi-thread loading shards:   0% Completed | 0/9 [00:00<?, ?it/s]
+
+Multi-thread loading shards:  11% Completed | 1/9 [00:00<00:06,  1.23it/s]
+
+Multi-thread loading shards:  22% Completed | 2/9 [00:01<00:05,  1.24it/s]
+
+Multi-thread loading shards:  33% Completed | 3/9 [00:02<00:04,  1.26it/s]
+
+Multi-thread loading shards:  44% Completed | 4/9 [00:03<00:03,  1.27it/s]
+
+Multi-thread loading shards:  56% Completed | 5/9 [00:03<00:03,  1.28it/s]
+
+Multi-thread loading shards:  67% Completed | 6/9 [00:04<00:02,  1.27it/s]
+
+Multi-thread loading shards:  78% Completed | 7/9 [00:05<00:01,  1.28it/s]
+
+Multi-thread loading shards:  89% Completed | 8/9 [00:06<00:00,  1.29it/s]
+
+Multi-thread loading shards: 100% Completed | 9/9 [00:06<00:00,  1.65it/s]
+
+Multi-thread loading shards: 100% Completed | 9/9 [00:06<00:00,  1.38it/s]
+
+INFO 05-18 07:28:01 [diffusers_loader.py:321] Loading weights took 6.53 seconds
+INFO 05-18 07:28:01 [diffusion_model_runner.py:394] Model loading took 53.7458 GiB and 12.042907 seconds
+INFO 05-18 07:28:01 [diffusion_model_runner.py:399] Model runner: Model loaded successfully.
+INFO 05-18 07:28:01 [cache_dit_backend.py:608] Enabling cache-dit on transformer: Fn=1, Bn=0, W=1,
+[05-18 07:28:01] [Cache-DiT] QwenImageTransformer2DModel is officially supported by cache-dit. Use it's pre-defined BlockAdapter directly!
+[05-18 07:28:01] [Cache-DiT] Transformer class QwenImageTransformer2DModel is from vllm_omni not diffusers, skipping strict type check in BlockAdapter.
+[05-18 07:28:01] [Cache-DiT] Auto fill blocks_name: transformer_blocks.
+[05-18 07:28:01] [Cache-DiT] Match Block Forward Pattern: QwenImageTransformerBlock, ForwardPattern.Pattern_1
+[05-18 07:28:01] [Cache-DiT] IN:('hidden_states', 'encoder_hidden_states'), OUT:('encoder_hidden_states', 'hidden_states'))
+[05-18 07:28:01] [Cache-DiT] Use custom 'enable_separate_cfg' from BlockAdapter: True. Pipeline: FakeDiffusionPipeline.
+[05-18 07:28:01] [Cache-DiT] Collected Context Config: DBCache_F1B0_W1I1M0MC3_R0.24_CFG1, Calibrator Config: None
+[05-18 07:28:01] [Cache-DiT] Match Blocks: CachedBlocks_Pattern_0_1_2, for transformer_blocks, cache_context: transformer_blocks_139765216893520, context_manager: FakeDiffusionPipeline_139765016263696.
+INFO 05-18 07:28:01 [cache_dit_backend.py:1281] Cache-dit enabled successfully on QwenImagePipeline
+INFO 05-18 07:28:01 [diffusion_model_runner.py:445] Model runner: Initialization complete.
+INFO 05-18 07:28:02 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=0 batch_size=1 req_ids=['qwen-c-000'] new_req_ids=['qwen-c-000'] cached_req_ids=[] progress=['qwen-c-000:1/1'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:02 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-000(seed=51000, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:28:03 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=1 batch_size=1 req_ids=['qwen-c-001'] new_req_ids=['qwen-c-001'] cached_req_ids=[] progress=['qwen-c-001:1/1'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:03 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-001(seed=51001, prompt=a futuristic city skyline at sunset with clean architectural ...)']
+INFO 05-18 07:28:04 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=2 batch_size=1 req_ids=['qwen-c-002'] new_req_ids=['qwen-c-002'] cached_req_ids=[] progress=['qwen-c-002:1/1'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:04 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-002(seed=51002, prompt=a bowl of strawberries beside a glass of water, realistic tex...)']
+INFO 05-18 07:28:05 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=3 batch_size=1 req_ids=['qwen-c-003'] new_req_ids=['qwen-c-003'] cached_req_ids=[] progress=['qwen-c-003:1/1'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:05 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-003(seed=51003, prompt=a small cabin in snowy mountains, clear sky, cinematic compos...)']
+INFO 05-18 07:28:06 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=4 batch_size=1 req_ids=['qwen-c-004'] new_req_ids=['qwen-c-004'] cached_req_ids=[] progress=['qwen-c-004:1/1'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:06 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-004(seed=51004, prompt=a watercolor painting of a mountain lake with reflections)']
+INFO 05-18 07:28:07 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=5 batch_size=1 req_ids=['qwen-c-005'] new_req_ids=['qwen-c-005'] cached_req_ids=[] progress=['qwen-c-005:1/1'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:07 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-005(seed=51005, prompt=a vintage camera on a desk with notebooks and pencils)']
+INFO 05-18 07:28:08 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=6 batch_size=1 req_ids=['qwen-c-006'] new_req_ids=['qwen-c-006'] cached_req_ids=[] progress=['qwen-c-006:1/1'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:08 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-006(seed=51006, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:28:09 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=7 batch_size=1 req_ids=['qwen-c-007'] new_req_ids=['qwen-c-007'] cached_req_ids=[] progress=['qwen-c-007:1/1'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:09 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-007(seed=51007, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:28:11 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=8 batch_size=1 req_ids=['qwen-c-008'] new_req_ids=['qwen-c-008'] cached_req_ids=[] progress=['qwen-c-008:1/1'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:11 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-008(seed=51008, prompt=a cozy reading corner with warm lamp light and plants)']
+INFO 05-18 07:28:12 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=9 batch_size=1 req_ids=['qwen-c-009'] new_req_ids=['qwen-c-009'] cached_req_ids=[] progress=['qwen-c-009:1/1'] shape=512x512 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:12 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-009(seed=51009, prompt=a detailed fantasy castle built on coastal cliffs)']
+INFO 05-18 07:28:12 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=10 batch_size=1 req_ids=['qwen-c-010'] new_req_ids=['qwen-c-010'] cached_req_ids=[] progress=['qwen-c-010:1/1'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:12 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-010(seed=51010, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:28:13 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=11 batch_size=1 req_ids=['qwen-c-011'] new_req_ids=['qwen-c-011'] cached_req_ids=[] progress=['qwen-c-011:1/1'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:13 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-011(seed=51011, prompt=a futuristic city skyline at sunset with clean architectural ...)']
+INFO 05-18 07:28:14 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=12 batch_size=1 req_ids=['qwen-c-012'] new_req_ids=['qwen-c-012'] cached_req_ids=[] progress=['qwen-c-012:1/1'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:14 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-012(seed=51012, prompt=a bowl of strawberries beside a glass of water, realistic tex...)']
+INFO 05-18 07:28:14 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=13 batch_size=1 req_ids=['qwen-c-013'] new_req_ids=['qwen-c-013'] cached_req_ids=[] progress=['qwen-c-013:1/1'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:14 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-013(seed=51013, prompt=a small cabin in snowy mountains, clear sky, cinematic compos...)']
+INFO 05-18 07:28:15 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=14 batch_size=1 req_ids=['qwen-c-011'] new_req_ids=[] cached_req_ids=['qwen-c-011'] progress=['qwen-c-011:2/20'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:15 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-011(seed=51011, prompt=a futuristic city skyline at sunset with clean architectural ...)']
+INFO 05-18 07:28:16 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=15 batch_size=1 req_ids=['qwen-c-014'] new_req_ids=['qwen-c-014'] cached_req_ids=[] progress=['qwen-c-014:1/1'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:16 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-014(seed=51014, prompt=a watercolor painting of a mountain lake with reflections)']
+INFO 05-18 07:28:16 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=16 batch_size=1 req_ids=['qwen-c-015'] new_req_ids=['qwen-c-015'] cached_req_ids=[] progress=['qwen-c-015:1/1'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:16 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-015(seed=51015, prompt=a vintage camera on a desk with notebooks and pencils)']
+INFO 05-18 07:28:17 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=17 batch_size=1 req_ids=['qwen-c-003'] new_req_ids=[] cached_req_ids=['qwen-c-003'] progress=['qwen-c-003:2/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:17 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-003(seed=51003, prompt=a small cabin in snowy mountains, clear sky, cinematic compos...)']
+INFO 05-18 07:28:18 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=18 batch_size=1 req_ids=['qwen-c-016'] new_req_ids=['qwen-c-016'] cached_req_ids=[] progress=['qwen-c-016:1/1'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:18 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-016(seed=51016, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:28:19 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=19 batch_size=1 req_ids=['qwen-c-008'] new_req_ids=[] cached_req_ids=['qwen-c-008'] progress=['qwen-c-008:2/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:19 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-008(seed=51008, prompt=a cozy reading corner with warm lamp light and plants)']
+INFO 05-18 07:28:20 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=20 batch_size=1 req_ids=['qwen-c-017'] new_req_ids=['qwen-c-017'] cached_req_ids=[] progress=['qwen-c-017:1/1'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:20 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-017(seed=51017, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:28:22 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=21 batch_size=1 req_ids=['qwen-c-015'] new_req_ids=[] cached_req_ids=['qwen-c-015'] progress=['qwen-c-015:2/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:22 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-015(seed=51015, prompt=a vintage camera on a desk with notebooks and pencils)']
+INFO 05-18 07:28:23 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=22 batch_size=1 req_ids=['qwen-c-018'] new_req_ids=['qwen-c-018'] cached_req_ids=[] progress=['qwen-c-018:1/1'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:23 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-018(seed=51018, prompt=a cozy reading corner with warm lamp light and plants)']
+INFO 05-18 07:28:24 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=23 batch_size=1 req_ids=['qwen-c-018'] new_req_ids=[] cached_req_ids=['qwen-c-018'] progress=['qwen-c-018:2/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:24 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-018(seed=51018, prompt=a cozy reading corner with warm lamp light and plants)']
+INFO 05-18 07:28:24 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=24 batch_size=1 req_ids=['qwen-c-019'] new_req_ids=['qwen-c-019'] cached_req_ids=[] progress=['qwen-c-019:1/1'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:24 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-019(seed=51019, prompt=a detailed fantasy castle built on coastal cliffs)']
+INFO 05-18 07:28:25 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=25 batch_size=1 req_ids=['qwen-c-020'] new_req_ids=['qwen-c-020'] cached_req_ids=[] progress=['qwen-c-020:1/1'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:25 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-020(seed=51020, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:28:27 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=26 batch_size=1 req_ids=['qwen-c-021'] new_req_ids=['qwen-c-021'] cached_req_ids=[] progress=['qwen-c-021:1/1'] shape=512x512 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:27 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-021(seed=51021, prompt=a futuristic city skyline at sunset with clean architectural ...)']
+INFO 05-18 07:28:27 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=27 batch_size=1 req_ids=['qwen-c-022'] new_req_ids=['qwen-c-022'] cached_req_ids=[] progress=['qwen-c-022:1/1'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:27 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-022(seed=51022, prompt=a bowl of strawberries beside a glass of water, realistic tex...)']
+INFO 05-18 07:28:28 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=28 batch_size=1 req_ids=['qwen-c-023'] new_req_ids=['qwen-c-023'] cached_req_ids=[] progress=['qwen-c-023:1/1'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:28 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-023(seed=51023, prompt=a small cabin in snowy mountains, clear sky, cinematic compos...)']
+INFO 05-18 07:28:30 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=29 batch_size=1 req_ids=['qwen-c-024'] new_req_ids=['qwen-c-024'] cached_req_ids=[] progress=['qwen-c-024:1/1'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:30 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-024(seed=51024, prompt=a watercolor painting of a mountain lake with reflections)']
+INFO 05-18 07:28:31 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=30 batch_size=1 req_ids=['qwen-c-025'] new_req_ids=['qwen-c-025'] cached_req_ids=[] progress=['qwen-c-025:1/1'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:31 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-025(seed=51025, prompt=a vintage camera on a desk with notebooks and pencils)']
+INFO 05-18 07:28:32 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=31 batch_size=1 req_ids=['qwen-c-019'] new_req_ids=[] cached_req_ids=['qwen-c-019'] progress=['qwen-c-019:2/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:32 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-019(seed=51019, prompt=a detailed fantasy castle built on coastal cliffs)']
+INFO 05-18 07:28:32 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=32 batch_size=1 req_ids=['qwen-c-026'] new_req_ids=['qwen-c-026'] cached_req_ids=[] progress=['qwen-c-026:1/1'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:32 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-026(seed=51026, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:28:33 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=33 batch_size=1 req_ids=['qwen-c-000'] new_req_ids=[] cached_req_ids=['qwen-c-000'] progress=['qwen-c-000:2/20'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:33 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-000(seed=51000, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:28:33 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=34 batch_size=1 req_ids=['qwen-c-027'] new_req_ids=['qwen-c-027'] cached_req_ids=[] progress=['qwen-c-027:1/1'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:33 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-027(seed=51027, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:28:34 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=35 batch_size=1 req_ids=['qwen-c-028'] new_req_ids=['qwen-c-028'] cached_req_ids=[] progress=['qwen-c-028:1/1'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:34 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-028(seed=51028, prompt=a cozy reading corner with warm lamp light and plants)']
+INFO 05-18 07:28:35 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=36 batch_size=1 req_ids=['qwen-c-029'] new_req_ids=['qwen-c-029'] cached_req_ids=[] progress=['qwen-c-029:1/1'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:35 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-029(seed=51029, prompt=a detailed fantasy castle built on coastal cliffs)']
+INFO 05-18 07:28:36 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=37 batch_size=1 req_ids=['qwen-c-030'] new_req_ids=['qwen-c-030'] cached_req_ids=[] progress=['qwen-c-030:1/1'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:36 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-030(seed=51030, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:28:37 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=38 batch_size=1 req_ids=['qwen-c-031'] new_req_ids=['qwen-c-031'] cached_req_ids=[] progress=['qwen-c-031:1/1'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:37 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-031(seed=51031, prompt=a futuristic city skyline at sunset with clean architectural ...)']
+INFO 05-18 07:28:38 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=39 batch_size=1 req_ids=['qwen-c-017'] new_req_ids=[] cached_req_ids=['qwen-c-017'] progress=['qwen-c-017:2/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:38 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-017(seed=51017, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:28:40 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=40 batch_size=1 req_ids=['qwen-c-004'] new_req_ids=[] cached_req_ids=['qwen-c-004'] progress=['qwen-c-004:2/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:40 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-004(seed=51004, prompt=a watercolor painting of a mountain lake with reflections)']
+INFO 05-18 07:28:41 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=41 batch_size=1 req_ids=['qwen-c-010'] new_req_ids=[] cached_req_ids=['qwen-c-010'] progress=['qwen-c-010:2/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:41 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-010(seed=51010, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:28:42 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=42 batch_size=1 req_ids=['qwen-c-027'] new_req_ids=[] cached_req_ids=['qwen-c-027'] progress=['qwen-c-027:2/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:42 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-027(seed=51027, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:28:42 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=43 batch_size=1 req_ids=['qwen-c-001'] new_req_ids=[] cached_req_ids=['qwen-c-001'] progress=['qwen-c-001:2/20'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:42 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-001(seed=51001, prompt=a futuristic city skyline at sunset with clean architectural ...)']
+INFO 05-18 07:28:43 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=44 batch_size=1 req_ids=['qwen-c-017'] new_req_ids=[] cached_req_ids=['qwen-c-017'] progress=['qwen-c-017:3/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:43 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-017(seed=51017, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:28:44 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=45 batch_size=1 req_ids=['qwen-c-006'] new_req_ids=[] cached_req_ids=['qwen-c-006'] progress=['qwen-c-006:2/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:44 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-006(seed=51006, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:28:45 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=46 batch_size=1 req_ids=['qwen-c-002'] new_req_ids=[] cached_req_ids=['qwen-c-002'] progress=['qwen-c-002:2/20'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:45 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-002(seed=51002, prompt=a bowl of strawberries beside a glass of water, realistic tex...)']
+INFO 05-18 07:28:45 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=47 batch_size=1 req_ids=['qwen-c-014'] new_req_ids=[] cached_req_ids=['qwen-c-014'] progress=['qwen-c-014:2/20'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:45 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-014(seed=51014, prompt=a watercolor painting of a mountain lake with reflections)']
+INFO 05-18 07:28:46 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=48 batch_size=1 req_ids=['qwen-c-031'] new_req_ids=[] cached_req_ids=['qwen-c-031'] progress=['qwen-c-031:2/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:46 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-031(seed=51031, prompt=a futuristic city skyline at sunset with clean architectural ...)']
+INFO 05-18 07:28:46 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=49 batch_size=1 req_ids=['qwen-c-010'] new_req_ids=[] cached_req_ids=['qwen-c-010'] progress=['qwen-c-010:3/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:46 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-010(seed=51010, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:28:47 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=50 batch_size=1 req_ids=['qwen-c-024'] new_req_ids=[] cached_req_ids=['qwen-c-024'] progress=['qwen-c-024:2/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:47 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-024(seed=51024, prompt=a watercolor painting of a mountain lake with reflections)']
+INFO 05-18 07:28:48 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=51 batch_size=1 req_ids=['qwen-c-021'] new_req_ids=[] cached_req_ids=['qwen-c-021'] progress=['qwen-c-021:2/20'] shape=512x512 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:48 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-021(seed=51021, prompt=a futuristic city skyline at sunset with clean architectural ...)']
+INFO 05-18 07:28:49 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=52 batch_size=1 req_ids=['qwen-c-024'] new_req_ids=[] cached_req_ids=['qwen-c-024'] progress=['qwen-c-024:3/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:49 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-024(seed=51024, prompt=a watercolor painting of a mountain lake with reflections)']
+INFO 05-18 07:28:50 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=53 batch_size=1 req_ids=['qwen-c-022'] new_req_ids=[] cached_req_ids=['qwen-c-022'] progress=['qwen-c-022:2/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:50 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-022(seed=51022, prompt=a bowl of strawberries beside a glass of water, realistic tex...)']
+INFO 05-18 07:28:51 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=54 batch_size=1 req_ids=['qwen-c-027'] new_req_ids=[] cached_req_ids=['qwen-c-027'] progress=['qwen-c-027:3/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:51 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-027(seed=51027, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:28:51 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=55 batch_size=1 req_ids=['qwen-c-000'] new_req_ids=[] cached_req_ids=['qwen-c-000'] progress=['qwen-c-000:3/20'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:28:51 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-000(seed=51000, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:28:52 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=56 batch_size=1 req_ids=['qwen-c-004'] new_req_ids=[] cached_req_ids=['qwen-c-004'] progress=['qwen-c-004:3/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:52 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-004(seed=51004, prompt=a watercolor painting of a mountain lake with reflections)']
+INFO 05-18 07:28:53 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=57 batch_size=1 req_ids=['qwen-c-007'] new_req_ids=[] cached_req_ids=['qwen-c-007'] progress=['qwen-c-007:2/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:53 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-007(seed=51007, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:28:55 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=58 batch_size=1 req_ids=['qwen-c-010'] new_req_ids=[] cached_req_ids=['qwen-c-010'] progress=['qwen-c-010:4/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:55 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-010(seed=51010, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:28:55 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=59 batch_size=1 req_ids=['qwen-c-007'] new_req_ids=[] cached_req_ids=['qwen-c-007'] progress=['qwen-c-007:3/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:55 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-007(seed=51007, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:28:57 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=60 batch_size=1 req_ids=['qwen-c-023'] new_req_ids=[] cached_req_ids=['qwen-c-023'] progress=['qwen-c-023:2/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:57 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-023(seed=51023, prompt=a small cabin in snowy mountains, clear sky, cinematic compos...)']
+INFO 05-18 07:28:58 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=61 batch_size=1 req_ids=['qwen-c-029'] new_req_ids=[] cached_req_ids=['qwen-c-029'] progress=['qwen-c-029:2/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:28:58 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-029(seed=51029, prompt=a detailed fantasy castle built on coastal cliffs)']
+INFO 05-18 07:28:59 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=62 batch_size=1 req_ids=['qwen-c-004'] new_req_ids=[] cached_req_ids=['qwen-c-004'] progress=['qwen-c-004:4/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:28:59 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-004(seed=51004, prompt=a watercolor painting of a mountain lake with reflections)']
+INFO 05-18 07:29:00 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=63 batch_size=1 req_ids=['qwen-c-027'] new_req_ids=[] cached_req_ids=['qwen-c-027'] progress=['qwen-c-027:4/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:00 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-027(seed=51027, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:29:01 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=64 batch_size=1 req_ids=['qwen-c-017'] new_req_ids=[] cached_req_ids=['qwen-c-017'] progress=['qwen-c-017:4/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:01 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-017(seed=51017, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:29:02 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=65 batch_size=1 req_ids=['qwen-c-028'] new_req_ids=[] cached_req_ids=['qwen-c-028'] progress=['qwen-c-028:2/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:02 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-028(seed=51028, prompt=a cozy reading corner with warm lamp light and plants)']
+INFO 05-18 07:29:04 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=66 batch_size=1 req_ids=['qwen-c-027'] new_req_ids=[] cached_req_ids=['qwen-c-027'] progress=['qwen-c-027:5/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:04 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-027(seed=51027, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:29:04 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=67 batch_size=1 req_ids=['qwen-c-017'] new_req_ids=[] cached_req_ids=['qwen-c-017'] progress=['qwen-c-017:5/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:04 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-017(seed=51017, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:29:05 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=68 batch_size=1 req_ids=['qwen-c-006'] new_req_ids=[] cached_req_ids=['qwen-c-006'] progress=['qwen-c-006:3/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:05 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-006(seed=51006, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:29:06 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=69 batch_size=1 req_ids=['qwen-c-030'] new_req_ids=[] cached_req_ids=['qwen-c-030'] progress=['qwen-c-030:2/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:06 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-030(seed=51030, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:29:07 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=70 batch_size=1 req_ids=['qwen-c-005'] new_req_ids=[] cached_req_ids=['qwen-c-005'] progress=['qwen-c-005:2/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:07 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-005(seed=51005, prompt=a vintage camera on a desk with notebooks and pencils)']
+INFO 05-18 07:29:08 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=71 batch_size=1 req_ids=['qwen-c-009'] new_req_ids=[] cached_req_ids=['qwen-c-009'] progress=['qwen-c-009:2/20'] shape=512x512 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:29:08 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-009(seed=51009, prompt=a detailed fantasy castle built on coastal cliffs)']
+INFO 05-18 07:29:09 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=72 batch_size=1 req_ids=['qwen-c-017'] new_req_ids=[] cached_req_ids=['qwen-c-017'] progress=['qwen-c-017:6/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:09 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-017(seed=51017, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:29:10 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=73 batch_size=1 req_ids=['qwen-c-012'] new_req_ids=[] cached_req_ids=['qwen-c-012'] progress=['qwen-c-012:2/20'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:29:10 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-012(seed=51012, prompt=a bowl of strawberries beside a glass of water, realistic tex...)']
+INFO 05-18 07:29:10 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=74 batch_size=1 req_ids=['qwen-c-023'] new_req_ids=[] cached_req_ids=['qwen-c-023'] progress=['qwen-c-023:3/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:10 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-023(seed=51023, prompt=a small cabin in snowy mountains, clear sky, cinematic compos...)']
+INFO 05-18 07:29:12 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=75 batch_size=1 req_ids=['qwen-c-028'] new_req_ids=[] cached_req_ids=['qwen-c-028'] progress=['qwen-c-028:3/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:12 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-028(seed=51028, prompt=a cozy reading corner with warm lamp light and plants)']
+INFO 05-18 07:29:13 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=76 batch_size=1 req_ids=['qwen-c-020'] new_req_ids=[] cached_req_ids=['qwen-c-020'] progress=['qwen-c-020:2/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:13 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-020(seed=51020, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:29:14 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=77 batch_size=1 req_ids=['qwen-c-006'] new_req_ids=[] cached_req_ids=['qwen-c-006'] progress=['qwen-c-006:4/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:14 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-006(seed=51006, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:29:15 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=78 batch_size=1 req_ids=['qwen-c-013'] new_req_ids=[] cached_req_ids=['qwen-c-013'] progress=['qwen-c-013:2/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:15 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-013(seed=51013, prompt=a small cabin in snowy mountains, clear sky, cinematic compos...)']
+INFO 05-18 07:29:16 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=79 batch_size=1 req_ids=['qwen-c-025'] new_req_ids=[] cached_req_ids=['qwen-c-025'] progress=['qwen-c-025:2/20'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:29:16 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-025(seed=51025, prompt=a vintage camera on a desk with notebooks and pencils)']
+INFO 05-18 07:29:17 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=80 batch_size=1 req_ids=['qwen-c-006'] new_req_ids=[] cached_req_ids=['qwen-c-006'] progress=['qwen-c-006:5/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:17 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-006(seed=51006, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:29:17 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=81 batch_size=1 req_ids=['qwen-c-020'] new_req_ids=[] cached_req_ids=['qwen-c-020'] progress=['qwen-c-020:3/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:17 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-020(seed=51020, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:29:19 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=82 batch_size=1 req_ids=['qwen-c-006'] new_req_ids=[] cached_req_ids=['qwen-c-006'] progress=['qwen-c-006:6/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:19 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-006(seed=51006, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:29:19 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=83 batch_size=1 req_ids=['qwen-c-027'] new_req_ids=[] cached_req_ids=['qwen-c-027'] progress=['qwen-c-027:6/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:19 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-027(seed=51027, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:29:20 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=84 batch_size=1 req_ids=['qwen-c-020'] new_req_ids=[] cached_req_ids=['qwen-c-020'] progress=['qwen-c-020:4/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:20 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-020(seed=51020, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:29:22 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=85 batch_size=1 req_ids=['qwen-c-024'] new_req_ids=[] cached_req_ids=['qwen-c-024'] progress=['qwen-c-024:4/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:22 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-024(seed=51024, prompt=a watercolor painting of a mountain lake with reflections)']
+INFO 05-18 07:29:23 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=86 batch_size=1 req_ids=['qwen-c-006'] new_req_ids=[] cached_req_ids=['qwen-c-006'] progress=['qwen-c-006:7/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:23 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-006(seed=51006, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:29:24 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=87 batch_size=1 req_ids=['qwen-c-030'] new_req_ids=[] cached_req_ids=['qwen-c-030'] progress=['qwen-c-030:3/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:24 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-030(seed=51030, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:29:25 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=88 batch_size=1 req_ids=['qwen-c-006'] new_req_ids=[] cached_req_ids=['qwen-c-006'] progress=['qwen-c-006:8/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:25 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-006(seed=51006, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:29:26 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=89 batch_size=1 req_ids=['qwen-c-005'] new_req_ids=[] cached_req_ids=['qwen-c-005'] progress=['qwen-c-005:3/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:26 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-005(seed=51005, prompt=a vintage camera on a desk with notebooks and pencils)']
+INFO 05-18 07:29:27 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=90 batch_size=1 req_ids=['qwen-c-031'] new_req_ids=[] cached_req_ids=['qwen-c-031'] progress=['qwen-c-031:3/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:27 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-031(seed=51031, prompt=a futuristic city skyline at sunset with clean architectural ...)']
+INFO 05-18 07:29:28 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=91 batch_size=1 req_ids=['qwen-c-002'] new_req_ids=[] cached_req_ids=['qwen-c-002'] progress=['qwen-c-002:3/20'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:29:28 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-002(seed=51002, prompt=a bowl of strawberries beside a glass of water, realistic tex...)']
+INFO 05-18 07:29:28 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=92 batch_size=1 req_ids=['qwen-c-000'] new_req_ids=[] cached_req_ids=['qwen-c-000'] progress=['qwen-c-000:4/20'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:29:28 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-000(seed=51000, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:29:28 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=93 batch_size=1 req_ids=['qwen-c-016'] new_req_ids=[] cached_req_ids=['qwen-c-016'] progress=['qwen-c-016:2/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:28 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-016(seed=51016, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:29:29 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=94 batch_size=1 req_ids=['qwen-c-016'] new_req_ids=[] cached_req_ids=['qwen-c-016'] progress=['qwen-c-016:3/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:29 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-016(seed=51016, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:29:30 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=95 batch_size=1 req_ids=['qwen-c-025'] new_req_ids=[] cached_req_ids=['qwen-c-025'] progress=['qwen-c-025:3/20'] shape=768x768 num_inference_steps=20 cache_backend=cache_dit
+INFO 05-18 07:29:30 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-025(seed=51025, prompt=a vintage camera on a desk with notebooks and pencils)']
+INFO 05-18 07:29:31 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=96 batch_size=1 req_ids=['qwen-c-027'] new_req_ids=[] cached_req_ids=['qwen-c-027'] progress=['qwen-c-027:7/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:31 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-027(seed=51027, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:29:31 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=97 batch_size=1 req_ids=['qwen-c-010'] new_req_ids=[] cached_req_ids=['qwen-c-010'] progress=['qwen-c-010:5/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:31 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-010(seed=51010, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:29:32 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=98 batch_size=1 req_ids=['qwen-c-006'] new_req_ids=[] cached_req_ids=['qwen-c-006'] progress=['qwen-c-006:9/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:32 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-006(seed=51006, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:29:32 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=99 batch_size=1 req_ids=['qwen-c-026'] new_req_ids=[] cached_req_ids=['qwen-c-026'] progress=['qwen-c-026:2/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:32 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-026(seed=51026, prompt=a robot gardener watering flowers in a greenhouse)']
+INFO 05-18 07:29:33 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=100 batch_size=1 req_ids=['qwen-c-030'] new_req_ids=[] cached_req_ids=['qwen-c-030'] progress=['qwen-c-030:4/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:33 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-030(seed=51030, prompt=a ceramic teapot on a wooden table, soft studio lighting)']
+INFO 05-18 07:29:34 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=101 batch_size=1 req_ids=['qwen-c-031'] new_req_ids=[] cached_req_ids=['qwen-c-031'] progress=['qwen-c-031:4/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:34 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-031(seed=51031, prompt=a futuristic city skyline at sunset with clean architectural ...)']
+INFO 05-18 07:29:35 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=102 batch_size=1 req_ids=['qwen-c-013'] new_req_ids=[] cached_req_ids=['qwen-c-013'] progress=['qwen-c-013:3/35'] shape=1536x1536 num_inference_steps=35 cache_backend=cache_dit
+INFO 05-18 07:29:35 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-013(seed=51013, prompt=a small cabin in snowy mountains, clear sky, cinematic compos...)']
+INFO 05-18 07:29:37 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=103 batch_size=1 req_ids=['qwen-c-027'] new_req_ids=[] cached_req_ids=['qwen-c-027'] progress=['qwen-c-027:8/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:37 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-027(seed=51027, prompt=a minimalist product photo of running shoes on a white backgr...)']
+INFO 05-18 07:29:37 [diffusion_model_runner.py:330] [StepBatch] scheduler_step=104 batch_size=1 req_ids=['qwen-c-026'] new_req_ids=[] cached_req_ids=['qwen-c-026'] progress=['qwen-c-026:3/25'] shape=1024x1024 num_inference_steps=25 cache_backend=cache_dit
+INFO 05-18 07:29:37 [diffusion_model_runner.py:344] [StepBatch] request_meta=['qwen-c-026(seed=51026, prompt=a robot gardener watering flowers in a greenhouse)']
+{
+  "model": "/home/wangfuyin/.cache/modelscope/hub/models/Qwen/Qwen-Image",
+  "dataset": "qwen_image_dataset_c",
+  "num_requests": 32,
+  "seed": 51,
+  "oom_observed": true,
+  "error": "CUDA out of memory. Tried to allocate 3.00 GiB. GPU 0 has a total capacity of 79.14 GiB of which 2.09 GiB is free. Including non-PyTorch memory, this process has 77.04 GiB memory in use. Of the allocated memory 75.40 GiB is allocated by PyTorch, and 1.15 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+  "oom_probe_attempted": true,
+  "oom_probe_oom_observed": true,
+  "oom_probe_success": false,
+  "oom_probe_allocation_mib": 3072.0,
+  "oom_probe_pressure_allocated_mib": 21168.75,
+  "max_frag_ratio": 0.9321344522344783,
+  "mean_frag_ratio": 0.8736304711865148,
+  "max_frag_tick": 104,
+  "max_frag_total_inactive_mib": 3182.763671875,
+  "max_frag_largest_inactive_mib": 216.0,
+  "max_reserved_mib": 78384.0,
+  "max_allocated_mib": 77209.986328125,
+  "max_resident_cache_mib": 2571.69140625,
+  "finished_requests": 0,
+  "released_requests": 32,
+  "pending_requests": 0,
+  "profiles": [
+    {
+      "name": "qwen_c_512_20",
+      "width": 512,
+      "height": 512,
+      "num_inference_steps": 20,
+      "weight": 0.15
+    },
+    {
+      "name": "qwen_c_768_20",
+      "width": 768,
+      "height": 768,
+      "num_inference_steps": 20,
+      "weight": 0.25
+    },
+    {
+      "name": "qwen_c_1024_25",
+      "width": 1024,
+      "height": 1024,
+      "num_inference_steps": 25,
+      "weight": 0.45
+    },
+    {
+      "name": "qwen_c_1536_35",
+      "width": 1536,
+      "height": 1536,
+      "num_inference_steps": 35,
+      "weight": 0.15
+    }
+  ],
+  "cache_config": {
+    "Fn_compute_blocks": 1,
+    "Bn_compute_blocks": 0,
+    "max_warmup_steps": 1,
+    "residual_diff_threshold": 0.24,
+    "max_continuous_cached_steps": 3
+  }
+}
+Artifacts written to: /home/wangfuyin/vllm-omni/benchmarks/diffusion/results/qwen_image_runner_fragmentation/probe_sweep_seed51_same_background_20260518_072740/probe_3072mib

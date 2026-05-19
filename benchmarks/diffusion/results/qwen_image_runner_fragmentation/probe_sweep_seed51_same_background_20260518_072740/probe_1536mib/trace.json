@@ -1,0 +1,322 @@
+[
+  {
+    "req_id": "qwen-c-000",
+    "profile_name": "qwen_c_768_20",
+    "width": 768,
+    "height": 768,
+    "num_inference_steps": 20,
+    "arrival_tick": 0,
+    "seed": 51000,
+    "prompt": "a ceramic teapot on a wooden table, soft studio lighting"
+  },
+  {
+    "req_id": "qwen-c-001",
+    "profile_name": "qwen_c_768_20",
+    "width": 768,
+    "height": 768,
+    "num_inference_steps": 20,
+    "arrival_tick": 1,
+    "seed": 51001,
+    "prompt": "a futuristic city skyline at sunset with clean architectural details"
+  },
+  {
+    "req_id": "qwen-c-002",
+    "profile_name": "qwen_c_768_20",
+    "width": 768,
+    "height": 768,
+    "num_inference_steps": 20,
+    "arrival_tick": 2,
+    "seed": 51002,
+    "prompt": "a bowl of strawberries beside a glass of water, realistic texture"
+  },
+  {
+    "req_id": "qwen-c-003",
+    "profile_name": "qwen_c_1536_35",
+    "width": 1536,
+    "height": 1536,
+    "num_inference_steps": 35,
+    "arrival_tick": 3,
+    "seed": 51003,
+    "prompt": "a small cabin in snowy mountains, clear sky, cinematic composition"
+  },
+  {
+    "req_id": "qwen-c-004",
+    "profile_name": "qwen_c_1536_35",
+    "width": 1536,
+    "height": 1536,
+    "num_inference_steps": 35,
+    "arrival_tick": 4,
+    "seed": 51004,
+    "prompt": "a watercolor painting of a mountain lake with reflections"
+  },
+  {
+    "req_id": "qwen-c-005",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 5,
+    "seed": 51005,
+    "prompt": "a vintage camera on a desk with notebooks and pencils"
+  },
+  {
+    "req_id": "qwen-c-006",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 6,
+    "seed": 51006,
+    "prompt": "a robot gardener watering flowers in a greenhouse"
+  },
+  {
+    "req_id": "qwen-c-007",
+    "profile_name": "qwen_c_1536_35",
+    "width": 1536,
+    "height": 1536,
+    "num_inference_steps": 35,
+    "arrival_tick": 6,
+    "seed": 51007,
+    "prompt": "a minimalist product photo of running shoes on a white background"
+  },
+  {
+    "req_id": "qwen-c-008",
+    "profile_name": "qwen_c_1536_35",
+    "width": 1536,
+    "height": 1536,
+    "num_inference_steps": 35,
+    "arrival_tick": 7,
+    "seed": 51008,
+    "prompt": "a cozy reading corner with warm lamp light and plants"
+  },
+  {
+    "req_id": "qwen-c-009",
+    "profile_name": "qwen_c_512_20",
+    "width": 512,
+    "height": 512,
+    "num_inference_steps": 20,
+    "arrival_tick": 9,
+    "seed": 51009,
+    "prompt": "a detailed fantasy castle built on coastal cliffs"
+  },
+  {
+    "req_id": "qwen-c-010",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 9,
+    "seed": 51010,
+    "prompt": "a ceramic teapot on a wooden table, soft studio lighting"
+  },
+  {
+    "req_id": "qwen-c-011",
+    "profile_name": "qwen_c_768_20",
+    "width": 768,
+    "height": 768,
+    "num_inference_steps": 20,
+    "arrival_tick": 11,
+    "seed": 51011,
+    "prompt": "a futuristic city skyline at sunset with clean architectural details"
+  },
+  {
+    "req_id": "qwen-c-012",
+    "profile_name": "qwen_c_768_20",
+    "width": 768,
+    "height": 768,
+    "num_inference_steps": 20,
+    "arrival_tick": 12,
+    "seed": 51012,
+    "prompt": "a bowl of strawberries beside a glass of water, realistic texture"
+  },
+  {
+    "req_id": "qwen-c-013",
+    "profile_name": "qwen_c_1536_35",
+    "width": 1536,
+    "height": 1536,
+    "num_inference_steps": 35,
+    "arrival_tick": 13,
+    "seed": 51013,
+    "prompt": "a small cabin in snowy mountains, clear sky, cinematic composition"
+  },
+  {
+    "req_id": "qwen-c-014",
+    "profile_name": "qwen_c_768_20",
+    "width": 768,
+    "height": 768,
+    "num_inference_steps": 20,
+    "arrival_tick": 15,
+    "seed": 51014,
+    "prompt": "a watercolor painting of a mountain lake with reflections"
+  },
+  {
+    "req_id": "qwen-c-015",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 16,
+    "seed": 51015,
+    "prompt": "a vintage camera on a desk with notebooks and pencils"
+  },
+  {
+    "req_id": "qwen-c-016",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 18,
+    "seed": 51016,
+    "prompt": "a robot gardener watering flowers in a greenhouse"
+  },
+  {
+    "req_id": "qwen-c-017",
+    "profile_name": "qwen_c_1536_35",
+    "width": 1536,
+    "height": 1536,
+    "num_inference_steps": 35,
+    "arrival_tick": 20,
+    "seed": 51017,
+    "prompt": "a minimalist product photo of running shoes on a white background"
+  },
+  {
+    "req_id": "qwen-c-018",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 22,
+    "seed": 51018,
+    "prompt": "a cozy reading corner with warm lamp light and plants"
+  },
+  {
+    "req_id": "qwen-c-019",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 24,
+    "seed": 51019,
+    "prompt": "a detailed fantasy castle built on coastal cliffs"
+  },
+  {
+    "req_id": "qwen-c-020",
+    "profile_name": "qwen_c_1536_35",
+    "width": 1536,
+    "height": 1536,
+    "num_inference_steps": 35,
+    "arrival_tick": 24,
+    "seed": 51020,
+    "prompt": "a ceramic teapot on a wooden table, soft studio lighting"
+  },
+  {
+    "req_id": "qwen-c-021",
+    "profile_name": "qwen_c_512_20",
+    "width": 512,
+    "height": 512,
+    "num_inference_steps": 20,
+    "arrival_tick": 25,
+    "seed": 51021,
+    "prompt": "a futuristic city skyline at sunset with clean architectural details"
+  },
+  {
+    "req_id": "qwen-c-022",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 25,
+    "seed": 51022,
+    "prompt": "a bowl of strawberries beside a glass of water, realistic texture"
+  },
+  {
+    "req_id": "qwen-c-023",
+    "profile_name": "qwen_c_1536_35",
+    "width": 1536,
+    "height": 1536,
+    "num_inference_steps": 35,
+    "arrival_tick": 26,
+    "seed": 51023,
+    "prompt": "a small cabin in snowy mountains, clear sky, cinematic composition"
+  },
+  {
+    "req_id": "qwen-c-024",
+    "profile_name": "qwen_c_1536_35",
+    "width": 1536,
+    "height": 1536,
+    "num_inference_steps": 35,
+    "arrival_tick": 26,
+    "seed": 51024,
+    "prompt": "a watercolor painting of a mountain lake with reflections"
+  },
+  {
+    "req_id": "qwen-c-025",
+    "profile_name": "qwen_c_768_20",
+    "width": 768,
+    "height": 768,
+    "num_inference_steps": 20,
+    "arrival_tick": 26,
+    "seed": 51025,
+    "prompt": "a vintage camera on a desk with notebooks and pencils"
+  },
+  {
+    "req_id": "qwen-c-026",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 27,
+    "seed": 51026,
+    "prompt": "a robot gardener watering flowers in a greenhouse"
+  },
+  {
+    "req_id": "qwen-c-027",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 27,
+    "seed": 51027,
+    "prompt": "a minimalist product photo of running shoes on a white background"
+  },
+  {
+    "req_id": "qwen-c-028",
+    "profile_name": "qwen_c_1536_35",
+    "width": 1536,
+    "height": 1536,
+    "num_inference_steps": 35,
+    "arrival_tick": 28,
+    "seed": 51028,
+    "prompt": "a cozy reading corner with warm lamp light and plants"
+  },
+  {
+    "req_id": "qwen-c-029",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 30,
+    "seed": 51029,
+    "prompt": "a detailed fantasy castle built on coastal cliffs"
+  },
+  {
+    "req_id": "qwen-c-030",
+    "profile_name": "qwen_c_1536_35",
+    "width": 1536,
+    "height": 1536,
+    "num_inference_steps": 35,
+    "arrival_tick": 36,
+    "seed": 51030,
+    "prompt": "a ceramic teapot on a wooden table, soft studio lighting"
+  },
+  {
+    "req_id": "qwen-c-031",
+    "profile_name": "qwen_c_1024_25",
+    "width": 1024,
+    "height": 1024,
+    "num_inference_steps": 25,
+    "arrival_tick": 37,
+    "seed": 51031,
+    "prompt": "a futuristic city skyline at sunset with clean architectural details"
+  }
+]

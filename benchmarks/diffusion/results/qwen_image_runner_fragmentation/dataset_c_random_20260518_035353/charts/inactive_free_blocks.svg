@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460">
+<style>
+text{font-family:Arial,Helvetica,sans-serif;fill:#222}
+.title{font-size:18px;font-weight:700}
+.label{font-size:12px}
+.tick{font-size:11px;fill:#555}
+.grid{stroke:#d0d7de;stroke-width:1;opacity:.7}
+.axis{stroke:#24292f;stroke-width:1.2}
+</style>
+<text class="title" x="450.0" y="26" text-anchor="middle">Allocator Inactive Free Memory</text>
+<text class="label" x="450.0" y="444" text-anchor="middle">event tick</text>
+<text class="label" transform="translate(18 224.0) rotate(-90)" text-anchor="middle">MiB</text>
+<line class="grid" x1="78" x2="876" y1="396.0" y2="396.0"/>
+<text class="tick" x="70" y="400.0" text-anchor="end">0.00</text>
+<line class="grid" x1="78" x2="876" y1="327.2" y2="327.2"/>
+<text class="tick" x="70" y="331.2" text-anchor="end">1221.10</text>
+<line class="grid" x1="78" x2="876" y1="258.4" y2="258.4"/>
+<text class="tick" x="70" y="262.4" text-anchor="end">2442.20</text>
+<line class="grid" x1="78" x2="876" y1="189.6" y2="189.6"/>
+<text class="tick" x="70" y="193.6" text-anchor="end">3663.30</text>
+<line class="grid" x1="78" x2="876" y1="120.8" y2="120.8"/>
+<text class="tick" x="70" y="124.8" text-anchor="end">4884.40</text>
+<line class="grid" x1="78" x2="876" y1="52.0" y2="52.0"/>
+<text class="tick" x="70" y="56.0" text-anchor="end">6105.51</text>
+<line class="grid" x1="78.0" x2="78.0" y1="52" y2="396"/>
+<text class="tick" x="78.0" y="414" text-anchor="middle">0</text>
+<line class="grid" x1="141.0" x2="141.0" y1="52" y2="396"/>
+<text class="tick" x="141.0" y="414" text-anchor="middle">6</text>
+<line class="grid" x1="204.0" x2="204.0" y1="52" y2="396"/>
+<text class="tick" x="204.0" y="414" text-anchor="middle">12</text>
+<line class="grid" x1="267.0" x2="267.0" y1="52" y2="396"/>
+<text class="tick" x="267.0" y="414" text-anchor="middle">18</text>
+<line class="grid" x1="330.0" x2="330.0" y1="52" y2="396"/>
+<text class="tick" x="330.0" y="414" text-anchor="middle">24</text>
+<line class="grid" x1="403.5" x2="403.5" y1="52" y2="396"/>
+<text class="tick" x="403.5" y="414" text-anchor="middle">31</text>
+<line class="grid" x1="466.5" x2="466.5" y1="52" y2="396"/>
+<text class="tick" x="466.5" y="414" text-anchor="middle">37</text>
+<line class="grid" x1="529.5" x2="529.5" y1="52" y2="396"/>
+<text class="tick" x="529.5" y="414" text-anchor="middle">43</text>
+<line class="grid" x1="592.5" x2="592.5" y1="52" y2="396"/>
+<text class="tick" x="592.5" y="414" text-anchor="middle">49</text>
+<line class="grid" x1="666.0" x2="666.0" y1="52" y2="396"/>
+<text class="tick" x="666.0" y="414" text-anchor="middle">56</text>
+<line class="grid" x1="739.5" x2="739.5" y1="52" y2="396"/>
+<text class="tick" x="739.5" y="414" text-anchor="middle">63</text>
+<line class="grid" x1="813.0" x2="813.0" y1="52" y2="396"/>
+<text class="tick" x="813.0" y="414" text-anchor="middle">70</text>
+<line class="axis" x1="78" x2="78" y1="52" y2="396"/>
+<line class="axis" x1="78" x2="876" y1="396" y2="396"/>
+<polyline fill="none" stroke="#0072B2" stroke-width="2.2" stroke-linejoin="round" points="78.0,393.6 78.0,376.2 88.5,358.8 99.0,356.0 109.5,356.7 120.0,359.5 130.5,360.0 141.0,360.0 151.5,360.7 162.0,363.5 172.5,364.1 183.0,358.7 183.0,361.4 193.5,362.1 204.0,362.8 214.5,363.4 225.0,363.5 235.5,364.1 246.0,362.8 246.0,362.8 256.5,360.1 267.0,360.1 277.5,354.6 277.5,354.6 288.0,354.6 298.5,354.6 309.0,354.6 319.5,354.6 330.0,356.1 340.5,356.1 351.0,356.1 361.5,356.1 372.0,356.1 382.5,356.1 393.0,356.1 403.5,356.1 414.0,354.8 414.0,354.8 424.5,354.8 435.0,354.8 445.5,354.8 456.0,354.8 466.5,354.8 477.0,354.8 487.5,354.8 498.0,354.7 508.5,353.4 508.5,353.4 519.0,353.3 529.5,353.4 540.0,352.0 540.0,352.0 550.5,352.0 561.0,352.0 571.5,352.0 582.0,352.0 592.5,352.0 603.0,352.0 613.5,352.0 624.0,352.0 634.5,352.0 645.0,352.0 655.5,352.0 666.0,352.0 676.5,352.0 687.0,352.0 697.5,352.0 708.0,352.0 718.5,352.0 729.0,352.0 739.5,352.0 750.0,352.0 760.5,80.7 771.0,80.4 781.5,80.4 792.0,80.4 802.5,80.4 813.0,80.4 823.5,80.4 834.0,80.4 844.5,80.4 855.0,80.4 865.5,80.4 876.0,77.5"/>
+<line x1="90" x2="114" y1="70" y2="70" stroke="#0072B2" stroke-width="3"/>
+<text class="label" x="122" y="74">total inactive</text>
+<polyline fill="none" stroke="#D55E00" stroke-width="2.2" stroke-linejoin="round" points="78.0,395.3 78.0,393.0 88.5,390.6 99.0,390.6 109.5,390.6 120.0,390.6 130.5,390.6 141.0,390.6 151.5,390.6 162.0,390.6 172.5,390.6 183.0,390.6 183.0,390.6 193.5,390.6 204.0,390.6 214.5,390.6 225.0,390.6 235.5,390.6 246.0,390.6 246.0,390.6 256.5,390.6 267.0,390.6 277.5,390.6 277.5,390.6 288.0,390.6 298.5,390.6 309.0,390.6 319.5,390.6 330.0,390.6 340.5,390.6 351.0,390.6 361.5,390.6 372.0,390.6 382.5,390.6 393.0,390.6 403.5,390.6 414.0,390.6 414.0,390.6 424.5,390.6 435.0,390.6 445.5,390.6 456.0,390.6 466.5,390.6 477.0,390.6 487.5,390.6 498.0,390.6 508.5,390.6 508.5,390.6 519.0,390.6 529.5,390.6 540.0,390.6 540.0,390.6 550.5,390.6 561.0,390.6 571.5,390.6 582.0,390.6 592.5,390.6 603.0,390.6 613.5,390.6 624.0,390.6 634.5,390.6 645.0,390.6 655.5,390.6 666.0,390.6 676.5,390.6 687.0,390.6 697.5,390.6 708.0,390.6 718.5,390.6 729.0,390.6 739.5,390.6 750.0,390.6 760.5,352.5 771.0,352.5 781.5,352.5 792.0,352.5 802.5,352.5 813.0,352.5 823.5,352.5 834.0,352.5 844.5,352.5 855.0,352.5 865.5,352.5 876.0,352.5"/>
+<line x1="90" x2="114" y1="90" y2="90" stroke="#D55E00" stroke-width="3"/>
+<text class="label" x="122" y="94">largest inactive block</text>
+</svg>
