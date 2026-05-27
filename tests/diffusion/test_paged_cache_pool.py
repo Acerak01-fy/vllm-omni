@@ -260,6 +260,33 @@ def _make_context_pipeline(hidden_dim: int = 2):
 
 
 class TestPagedCacheDiTStateDriver:
+    def test_paged_context_refresh_uses_wrapped_base_context(self):
+        pipeline, manager = _make_context_pipeline()
+        pool = PagedCachePool(
+            num_pages=8,
+            page_size=2,
+            hidden_dim=2,
+            dtype=torch.float32,
+            device="cpu",
+        )
+
+        PagedCacheDiTStateDriver(_ReplacingRefreshBackend(), pipeline, pool)
+        base_context = CachedContext(name="ctx")
+        base_context.cache_config.num_inference_steps = 1
+        base_context.executed_steps = 2
+        paged_context = PagedCacheContext(base_context, pool)
+        manager._current_context = paged_context
+
+        should_refresh, reason = manager.maybe_refresh(paged_context)
+
+        assert should_refresh is True
+        assert reason == "num_inference_steps"
+
+        should_refresh, reason = manager.maybe_refresh()
+
+        assert should_refresh is True
+        assert reason == "num_inference_steps"
+
     def test_initialize_rewraps_contexts_replaced_by_force_refresh(self):
         pipeline, manager = _make_context_pipeline()
         pool = PagedCachePool(

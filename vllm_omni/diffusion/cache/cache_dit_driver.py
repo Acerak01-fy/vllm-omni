@@ -185,10 +185,7 @@ class CacheDiTStateDriver(CacheStateDriver):
         return fresh_context
 
     def _build_fresh_contexts(self, handle: _CacheDiTHandle) -> dict[str, Any]:
-        return {
-            name: self._clone_fresh_context(handle.templates[name])
-            for name in handle.context_names
-        }
+        return {name: self._clone_fresh_context(handle.templates[name]) for name in handle.context_names}
 
     @staticmethod
     def _get_payload(slot: CacheBackendSlot) -> tuple[dict[str, Any], ...]:
@@ -202,6 +199,7 @@ class PagedCacheDiTStateDriver(CacheDiTStateDriver):
     """Cache-DiT state driver that stores eligible buffers in a page pool."""
 
     def __init__(self, backend: Any, pipeline: Any, pool: PagedCachePool):
+        _patch_cache_dit_manager_for_paged_context()
         super().__init__(backend, pipeline)
         self._pool = pool
 
@@ -259,3 +257,29 @@ class PagedCacheDiTStateDriver(CacheDiTStateDriver):
         for name, context in list(contexts.items()):
             if not isinstance(context, PagedCacheContext):
                 contexts[name] = PagedCacheContext(context, self._pool)
+
+
+def _patch_cache_dit_manager_for_paged_context() -> None:
+    """Teach cache-dit's context manager to refresh paged wrapper contexts.
+
+    cache-dit's refresh path expects a raw CachedContext or context name.
+    PagedCacheContext is a storage wrapper, so refresh decisions must run on
+    the wrapped base_context while buffer get/set still go through the wrapper.
+    """
+
+    if getattr(CachedContextManager, "_vllm_omni_paged_context_patch", False):
+        return
+
+    original_maybe_refresh = CachedContextManager.maybe_refresh
+
+    def maybe_refresh(self: CachedContextManager, cached_context: Any = None) -> Any:
+        # cache-dit's refresh path only understands raw CachedContext objects.
+        # Keep the wrapper for storage, but unwrap to base_context for refresh decisions.
+        if isinstance(cached_context, PagedCacheContext):
+            return original_maybe_refresh(self, cached_context.base_context)
+        if cached_context is None and isinstance(getattr(self, "_current_context", None), PagedCacheContext):
+            return original_maybe_refresh(self, self._current_context.base_context)
+        return original_maybe_refresh(self, cached_context)
+
+    CachedContextManager.maybe_refresh = maybe_refresh
+    CachedContextManager._vllm_omni_paged_context_patch = True
