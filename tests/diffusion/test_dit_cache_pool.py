@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -19,7 +20,10 @@ from vllm_omni.diffusion.cache.cache_dit_batch import (
     set_batch_contexts,
 )
 from vllm_omni.diffusion.cache.cache_dit_driver import CacheDiTStateDriver
-from vllm_omni.diffusion.cache.dit_cache_manager import DiTCacheManager, DiTCacheStateDriverBase
+from vllm_omni.diffusion.cache.dit_cache_manager import (
+    DiTCacheManager,
+    DiTCacheStateDriverBase,
+)
 from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.driver import TeaCacheStateDriver
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
@@ -567,6 +571,8 @@ class _FakeBatchCacheLifecycleDriver(DiTCacheStateDriverBase):
         self.clear_history: list[int] = []
         self.active_slot: CacheBackendSlot | None = None
         self.fail_initialize_slot_ids: set[int] = set()
+        self.fail_install_batch = False
+        self.fail_deactivate_batch = False
 
     @property
     def backend_name(self) -> str:
@@ -611,9 +617,13 @@ class _FakeBatchCacheLifecycleDriver(DiTCacheStateDriverBase):
 
     def install_batch_slots(self, states):
         self.install_batch_history.append(tuple(state.req_id for state in states))
+        if self.fail_install_batch:
+            raise RuntimeError("install-batch-boom")
 
     def deactivate_batch_slots(self):
         self.deactivate_batch_calls += 1
+        if self.fail_deactivate_batch:
+            raise RuntimeError("deactivate-batch-boom")
 
 
 @dataclass(frozen=True)
@@ -1192,6 +1202,28 @@ class TestDiTCacheManagerBatchLifecycle:
         assert driver.deactivate_history == [2, 1]
         assert driver.active_slot is None
         assert driver.install_batch_history == []
+        assert manager._batch_active is False
+
+    def test_activate_batch_logs_failed_batch_cleanup(self, caplog):
+        driver = _FakeBatchCacheLifecycleDriver()
+        manager = DiTCacheManager(driver)
+        driver.fail_install_batch = True
+        driver.fail_deactivate_batch = True
+        req_a = _make_cache_state("req-a", num_inference_steps=3)
+        req_b = _make_cache_state("req-b", num_inference_steps=3)
+        target_logger = logging.getLogger("vllm_omni.diffusion.cache.dit_cache_manager")
+        target_logger.addHandler(caplog.handler)
+
+        try:
+            with caplog.at_level(logging.ERROR, logger=target_logger.name):
+                with pytest.raises(RuntimeError, match="install-batch-boom"):
+                    manager.activate([req_a, req_b])
+        finally:
+            target_logger.removeHandler(caplog.handler)
+
+        assert driver.deactivate_batch_calls == 1
+        assert "Failed to deactivate batch cache slots" in caplog.text
+        assert "cache context may still be installed" in caplog.text
         assert manager._batch_active is False
 
     def test_activate_single_deactivates_installed_slot_when_initialize_fails(self):

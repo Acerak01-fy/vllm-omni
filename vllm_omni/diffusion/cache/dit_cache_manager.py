@@ -7,7 +7,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+from vllm.logger import init_logger
+
 from vllm_omni.diffusion.worker.utils import CacheBackendSlot, DiffusionRequestState
+
+logger = init_logger(__name__)
 
 
 class DiTCacheStateDriverBase(ABC):
@@ -213,12 +217,20 @@ class DiTCacheManager:
                 try:
                     self.driver.deactivate_batch_slots()
                 except Exception:
-                    pass
+                    logger.exception(
+                        "Failed to deactivate batch cache slots for backend %s "
+                        "after activation failure; cache context may still be "
+                        "installed on the live pipeline.",
+                        self.driver.backend_name,
+                    )
             for slot in reversed(installed_slots):
                 try:
                     self.driver.deactivate_slot(slot)
                 except Exception:
-                    pass
+                    logger.exception(
+                        "Failed to deactivate cache slot for backend %s after activation failure.",
+                        self.driver.backend_name,
+                    )
             self._batch_active = False
             raise
         self._batch_active = True
