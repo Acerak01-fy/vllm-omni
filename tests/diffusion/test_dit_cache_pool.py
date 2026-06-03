@@ -42,13 +42,13 @@ def _noop_forward_context(*args, **kwargs):
 
 
 def _require_req_output(output, req_id: str):
-    req_output = output.get_req_output(req_id)
+    req_output = output.get_request_output(req_id)
     assert req_output is not None
     return req_output
 
 
 def _output_req_ids(output) -> list[str]:
-    return [item.req_id for item in output.runner_outputs]
+    return [item.request_id for item in output.runner_outputs]
 
 
 def _output_step_indices(output) -> list[int | None]:
@@ -77,7 +77,7 @@ def _make_request(req_id: str, num_inference_steps: int = 3):
 def _make_new_scheduler_output(req, step_id: int = 0, finished_req_ids=None):
     return DiffusionSchedulerOutput(
         step_id=step_id,
-        scheduled_new_reqs=[NewRequestData(sched_req_id=req.request_ids[0], req=req)],
+        scheduled_new_reqs=[NewRequestData(request_id=req.request_ids[0], req=req)],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
         num_running_reqs=1,
@@ -95,8 +95,8 @@ def _make_batch_scheduler_output(
     cached_req_ids = [] if cached_req_ids is None else list(cached_req_ids)
     return DiffusionSchedulerOutput(
         step_id=step_id,
-        scheduled_new_reqs=[NewRequestData(sched_req_id=req.request_ids[0], req=req) for req in new_reqs],
-        scheduled_cached_reqs=CachedRequestData(sched_req_ids=cached_req_ids),
+        scheduled_new_reqs=[NewRequestData(request_id=req.request_ids[0], req=req) for req in new_reqs],
+        scheduled_cached_reqs=CachedRequestData(request_ids=cached_req_ids),
         finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
         num_running_reqs=len(new_reqs) + len(cached_req_ids),
         num_waiting_reqs=0,
@@ -107,7 +107,7 @@ def _make_cached_scheduler_output(sched_req_id: str, step_id: int = 0, finished_
     return DiffusionSchedulerOutput(
         step_id=step_id,
         scheduled_new_reqs=[],
-        scheduled_cached_reqs=CachedRequestData(sched_req_ids=[sched_req_id]),
+        scheduled_cached_reqs=CachedRequestData(request_ids=[sched_req_id]),
         finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
         num_running_reqs=1,
         num_waiting_reqs=0,
@@ -116,7 +116,7 @@ def _make_cached_scheduler_output(sched_req_id: str, step_id: int = 0, finished_
 
 @dataclass(frozen=True)
 class _CacheDiTSnapshot:
-    req_id: str
+    request_id: str
     step_index: int
     active_req_id: str | None
     waiting_req_ids: tuple[str, ...]
@@ -190,7 +190,7 @@ class _CacheDiTPipeline:
 
     def prepare_encode(self, state, **kwargs):
         del kwargs
-        self.prepare_calls.append(state.req_id)
+        self.prepare_calls.append(state.request_id)
         num_steps = state.sampling.num_inference_steps
         state.timesteps = [torch.tensor(num_steps - idx) for idx in range(num_steps)]
         state.latents = torch.tensor([0.0])
@@ -218,7 +218,7 @@ class _CacheDiTPipeline:
         trace_before = tuple(state.cache_slot.payload["trace"])
         self.snapshots.append(
             _CacheDiTSnapshot(
-                req_id=state.req_id,
+                request_id=state.request_id,
                 step_index=state.step_index,
                 active_req_id=active_req_id,
                 waiting_req_ids=waiting_req_ids,
@@ -228,12 +228,12 @@ class _CacheDiTPipeline:
             )
         )
 
-        if state.req_id in self.fail_req_ids:
-            raise RuntimeError(f"boom-{state.req_id}")
-        if state.req_id in self.none_req_ids:
+        if state.request_id in self.fail_req_ids:
+            raise RuntimeError(f"boom-{state.request_id}")
+        if state.request_id in self.none_req_ids:
             return None
 
-        state.cache_slot.payload["trace"].append(f"{state.req_id}:{state.step_index}")
+        state.cache_slot.payload["trace"].append(f"{state.request_id}:{state.step_index}")
         return torch.tensor([float(state.step_index + 1)])
 
     def step_scheduler(self, state, noise_pred, **kwargs):
@@ -242,7 +242,7 @@ class _CacheDiTPipeline:
 
     def post_decode(self, state, **kwargs):
         del kwargs
-        self.decode_calls.append(state.req_id)
+        self.decode_calls.append(state.request_id)
         return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
 
 
@@ -616,7 +616,7 @@ class _FakeBatchCacheLifecycleDriver(DiTCacheStateDriverBase):
         return 256 + slot.payload["slot_id"]
 
     def install_batch_slots(self, states):
-        self.install_batch_history.append(tuple(state.req_id for state in states))
+        self.install_batch_history.append(tuple(state.request_id for state in states))
         if self.fail_install_batch:
             raise RuntimeError("install-batch-boom")
 
@@ -675,8 +675,8 @@ class _FakeRunnerBatchCacheDiTDriver(DiTCacheStateDriverBase):
         return 1024 + 64 * len(slot.payload["history"])
 
     def install_batch_slots(self, states):
-        self.install_batch_history.append(tuple(state.req_id for state in states))
-        self.pipeline.live_batch_req_ids = [state.req_id for state in states]
+        self.install_batch_history.append(tuple(state.request_id for state in states))
+        self.pipeline.live_batch_req_ids = [state.request_id for state in states]
         for state in states:
             state.cache_slot.payload["cache_plan"] = tuple(getattr(state.sampling, "cache_plan", ()))
 
@@ -698,7 +698,7 @@ class _BatchCacheDiTPipeline:
 
     def prepare_encode(self, state, **kwargs):
         del kwargs
-        self.prepare_calls.append(state.req_id)
+        self.prepare_calls.append(state.request_id)
         num_steps = state.sampling.num_inference_steps
         state.timesteps = [torch.tensor(num_steps - idx) for idx in range(num_steps)]
         state.latents = torch.tensor([[0.0]], dtype=torch.float32)
@@ -710,18 +710,18 @@ class _BatchCacheDiTPipeline:
     def denoise_step(self, input_batch, **kwargs):
         del kwargs
         assert self.runner is not None
-        states = [self.runner.state_cache[req_id] for req_id in input_batch.req_ids]
+        states = [self.runner.state_cache[req_id] for req_id in input_batch.request_ids]
         decisions = tuple(state.step_index in state.extra.get("cache_plan", ()) for state in states)
         self.snapshots.append(
             _BatchRunnerSnapshot(
-                req_ids=tuple(input_batch.req_ids),
+                req_ids=tuple(input_batch.request_ids),
                 step_indices=tuple(state.step_index for state in states),
                 cache_decisions=decisions,
                 batch_active=self.runner.dit_cache_manager._batch_active,
             )
         )
         for state in states:
-            state.cache_slot.payload["history"].append((state.req_id, state.step_index))
+            state.cache_slot.payload["history"].append((state.request_id, state.step_index))
         return input_batch.latents + 1
 
     def step_scheduler(self, state, noise_pred, **kwargs):
@@ -730,7 +730,7 @@ class _BatchCacheDiTPipeline:
 
     def post_decode(self, state, **kwargs):
         del kwargs
-        self.decode_calls.append(state.req_id)
+        self.decode_calls.append(state.request_id)
         return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
 
 
@@ -821,7 +821,7 @@ def _make_cache_state(
     slot: CacheBackendSlot | None = None,
 ):
     return SimpleNamespace(
-        req_id=req_id,
+        request_id=req_id,
         sampling=SimpleNamespace(num_inference_steps=num_inference_steps),
         latents=torch.zeros((rows, 2), dtype=torch.float32),
         cache_slot=slot,
@@ -864,7 +864,7 @@ def _assert_context_maps_match(actual_contexts, expected_contexts):
 
 @dataclass(frozen=True)
 class _TeaCacheSnapshot:
-    req_id: str
+    request_id: str
     step_index: int
     active_req_id: str | None
     waiting_req_ids: tuple[str, ...]
@@ -905,7 +905,7 @@ class _TeaCachePipeline:
 
     def prepare_encode(self, state, **kwargs):
         del kwargs
-        self.prepare_calls.append(state.req_id)
+        self.prepare_calls.append(state.request_id)
         num_steps = state.sampling.num_inference_steps
         state.timesteps = [torch.tensor(num_steps - idx) for idx in range(num_steps)]
         state.latents = torch.tensor([0.0])
@@ -937,7 +937,7 @@ class _TeaCachePipeline:
 
         self.snapshots.append(
             _TeaCacheSnapshot(
-                req_id=state.req_id,
+                request_id=state.request_id,
                 step_index=state.step_index,
                 active_req_id=active_req_id,
                 waiting_req_ids=waiting_req_ids,
@@ -948,9 +948,9 @@ class _TeaCachePipeline:
             )
         )
 
-        if state.req_id in self.fail_req_ids:
-            raise RuntimeError(f"boom-{state.req_id}")
-        if state.req_id in self.none_req_ids:
+        if state.request_id in self.fail_req_ids:
+            raise RuntimeError(f"boom-{state.request_id}")
+        if state.request_id in self.none_req_ids:
             return None
 
         positive_state.cnt += 1
@@ -974,7 +974,7 @@ class _TeaCachePipeline:
 
     def post_decode(self, state, **kwargs):
         del kwargs
-        self.decode_calls.append(state.req_id)
+        self.decode_calls.append(state.request_id)
         return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
 
 
@@ -1023,7 +1023,7 @@ class TestExecuteStepwiseDiTCachePool:
         assert runner.state_cache["req-a"].cache_slot is slot_a
         assert runner.state_cache["req-a"].cache_slot.payload["trace"] == ["req-a:0", "req-a:1"]
         assert runner.state_cache["req-b"].cache_slot.payload["trace"] == ["req-b:0"]
-        assert [snapshot.trace_before for snapshot in runner.pipeline.snapshots if snapshot.req_id == "req-a"] == [
+        assert [snapshot.trace_before for snapshot in runner.pipeline.snapshots if snapshot.request_id == "req-a"] == [
             (),
             ("req-a:0",),
         ]
@@ -1045,7 +1045,7 @@ class TestExecuteStepwiseDiTCachePool:
         snapshot = runner.pipeline.snapshots[-1]
         resident_slots = {req_id: state.cache_slot for req_id, state in runner.state_cache.items()}
 
-        assert snapshot.req_id == "req-c"
+        assert snapshot.request_id == "req-c"
         assert snapshot.active_req_id == "req-c"
         assert snapshot.waiting_req_ids == ("req-a", "req-b")
         assert snapshot.resident_req_ids == ("req-a", "req-b", "req-c")
@@ -1070,7 +1070,7 @@ class TestExecuteStepwiseDiTCachePool:
             _make_new_scheduler_output(req_b, step_id=1, finished_req_ids={"req-a"}),
         )
 
-        assert _require_req_output(output, "req-b").req_id == "req-b"
+        assert _require_req_output(output, "req-b").request_id == "req-b"
         assert "req-a" not in runner.state_cache
         assert slot_a.metadata == {}
         assert slot_a.resident_bytes == 0
@@ -1779,7 +1779,7 @@ class TestExecuteStepwiseTeaCacheSlotSwitching:
         assert runner.state_cache["req-b"].cache_slot.payload["forward_cnt"] == 1
         assert runner.state_cache["req-b"].cache_slot.payload["states"]["teacache_positive"].cnt == 1
 
-        req_a_snapshots = [snapshot for snapshot in runner.pipeline.snapshots if snapshot.req_id == "req-a"]
+        req_a_snapshots = [snapshot for snapshot in runner.pipeline.snapshots if snapshot.request_id == "req-a"]
         assert [snapshot.positive_cnt_before for snapshot in req_a_snapshots] == [0, 1]
         assert [snapshot.forward_cnt_before for snapshot in req_a_snapshots] == [0, 1]
         assert req_a_snapshots[1].residual_sum_before == pytest.approx(20.0)

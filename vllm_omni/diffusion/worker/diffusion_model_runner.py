@@ -207,7 +207,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 )
                 if cfg_cached_steps:
                     logger.info(
-                        "[Cache-DiT] Request %s seed=%s prompt=%s for %s: cfg_skipped %d / %d steps (%.2f%%), cfg_skipped_step_ids=%s",
+                        "[Cache-DiT] Request %s seed=%s prompt=%s for %s: "
+                        "cfg_skipped %d / %d steps (%.2f%%), cfg_skipped_step_ids=%s",
                         request_id,
                         seed_value,
                         prompt_preview,
@@ -275,7 +276,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 )
                 if cfg_cached_steps:
                     logger.info(
-                        "[Cache-DiT][stepwise] Request %s seed=%s prompt=%s for %s: cfg_skipped %d / %d steps (%.2f%%), cfg_skipped_step_ids=%s",
+                        "[Cache-DiT][stepwise] Request %s seed=%s prompt=%s for %s: "
+                        "cfg_skipped %d / %d steps (%.2f%%), cfg_skipped_step_ids=%s",
                         request_state.request_id,
                         seed_value,
                         prompt_preview,
