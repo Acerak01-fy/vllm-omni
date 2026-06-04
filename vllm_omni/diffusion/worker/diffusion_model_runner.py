@@ -802,34 +802,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     and len(states) > 1
                     and not dit_cache_manager.supports_batch_activation
                 ):
-                    runner_output_list = []
-                    new_request_id_set = set(new_request_ids)
-                    for state in states:
-                        state_new_req_ids = [state.request_id] if state.request_id in new_request_id_set else []
-                        input_batch = self._prepare_batch_inputs([state], state_new_req_ids)
-                        attn_metadata = self._prepare_attn_metadata(input_batch)
-
-                        with set_forward_context(
-                            vllm_config=self.vllm_config,
-                            omni_diffusion_config=self.od_config,
-                            attn_metadata=attn_metadata,
-                        ):
-                            try:
-                                dit_cache_manager.activate(state)
-                                noise_pred = self.pipeline.denoise_step(input_batch)
-                            finally:
-                                dit_cache_manager.deactivate(state)
-
-                        pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
-                        runner_output_list.extend(
-                            self._build_stepwise_outputs(
-                                [state],
-                                input_batch,
-                                noise_pred,
-                                pipeline_interrupted,
-                            )
-                        )
-                    return BatchRunnerOutput.from_list(runner_output_list)
+                    raise ValueError(
+                        f"Cache backend '{dit_cache_manager.driver.backend_name}' "
+                        "does not support batched slot activation."
+                    )
 
                 input_batch = self._prepare_batch_inputs(states, new_request_ids)
                 noise_pred = self._denoise_step_with_cache(
