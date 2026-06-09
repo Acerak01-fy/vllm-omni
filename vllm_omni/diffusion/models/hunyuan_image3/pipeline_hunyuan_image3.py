@@ -44,6 +44,7 @@ from .hunyuan_image3_transformer import (
     UNetDown,
     UNetUp,
     build_batch_2d_rope,
+    is_hunyuan_image3_paged_kv_cache_enabled,
     real_batched_index_select,
 )
 from .system_prompt import get_system_prompt
@@ -304,6 +305,7 @@ class HunyuanImage3Pipeline(
     DiffusionPipelineProfilerMixin,
 ):
     support_image_input = True
+    EXTRA_OUTPUT_PARAMS = frozenset({"hunyuan_image3_paged_kv_cache_stats"})
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "model.": "",
@@ -417,6 +419,12 @@ class HunyuanImage3Pipeline(
             skip_prefixes=skip_prefixes,
         )
         return loader.load_weights(weights)
+
+    def reset_paged_kv_cache_stats(self) -> None:
+        self.model.reset_paged_kv_cache_stats()
+
+    def get_paged_kv_cache_stats(self, *, include_layers: bool = False) -> dict[str, Any]:
+        return self.model.get_paged_kv_cache_stats(include_layers=include_layers)
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed
@@ -1463,10 +1471,14 @@ class HunyuanImage3Pipeline(
 
         model_inputs.update(ar_kv_kwargs)
 
+        self.reset_paged_kv_cache_stats()
         outputs = self._generate(**model_inputs, **kwargs)
         custom_output = {}
         if any(t is not None for t in cot_text_list):
             custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
+        custom_output["hunyuan_image3_paged_kv_cache_stats"] = self.get_paged_kv_cache_stats(
+            include_layers=is_hunyuan_image3_paged_kv_cache_enabled(),
+        )
         return DiffusionOutput(
             output=outputs[0],
             custom_output=custom_output,

@@ -25,6 +25,8 @@ HEAD_DIM = 16
 IMAGE_TOKEN_LEN = 8
 SUFFIX_TOKEN_LEN = 3
 SCALING = 1.0 / math.sqrt(HEAD_DIM)
+CAPTURED_ATTN_METADATA = []
+CAPTURED_ATTN_CALLS = []
 
 
 # ============================================================
@@ -37,7 +39,44 @@ class MockAttention(nn.Module):
         super().__init__()
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
+        CAPTURED_ATTN_METADATA.append(attn_metadata)
+        CAPTURED_ATTN_CALLS.append((query, key, value, attn_metadata))
+        if attn_metadata is None or attn_metadata.attn_mask is None:
+            return query
         return query
+
+
+class FakePagedKVRunner:
+    def __init__(self):
+        self.calls = []
+
+    def is_available(self):
+        return True
+
+    def run(self, query, key, value, metadata, *, sm_scale, causal, attn_mask=None):
+        del causal, attn_mask
+        self.calls.append((query, key, value, metadata))
+        outputs = []
+        custom_mask_offset = 0
+        for b in range(query.shape[0]):
+            page_start = int(metadata.kv_indptr[b].item())
+            page_end = int(metadata.kv_indptr[b + 1].item())
+            page_indices = metadata.kv_indices[page_start:page_end]
+            cached_len = int(metadata.cached_lens[b].item())
+            prefix_key = metadata.key_cache[page_indices].reshape(-1, key.shape[2], key.shape[3])[:cached_len]
+            prefix_value = metadata.value_cache[page_indices].reshape(-1, value.shape[2], value.shape[3])[:cached_len]
+            dense_key = torch.cat([prefix_key, key[b]], dim=0).unsqueeze(0)
+            dense_value = torch.cat([prefix_value, value[b]], dim=0).unsqueeze(0)
+            custom_mask = None
+            if metadata.custom_mask is not None:
+                kv_len = int(metadata.seq_lens[b].item())
+                item_size = query.shape[1] * kv_len
+                custom_mask = metadata.custom_mask[
+                    custom_mask_offset : custom_mask_offset + item_size
+                ].reshape(1, query.shape[1], kv_len)
+                custom_mask_offset += item_size
+            outputs.append(_dense_attention(query[b : b + 1], dense_key, dense_value, sm_scale, attn_mask=custom_mask)[0])
+        return torch.stack(outputs, dim=0)
 
 
 @contextmanager
@@ -80,6 +119,25 @@ def _make_known_kv(num_tokens, base=0.0):
     return k, v
 
 
+def _repeat_kv_for_test(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return hidden_states
+    bsz, seq_len, num_kv_heads, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, :, None, :].expand(bsz, seq_len, num_kv_heads, n_rep, head_dim)
+    return hidden_states.reshape(bsz, seq_len, num_kv_heads * n_rep, head_dim)
+
+
+def _dense_attention(query, key, value, scale, attn_mask=None):
+    repeat_num = query.shape[2] // key.shape[2]
+    key = _repeat_kv_for_test(key, repeat_num)
+    value = _repeat_kv_for_test(value, repeat_num)
+    scores = torch.einsum("bqhd,bkhd->bhqk", query, key) * scale
+    if attn_mask is not None:
+        scores = scores.masked_fill(~attn_mask.unsqueeze(1), torch.finfo(scores.dtype).min)
+    probs = torch.softmax(scores, dim=-1)
+    return torch.einsum("bhqk,bkhd->bqhd", probs, value)
+
+
 def _gen_timestep_index(bs: int, current_start: int) -> torch.Tensor:
     return torch.full((bs, 1), current_start, dtype=torch.long)
 
@@ -91,16 +149,19 @@ def _call_mgr(
     seq_len,
     key_flat,
     value_flat,
+    query_flat=None,
+    attention_mask=None,
     first_step=False,
     uncond_cfg_prefill=False,
     num_image_tokens=IMAGE_TOKEN_LEN,
     shard_image_size=None,
     gen_timestep_scatter_index=None,
     position_ids=None,
+    full_attn_spans=None,
 ):
-    query = torch.randn(bs * q_len, NUM_HEADS, HEAD_DIM)
-    attn_mask = torch.zeros(bs, 1, seq_len, seq_len)
-    mgr(
+    query = torch.randn(bs * q_len, NUM_HEADS, HEAD_DIM) if query_flat is None else query_flat
+    attn_mask = torch.zeros(bs, 1, seq_len, seq_len) if attention_mask is None else attention_mask
+    return mgr(
         query,
         key_flat,
         value_flat,
@@ -113,6 +174,7 @@ def _call_mgr(
         shard_image_size=shard_image_size,
         gen_timestep_scatter_index=gen_timestep_scatter_index,
         position_ids=position_ids,
+        full_attn_spans=full_attn_spans,
     )
 
 
@@ -185,6 +247,45 @@ def test_no_ar_kv(bs):
             result_k[b, prompt_len : prompt_len + img_q_len],
             new_img_k[img_offset : img_offset + img_q_len],
         )
+
+
+def test_profile_records_dense_later_reuse_and_attention(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_HY3_PAGED_KV_PROFILE", "1")
+    mgr = _make_cache_mgr()
+    bs = 1
+    prompt_len = 3
+    first_q_len = prompt_len + IMAGE_TOKEN_LEN + SUFFIX_TOKEN_LEN
+    k_flat, v_flat = _make_known_kv(first_q_len, base=1.0)
+    _call_mgr(
+        mgr,
+        bs,
+        q_len=first_q_len,
+        seq_len=first_q_len,
+        key_flat=k_flat,
+        value_flat=v_flat,
+        first_step=True,
+        gen_timestep_scatter_index=_gen_timestep_index(bs, prompt_len),
+    )
+
+    img_k, img_v = _make_known_kv(IMAGE_TOKEN_LEN, base=50.0)
+    position_ids = torch.arange(prompt_len, prompt_len + IMAGE_TOKEN_LEN).reshape(1, IMAGE_TOKEN_LEN)
+    _call_mgr(
+        mgr,
+        bs,
+        q_len=IMAGE_TOKEN_LEN,
+        seq_len=prompt_len + IMAGE_TOKEN_LEN,
+        key_flat=img_k,
+        value_flat=img_v,
+        first_step=False,
+        position_ids=position_ids,
+    )
+
+    stats = mgr.get_paged_kv_cache_stats()
+    assert stats["paged_kv_profile_enabled"] is True
+    assert stats["profile_dense_reuse_calls"] == 1
+    assert stats["profile_dense_later_attention_calls"] == 1
+    assert stats["profile_dense_reuse_total_ms"] >= 0.0
+    assert stats["profile_dense_later_attention_total_ms"] >= 0.0
 
 
 # ============================================================
@@ -498,3 +599,443 @@ def test_cross_request_isolation():
     assert torch.allclose(cached_value[0, :prompt_len], v_flat[:prompt_len])
     # Stale values must not be present
     assert not torch.any(cached_key >= 999.0)
+
+
+# ============================================================
+# Test 5: Paged KV opt-in path
+# ============================================================
+
+
+def test_paged_kv_disabled_by_default_uses_dense_update_path():
+    CAPTURED_ATTN_CALLS.clear()
+    mgr = _make_cache_mgr()
+    bs = 1
+    prompt_len = 3
+    first_q_len = prompt_len + IMAGE_TOKEN_LEN + SUFFIX_TOKEN_LEN
+    k_flat, v_flat = _make_known_kv(bs * first_q_len, base=1.0)
+
+    _call_mgr(
+        mgr,
+        bs,
+        q_len=first_q_len,
+        seq_len=first_q_len,
+        key_flat=k_flat,
+        value_flat=v_flat,
+        first_step=True,
+        gen_timestep_scatter_index=_gen_timestep_index(bs, prompt_len),
+    )
+
+    assert mgr._paged_prompt_kv_state is None
+
+    update_seq_len = prompt_len + IMAGE_TOKEN_LEN
+    img_k, img_v = _make_known_kv(IMAGE_TOKEN_LEN, base=50.0)
+    position_ids = torch.arange(prompt_len, prompt_len + IMAGE_TOKEN_LEN).reshape(1, IMAGE_TOKEN_LEN)
+    CAPTURED_ATTN_CALLS.clear()
+    _call_mgr(
+        mgr,
+        bs,
+        q_len=IMAGE_TOKEN_LEN,
+        seq_len=update_seq_len,
+        key_flat=img_k,
+        value_flat=img_v,
+        first_step=False,
+        position_ids=position_ids,
+    )
+
+    assert CAPTURED_ATTN_CALLS
+    _, dense_key, dense_value, _ = CAPTURED_ATTN_CALLS[-1]
+    assert dense_key.shape == (bs, update_seq_len, NUM_HEADS, HEAD_DIM)
+    assert dense_value.shape == (bs, update_seq_len, NUM_HEADS, HEAD_DIM)
+
+
+def test_paged_prompt_state_built_on_first_step():
+    mgr = _make_cache_mgr()
+    mgr.set_paged_kv_cache_enabled(True)
+    mgr.set_paged_kv_cache_page_size(4)
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+        HunyuanImage3PagedKVCacheManager,
+    )
+
+    assert isinstance(mgr._paged_kv_cache_manager, HunyuanImage3PagedKVCacheManager)
+
+    bs = 2
+    prompt_len = 5
+    q_len = prompt_len + IMAGE_TOKEN_LEN + SUFFIX_TOKEN_LEN
+    k_flat, v_flat = _make_known_kv(bs * q_len, base=1.0)
+
+    _call_mgr(
+        mgr,
+        bs,
+        q_len=q_len,
+        seq_len=q_len,
+        key_flat=k_flat,
+        value_flat=v_flat,
+        first_step=True,
+        gen_timestep_scatter_index=_gen_timestep_index(bs, prompt_len),
+    )
+
+    state = mgr._paged_prompt_kv_state
+    assert state is not None
+    assert state.page_size == 4
+    assert state.key_cache.shape == (4, 4, NUM_KV_HEADS, HEAD_DIM)
+    assert state.prefix_page_indptr.tolist() == [0, 2, 4]
+    assert torch.equal(state.cached_lens, torch.full((bs,), prompt_len, dtype=torch.int32))
+    for b in range(bs):
+        page_start = int(state.prefix_page_indptr[b].item())
+        page_end = int(state.prefix_page_indptr[b + 1].item())
+        prefix_from_pages = state.key_cache[page_start:page_end].reshape(-1, NUM_KV_HEADS, HEAD_DIM)[:prompt_len]
+        flat_offset = b * q_len
+        assert torch.allclose(prefix_from_pages, k_flat[flat_offset : flat_offset + prompt_len])
+
+
+def test_paged_update_dispatches_runner_without_dense_reuse():
+    CAPTURED_ATTN_CALLS.clear()
+    mgr = _make_cache_mgr()
+    runner = FakePagedKVRunner()
+    mgr.set_paged_kv_cache_enabled(True)
+    mgr.set_paged_kv_cache_page_size(4)
+    mgr.set_paged_kv_runner(runner)
+
+    bs = 1
+    prompt_len = 3
+    first_q_len = prompt_len + IMAGE_TOKEN_LEN + SUFFIX_TOKEN_LEN
+    k_flat, v_flat = _make_known_kv(first_q_len, base=1.0)
+    _call_mgr(
+        mgr,
+        bs,
+        q_len=first_q_len,
+        seq_len=first_q_len,
+        key_flat=k_flat,
+        value_flat=v_flat,
+        first_step=True,
+        gen_timestep_scatter_index=_gen_timestep_index(bs, prompt_len),
+    )
+
+    def _fail_dense_reuse(*args, **kwargs):
+        raise AssertionError("_reuse_prompt_kv should not be called on the paged path")
+
+    mgr._reuse_prompt_kv = _fail_dense_reuse
+    CAPTURED_ATTN_CALLS.clear()
+    img_k, img_v = _make_known_kv(IMAGE_TOKEN_LEN, base=50.0)
+    position_ids = torch.arange(prompt_len, prompt_len + IMAGE_TOKEN_LEN).reshape(1, IMAGE_TOKEN_LEN)
+    out = _call_mgr(
+        mgr,
+        bs,
+        q_len=IMAGE_TOKEN_LEN,
+        seq_len=prompt_len + IMAGE_TOKEN_LEN,
+        key_flat=img_k,
+        value_flat=img_v,
+        first_step=False,
+        position_ids=position_ids,
+    )
+
+    assert out.shape == (IMAGE_TOKEN_LEN, NUM_HEADS, HEAD_DIM)
+    assert not CAPTURED_ATTN_CALLS
+    assert len(runner.calls) == 1
+    _, _, _, metadata = runner.calls[0]
+    assert metadata.kv_indptr.tolist() == [0, 3]
+    assert metadata.kv_last_page_len.tolist() == [3]
+    assert metadata.append_batch_indices.tolist() == [0] * IMAGE_TOKEN_LEN
+    assert metadata.append_positions.tolist() == list(range(prompt_len, prompt_len + IMAGE_TOKEN_LEN))
+    stats = mgr.get_paged_kv_cache_stats()
+    assert stats["paged_kv_num_pages"] == 3
+    assert stats["paged_kv_batch_size"] == 1
+    assert stats["paged_kv_cached_tokens"] == prompt_len
+    assert stats["paged_kv_max_cached_tokens"] == prompt_len
+    assert stats["paged_cache_expansions"] == 1
+    assert stats["paged_attention_calls"] == 1
+    assert stats["paged_kv_prefix_page_hits"] == 1
+    assert stats["paged_kv_prefix_page_lookups"] == 1
+    assert stats["paged_kv_prefix_page_hit_rate"] == 1.0
+    assert stats["paged_kv_prefix_token_hits"] == prompt_len
+    assert stats["paged_kv_prefix_token_lookups"] == prompt_len
+
+
+def test_fake_paged_runner_matches_dense_attention_reference():
+    mgr = _make_cache_mgr()
+    runner = FakePagedKVRunner()
+    mgr.set_paged_kv_cache_enabled(True)
+    mgr.set_paged_kv_cache_page_size(4)
+    mgr.set_paged_kv_runner(runner)
+
+    bs = 1
+    prompt_len = 3
+    first_q_len = prompt_len + IMAGE_TOKEN_LEN + SUFFIX_TOKEN_LEN
+    k_flat, v_flat = _make_known_kv(first_q_len, base=1.0)
+    _call_mgr(
+        mgr,
+        bs,
+        q_len=first_q_len,
+        seq_len=first_q_len,
+        key_flat=k_flat,
+        value_flat=v_flat,
+        first_step=True,
+        gen_timestep_scatter_index=_gen_timestep_index(bs, prompt_len),
+    )
+
+    query = torch.randn(bs * IMAGE_TOKEN_LEN, NUM_HEADS, HEAD_DIM)
+    img_k, img_v = _make_known_kv(IMAGE_TOKEN_LEN, base=50.0)
+    position_ids = torch.arange(prompt_len, prompt_len + IMAGE_TOKEN_LEN).reshape(1, IMAGE_TOKEN_LEN)
+    out = _call_mgr(
+        mgr,
+        bs,
+        q_len=IMAGE_TOKEN_LEN,
+        seq_len=prompt_len + IMAGE_TOKEN_LEN,
+        key_flat=img_k,
+        value_flat=img_v,
+        query_flat=query,
+        first_step=False,
+        position_ids=position_ids,
+    )
+
+    cached_key, cached_value = mgr.image_kv_cache_map
+    current_key = img_k.reshape(bs, IMAGE_TOKEN_LEN, NUM_KV_HEADS, HEAD_DIM)
+    current_value = img_v.reshape(bs, IMAGE_TOKEN_LEN, NUM_KV_HEADS, HEAD_DIM)
+    dense_key = torch.cat([cached_key, current_key], dim=1)
+    dense_value = torch.cat([cached_value, current_value], dim=1)
+    expected = _dense_attention(
+        query.reshape(bs, IMAGE_TOKEN_LEN, NUM_HEADS, HEAD_DIM),
+        dense_key,
+        dense_value,
+        SCALING,
+    )
+    assert torch.allclose(out.reshape_as(expected), expected)
+
+
+def test_paged_update_accepts_boolean_attention_mask_as_custom_mask():
+    CAPTURED_ATTN_CALLS.clear()
+    mgr = _make_cache_mgr()
+    runner = FakePagedKVRunner()
+    mgr.set_paged_kv_cache_enabled(True)
+    mgr.set_paged_kv_cache_page_size(4)
+    mgr.set_paged_kv_runner(runner)
+
+    bs = 1
+    prompt_len = 3
+    first_q_len = prompt_len + IMAGE_TOKEN_LEN + SUFFIX_TOKEN_LEN
+    k_flat, v_flat = _make_known_kv(first_q_len, base=1.0)
+    _call_mgr(
+        mgr,
+        bs,
+        q_len=first_q_len,
+        seq_len=first_q_len,
+        key_flat=k_flat,
+        value_flat=v_flat,
+        first_step=True,
+        gen_timestep_scatter_index=_gen_timestep_index(bs, prompt_len),
+    )
+
+    update_seq_len = prompt_len + IMAGE_TOKEN_LEN
+    query = torch.randn(bs * IMAGE_TOKEN_LEN, NUM_HEADS, HEAD_DIM)
+    img_k, img_v = _make_known_kv(IMAGE_TOKEN_LEN, base=50.0)
+    position_ids = torch.arange(prompt_len, prompt_len + IMAGE_TOKEN_LEN).reshape(1, IMAGE_TOKEN_LEN)
+    mask = torch.ones(bs, 1, IMAGE_TOKEN_LEN, update_seq_len, dtype=torch.bool)
+    mask[..., 0] = False
+    CAPTURED_ATTN_CALLS.clear()
+    out = _call_mgr(
+        mgr,
+        bs,
+        q_len=IMAGE_TOKEN_LEN,
+        seq_len=update_seq_len,
+        key_flat=img_k,
+        value_flat=img_v,
+        query_flat=query,
+        attention_mask=mask,
+        first_step=False,
+        position_ids=position_ids,
+    )
+
+    assert not CAPTURED_ATTN_CALLS
+    assert len(runner.calls) == 1
+    _, _, _, metadata = runner.calls[0]
+    assert metadata.custom_mask is not None
+    assert metadata.custom_mask.numel() == IMAGE_TOKEN_LEN * update_seq_len
+    assert mgr.get_paged_kv_cache_stats()["paged_attention_custom_mask_calls"] == 1
+
+    cached_key, cached_value = mgr.image_kv_cache_map
+    current_key = img_k.reshape(bs, IMAGE_TOKEN_LEN, NUM_KV_HEADS, HEAD_DIM)
+    current_value = img_v.reshape(bs, IMAGE_TOKEN_LEN, NUM_KV_HEADS, HEAD_DIM)
+    dense_key = torch.cat([cached_key, current_key], dim=1)
+    dense_value = torch.cat([cached_value, current_value], dim=1)
+    expected = _dense_attention(
+        query.reshape(bs, IMAGE_TOKEN_LEN, NUM_HEADS, HEAD_DIM),
+        dense_key,
+        dense_value,
+        SCALING,
+        attn_mask=mask[:, 0],
+    )
+    assert torch.allclose(out.reshape_as(expected), expected)
+
+
+def test_paged_update_matches_ragged_dense_reference_for_non_uniform_cfg_batch():
+    CAPTURED_ATTN_CALLS.clear()
+    mgr = _make_cache_mgr()
+    runner = FakePagedKVRunner()
+    mgr.set_paged_kv_cache_enabled(True)
+    mgr.set_paged_kv_cache_page_size(4)
+    mgr.set_paged_kv_runner(runner)
+
+    bs = 2
+    cached_lens = torch.tensor([3, 5], dtype=torch.long)
+    max_prompt_len = int(cached_lens.max().item())
+    first_q_len = max_prompt_len + IMAGE_TOKEN_LEN + SUFFIX_TOKEN_LEN
+    k_flat, v_flat = _make_known_kv(bs * first_q_len, base=1.0)
+    _call_mgr(
+        mgr,
+        bs,
+        q_len=first_q_len,
+        seq_len=first_q_len,
+        key_flat=k_flat,
+        value_flat=v_flat,
+        first_step=True,
+        gen_timestep_scatter_index=cached_lens.reshape(bs, 1),
+    )
+
+    update_seq_len = max_prompt_len + IMAGE_TOKEN_LEN
+    query = torch.randn(bs * IMAGE_TOKEN_LEN, NUM_HEADS, HEAD_DIM)
+    img_k, img_v = _make_known_kv(bs * IMAGE_TOKEN_LEN, base=50.0)
+    position_ids = cached_lens.unsqueeze(1) + torch.arange(IMAGE_TOKEN_LEN).unsqueeze(0)
+    mask = torch.ones(bs, 1, IMAGE_TOKEN_LEN, update_seq_len, dtype=torch.bool)
+    mask[0, 0, :, 3:5] = False  # Dense padding columns for sample 0.
+    mask[0, 0, 0, 5] = False  # First current token after sample 0 prefix.
+    mask[1, 0, 1, 4] = False  # Last prefix token for sample 1.
+    mask[1, 0, 2, 12] = False  # Last current token for sample 1.
+
+    CAPTURED_ATTN_CALLS.clear()
+    out = _call_mgr(
+        mgr,
+        bs,
+        q_len=IMAGE_TOKEN_LEN,
+        seq_len=update_seq_len,
+        key_flat=img_k,
+        value_flat=img_v,
+        query_flat=query,
+        attention_mask=mask,
+        first_step=False,
+        position_ids=position_ids,
+    )
+
+    assert not CAPTURED_ATTN_CALLS
+    assert len(runner.calls) == 1
+    _, _, _, metadata = runner.calls[0]
+    assert metadata.cached_lens.tolist() == cached_lens.tolist()
+    assert metadata.seq_lens.tolist() == [int(cached_len.item()) + IMAGE_TOKEN_LEN for cached_len in cached_lens]
+    assert metadata.custom_mask is not None
+
+    cached_key, cached_value = mgr.image_kv_cache_map
+    current_key = img_k.reshape(bs, IMAGE_TOKEN_LEN, NUM_KV_HEADS, HEAD_DIM)
+    current_value = img_v.reshape(bs, IMAGE_TOKEN_LEN, NUM_KV_HEADS, HEAD_DIM)
+    query_4d = query.reshape(bs, IMAGE_TOKEN_LEN, NUM_HEADS, HEAD_DIM)
+    expected_parts = []
+    for b in range(bs):
+        cached_len = int(cached_lens[b].item())
+        dense_key = torch.cat([cached_key[b, :cached_len], current_key[b]], dim=0).unsqueeze(0)
+        dense_value = torch.cat([cached_value[b, :cached_len], current_value[b]], dim=0).unsqueeze(0)
+        prefix_mask = mask[b, 0, :, :cached_len]
+        current_mask = mask[b, 0, :, max_prompt_len : max_prompt_len + IMAGE_TOKEN_LEN]
+        ragged_mask = torch.cat([prefix_mask, current_mask], dim=1).unsqueeze(0)
+        expected_parts.append(
+            _dense_attention(
+                query_4d[b : b + 1],
+                dense_key,
+                dense_value,
+                SCALING,
+                attn_mask=ragged_mask,
+            )[0]
+        )
+    expected = torch.stack(expected_parts, dim=0)
+    assert torch.allclose(out.reshape_as(expected), expected)
+    assert mgr.get_paged_kv_cache_stats()["paged_attention_custom_mask_calls"] == 1
+
+
+def test_paged_update_falls_back_for_float_attention_mask():
+    CAPTURED_ATTN_CALLS.clear()
+    mgr = _make_cache_mgr()
+    runner = FakePagedKVRunner()
+    mgr.set_paged_kv_cache_enabled(True)
+    mgr.set_paged_kv_cache_page_size(4)
+    mgr.set_paged_kv_runner(runner)
+
+    bs = 1
+    prompt_len = 3
+    first_q_len = prompt_len + IMAGE_TOKEN_LEN + SUFFIX_TOKEN_LEN
+    k_flat, v_flat = _make_known_kv(first_q_len, base=1.0)
+    _call_mgr(
+        mgr,
+        bs,
+        q_len=first_q_len,
+        seq_len=first_q_len,
+        key_flat=k_flat,
+        value_flat=v_flat,
+        first_step=True,
+        gen_timestep_scatter_index=_gen_timestep_index(bs, prompt_len),
+    )
+
+    update_seq_len = prompt_len + IMAGE_TOKEN_LEN
+    img_k, img_v = _make_known_kv(IMAGE_TOKEN_LEN, base=50.0)
+    position_ids = torch.arange(prompt_len, prompt_len + IMAGE_TOKEN_LEN).reshape(1, IMAGE_TOKEN_LEN)
+    mask = torch.zeros(bs, 1, update_seq_len, update_seq_len)
+    mask[..., 0] = float("-inf")
+    CAPTURED_ATTN_CALLS.clear()
+    _call_mgr(
+        mgr,
+        bs,
+        q_len=IMAGE_TOKEN_LEN,
+        seq_len=update_seq_len,
+        key_flat=img_k,
+        value_flat=img_v,
+        attention_mask=mask,
+        first_step=False,
+        position_ids=position_ids,
+    )
+
+    assert runner.calls == []
+    assert CAPTURED_ATTN_CALLS
+    _, dense_key, _, _ = CAPTURED_ATTN_CALLS[-1]
+    assert dense_key.shape[1] == update_seq_len
+    assert mgr.get_paged_kv_cache_stats()["paged_attention_fallbacks"] == 1
+
+
+def test_paged_update_required_mode_raises_for_float_attention_mask():
+    mgr = _make_cache_mgr()
+    runner = FakePagedKVRunner()
+    mgr.set_paged_kv_cache_enabled(True, required=True)
+    mgr.set_paged_kv_cache_page_size(4)
+    mgr.set_paged_kv_runner(runner)
+
+    bs = 1
+    prompt_len = 3
+    first_q_len = prompt_len + IMAGE_TOKEN_LEN + SUFFIX_TOKEN_LEN
+    k_flat, v_flat = _make_known_kv(first_q_len, base=1.0)
+    _call_mgr(
+        mgr,
+        bs,
+        q_len=first_q_len,
+        seq_len=first_q_len,
+        key_flat=k_flat,
+        value_flat=v_flat,
+        first_step=True,
+        gen_timestep_scatter_index=_gen_timestep_index(bs, prompt_len),
+    )
+
+    update_seq_len = prompt_len + IMAGE_TOKEN_LEN
+    img_k, img_v = _make_known_kv(IMAGE_TOKEN_LEN, base=50.0)
+    position_ids = torch.arange(prompt_len, prompt_len + IMAGE_TOKEN_LEN).reshape(1, IMAGE_TOKEN_LEN)
+    mask = torch.zeros(bs, 1, update_seq_len, update_seq_len)
+    mask[..., 0] = float("-inf")
+
+    with pytest.raises(RuntimeError, match="metadata build failed"):
+        _call_mgr(
+            mgr,
+            bs,
+            q_len=IMAGE_TOKEN_LEN,
+            seq_len=update_seq_len,
+            key_flat=img_k,
+            value_flat=img_v,
+            attention_mask=mask,
+            first_step=False,
+            position_ids=position_ids,
+        )
+
+    assert runner.calls == []
+    assert mgr.get_paged_kv_cache_stats()["paged_attention_fallbacks"] == 1

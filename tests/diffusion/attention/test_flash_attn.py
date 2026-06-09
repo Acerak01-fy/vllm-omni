@@ -11,6 +11,7 @@ This script tests two main scenarios:
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
@@ -295,6 +296,108 @@ def test_flash_attn_func_preferred_over_varlen():
     assert output.shape == q.shape
     assert not torch.isnan(output).any()
     print("✓ flash_attn_func forward works correctly!")
+
+
+def _sdpa_segment(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, causal: bool, softmax_scale: float):
+    q_ = q.transpose(1, 2)
+    k_ = k.transpose(1, 2)
+    v_ = v.transpose(1, 2)
+    attn_mask = None
+    if causal:
+        sq, sk = q_.shape[-2], k_.shape[-2]
+        i = torch.arange(sq, device=q.device).unsqueeze(1)
+        j = torch.arange(sk, device=q.device).unsqueeze(0)
+        attn_mask = j <= (i + (sk - sq))
+    out = F.scaled_dot_product_attention(q_, k_, v_, attn_mask=attn_mask, scale=softmax_scale)
+    return out.transpose(1, 2).contiguous()
+
+
+def test_piecewise_uses_varlen_when_flash_attn_func_missing(monkeypatch):
+    """The CUDA piecewise path must work when only flash_attn_varlen_func exists."""
+
+    def fake_varlen_func(
+        q,
+        k,
+        v,
+        *,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=False,
+        softmax_scale=None,
+        **kwargs,
+    ):
+        del max_seqlen_q, max_seqlen_k, kwargs
+        outputs = []
+        for idx in range(cu_seqlens_q.numel() - 1):
+            q_start = int(cu_seqlens_q[idx].item())
+            q_end = int(cu_seqlens_q[idx + 1].item())
+            k_start = int(cu_seqlens_k[idx].item())
+            k_end = int(cu_seqlens_k[idx + 1].item())
+            outputs.append(
+                _sdpa_segment(
+                    q[q_start:q_end].unsqueeze(0),
+                    k[k_start:k_end].unsqueeze(0),
+                    v[k_start:k_end].unsqueeze(0),
+                    causal=causal,
+                    softmax_scale=softmax_scale,
+                ).squeeze(0)
+            )
+        return torch.cat(outputs, dim=0)
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+
+    torch.manual_seed(7)
+    batch_size, num_heads, head_dim = 1, 2, 16
+    key_len = 10
+    query_start = 4
+    query_len = key_len - query_start
+    query = torch.randn(batch_size, query_len, num_heads, head_dim)
+    key = torch.randn(batch_size, key_len, num_heads, head_dim)
+    value = torch.randn(batch_size, key_len, num_heads, head_dim)
+    softmax_scale = 1.0 / (head_dim**0.5)
+    full_attn_spans = [[(5, 8)]]
+    impl = FlashAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_dim,
+        softmax_scale=softmax_scale,
+        causal=False,
+    )
+
+    got = impl.forward_cuda(
+        query,
+        key,
+        value,
+        AttentionMetadata(full_attn_spans=full_attn_spans),
+    )
+
+    causal_part = _sdpa_segment(
+        query[:, :1],
+        key[:, :5],
+        value[:, :5],
+        causal=True,
+        softmax_scale=softmax_scale,
+    )
+    full_part = _sdpa_segment(
+        query[:, 1:4],
+        key[:, :8],
+        value[:, :8],
+        causal=False,
+        softmax_scale=softmax_scale,
+    )
+    causal_tail = _sdpa_segment(
+        query[:, 4:],
+        key,
+        value,
+        causal=True,
+        softmax_scale=softmax_scale,
+    )
+    expected = torch.cat([causal_part, full_part, causal_tail], dim=1)
+
+    torch.testing.assert_close(got, expected, atol=1e-6, rtol=1e-6)
 
 
 if __name__ == "__main__":

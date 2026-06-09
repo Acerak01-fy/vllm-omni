@@ -5,6 +5,7 @@ HunyuanImage-3.0-Instruct unified end-to-end inference script.
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
@@ -78,6 +79,43 @@ def parse_args():
     parser.add_argument("--init-timeout", type=int, default=300, help="Initialization timeout in seconds.")
     parser.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile.")
     parser.add_argument(
+        "--enable-paged-kv-cache",
+        action="store_true",
+        help="Enable the Hunyuan Image3 paged KV cache path for later denoise attention.",
+    )
+    parser.add_argument(
+        "--require-paged-kv-cache",
+        action="store_true",
+        help="Require the Hunyuan Image3 paged KV cache path and fail if it falls back.",
+    )
+    parser.add_argument(
+        "--require-paged-kv-custom-mask",
+        action="store_true",
+        help="Fail unless the paged KV path used FlashInfer custom masks at least once.",
+    )
+    parser.add_argument(
+        "--paged-kv-cache-page-size",
+        type=int,
+        default=None,
+        help="Page size for the Hunyuan Image3 paged KV cache path.",
+    )
+    parser.add_argument(
+        "--paged-kv-cache-workspace-bytes",
+        type=int,
+        default=None,
+        help="FlashInfer workspace size in bytes for the Hunyuan Image3 paged KV cache runner.",
+    )
+    parser.add_argument(
+        "--print-paged-kv-stats",
+        action="store_true",
+        help="Print aggregated Hunyuan Image3 paged KV cache stats after generation.",
+    )
+    parser.add_argument(
+        "--profile-paged-kv",
+        action="store_true",
+        help="Synchronize and time Hunyuan Image3 dense/paged KV reuse internals for profiling.",
+    )
+    parser.add_argument(
         "--diffusion-kv-cache-dtype",
         type=str,
         default=None,
@@ -110,6 +148,137 @@ def parse_args():
     return parser.parse_args()
 
 
+def configure_paged_kv_cache_from_args(args) -> None:
+    if args.require_paged_kv_cache:
+        os.environ["VLLM_OMNI_HY3_PAGED_KV_CACHE"] = "required"
+    elif args.enable_paged_kv_cache:
+        os.environ["VLLM_OMNI_HY3_PAGED_KV_CACHE"] = "1"
+    if args.paged_kv_cache_page_size is not None:
+        os.environ["VLLM_OMNI_HY3_PAGED_KV_CACHE_PAGE_SIZE"] = str(args.paged_kv_cache_page_size)
+    if args.paged_kv_cache_workspace_bytes is not None:
+        os.environ["VLLM_OMNI_HY3_PAGED_KV_CACHE_WORKSPACE_BYTES"] = str(args.paged_kv_cache_workspace_bytes)
+    if args.profile_paged_kv:
+        os.environ["VLLM_OMNI_HY3_PAGED_KV_PROFILE"] = "1"
+
+
+def validate_paged_kv_stats(stats: dict | None, *, require_custom_mask: bool) -> None:
+    if not isinstance(stats, dict):
+        raise RuntimeError("Hunyuan Image3 paged KV cache stats were not returned by the diffusion pipeline.")
+    layers = int(stats.get("layers", 0))
+    enabled_layers = int(stats.get("enabled_layers", 0))
+    required_layers = int(stats.get("required_layers", 0))
+    active_layers = int(stats.get("active_layers", 0))
+    if layers <= 0:
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache stats did not include any attention layers. stats={stats}")
+    if not stats.get("paged_kv_cache_enabled"):
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache was not enabled. stats={stats}")
+    if not stats.get("paged_kv_cache_required"):
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache was not running in required mode. stats={stats}")
+    if enabled_layers != layers:
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache was not enabled on all layers. stats={stats}")
+    if required_layers != enabled_layers:
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache was not required on all enabled layers. stats={stats}")
+    if active_layers != enabled_layers:
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache did not stay active on all enabled layers. stats={stats}")
+    if int(stats.get("paged_cache_builds", 0)) <= 0:
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache did not build any paged prefix cache. stats={stats}")
+    if int(stats.get("paged_cache_builds", 0)) < enabled_layers:
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache did not build cache on every enabled layer. stats={stats}")
+    if int(stats.get("paged_cache_build_failures", 0)) != 0:
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache reported build failures. stats={stats}")
+    if int(stats.get("paged_attention_calls", 0)) <= 0:
+        raise RuntimeError(f"Hunyuan Image3 paged KV attention was not called on later denoise steps. stats={stats}")
+    if int(stats.get("paged_attention_calls", 0)) < enabled_layers:
+        raise RuntimeError(f"Hunyuan Image3 paged KV attention was not called on every enabled layer. stats={stats}")
+    if int(stats.get("paged_attention_fallbacks", 0)) != 0:
+        raise RuntimeError(f"Hunyuan Image3 paged KV attention fell back. stats={stats}")
+    if int(stats.get("paged_attention_runner_errors", 0)) != 0:
+        raise RuntimeError(f"Hunyuan Image3 paged KV attention runner failed. stats={stats}")
+    if require_custom_mask and int(stats.get("paged_attention_custom_mask_calls", 0)) <= 0:
+        raise RuntimeError(f"Hunyuan Image3 paged KV attention did not use custom masks. stats={stats}")
+    prefix_page_hits = int(stats.get("paged_kv_prefix_page_hits", 0))
+    prefix_page_lookups = int(stats.get("paged_kv_prefix_page_lookups", 0))
+    if prefix_page_hits <= 0 or prefix_page_lookups <= 0:
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache did not report prefix page hits. stats={stats}")
+    if prefix_page_hits != prefix_page_lookups:
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache reported prefix page misses. stats={stats}")
+    prefix_token_hits = int(stats.get("paged_kv_prefix_token_hits", 0))
+    prefix_token_lookups = int(stats.get("paged_kv_prefix_token_lookups", 0))
+    if prefix_token_hits <= 0 or prefix_token_lookups <= 0:
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache did not report prefix token hits. stats={stats}")
+    if prefix_token_hits != prefix_token_lookups:
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache reported prefix token misses. stats={stats}")
+
+    layer_stats = stats.get("layers_detail")
+    if not isinstance(layer_stats, list) or len(layer_stats) != layers:
+        raise RuntimeError(f"Hunyuan Image3 paged KV cache layer stats were not returned. stats={stats}")
+    for layer_stat in layer_stats:
+        layer_idx = layer_stat.get("layer_idx")
+        if not layer_stat.get("paged_kv_cache_enabled"):
+            raise RuntimeError(f"Hunyuan Image3 paged KV cache disabled on layer {layer_idx}. stats={stats}")
+        if not layer_stat.get("paged_kv_cache_required"):
+            raise RuntimeError(f"Hunyuan Image3 paged KV cache not required on layer {layer_idx}. stats={stats}")
+        if not layer_stat.get("paged_kv_cache_active"):
+            raise RuntimeError(f"Hunyuan Image3 paged KV cache inactive on layer {layer_idx}. stats={stats}")
+        if int(layer_stat.get("paged_cache_builds", 0)) <= 0:
+            raise RuntimeError(f"Hunyuan Image3 paged KV cache did not build on layer {layer_idx}. stats={stats}")
+        if int(layer_stat.get("paged_cache_build_failures", 0)) != 0:
+            raise RuntimeError(f"Hunyuan Image3 paged KV cache build failed on layer {layer_idx}. stats={stats}")
+        if int(layer_stat.get("paged_attention_calls", 0)) <= 0:
+            raise RuntimeError(f"Hunyuan Image3 paged KV attention did not run on layer {layer_idx}. stats={stats}")
+        if int(layer_stat.get("paged_attention_fallbacks", 0)) != 0:
+            raise RuntimeError(f"Hunyuan Image3 paged KV attention fell back on layer {layer_idx}. stats={stats}")
+        if int(layer_stat.get("paged_attention_runner_errors", 0)) != 0:
+            raise RuntimeError(f"Hunyuan Image3 paged KV attention runner failed on layer {layer_idx}. stats={stats}")
+        if require_custom_mask and int(layer_stat.get("paged_attention_custom_mask_calls", 0)) <= 0:
+            raise RuntimeError(
+                f"Hunyuan Image3 paged KV attention did not use custom masks on layer {layer_idx}. stats={stats}"
+            )
+        layer_prefix_page_hits = int(layer_stat.get("paged_kv_prefix_page_hits", 0))
+        layer_prefix_page_lookups = int(layer_stat.get("paged_kv_prefix_page_lookups", 0))
+        if layer_prefix_page_hits <= 0 or layer_prefix_page_lookups <= 0:
+            raise RuntimeError(
+                f"Hunyuan Image3 paged KV cache did not report prefix page hits on layer {layer_idx}. stats={stats}"
+            )
+        if layer_prefix_page_hits != layer_prefix_page_lookups:
+            raise RuntimeError(
+                f"Hunyuan Image3 paged KV cache reported prefix page misses on layer {layer_idx}. stats={stats}"
+            )
+
+
+def enrich_paged_kv_stats(stats: dict | None, *, num_inference_steps: int) -> dict | None:
+    if not isinstance(stats, dict):
+        return stats
+    enriched = dict(stats)
+    enabled_layers = int(enriched.get("enabled_layers", 0))
+    later_steps = max(int(num_inference_steps) - 1, 0)
+    expected_calls = enabled_layers * later_steps
+    actual_calls = int(enriched.get("paged_attention_calls", 0))
+    reuse_coverage = actual_calls / expected_calls if expected_calls > 0 else None
+    prefix_page_lookups = int(enriched.get("paged_kv_prefix_page_lookups", 0))
+    prefix_token_lookups = int(enriched.get("paged_kv_prefix_token_lookups", 0))
+    prefix_page_hit_rate = (
+        int(enriched.get("paged_kv_prefix_page_hits", 0)) / prefix_page_lookups
+        if prefix_page_lookups > 0
+        else None
+    )
+    prefix_token_hit_rate = (
+        int(enriched.get("paged_kv_prefix_token_hits", 0)) / prefix_token_lookups
+        if prefix_token_lookups > 0
+        else None
+    )
+    enriched["paged_attention_expected_calls"] = expected_calls
+    enriched["paged_attention_reuse_coverage"] = reuse_coverage
+    enriched["paged_kv_prefix_page_hit_rate"] = prefix_page_hit_rate
+    enriched["paged_kv_prefix_token_hit_rate"] = prefix_token_hit_rate
+    # Compatibility field for older benchmark parsers. Prefer the explicit
+    # paged_kv_prefix_* hit rates for page-cache analysis.
+    enriched["paged_attention_hit_rate"] = (
+        prefix_page_hit_rate if prefix_page_hit_rate is not None else reuse_coverage
+    )
+    return enriched
+
+
 def parse_additional_config(raw_value: str | None) -> dict | None:
     """Parse a JSON string into an additional_config mapping."""
     if raw_value is None:
@@ -129,6 +298,7 @@ def parse_additional_config(raw_value: str | None) -> dict | None:
 
 def main():
     args = parse_args()
+    configure_paged_kv_cache_from_args(args)
     os.makedirs(args.output, exist_ok=True)
     additional_config = parse_additional_config(args.additional_config)
 
@@ -281,15 +451,41 @@ def main():
     print(f"  Prompts: {prompts}")
     print(f"{'=' * 60}\n")
 
+    generation_start = time.perf_counter()
     omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
+    generation_wall_time_s = time.perf_counter() - generation_start
+    print(
+        "[Benchmark Metrics] "
+        + json.dumps(
+            {
+                "generation_wall_time_s": generation_wall_time_s,
+                "guidance_scale": args.guidance_scale,
+                "modality": args.modality,
+                "num_input_images": len(input_images),
+                "num_outputs": len(omni_outputs),
+                "steps": args.steps,
+            },
+            sort_keys=True,
+        )
+    )
     img_idx = 0
     for req_output in omni_outputs:
+        custom_output = getattr(req_output, "custom_output", {}) or {}
+        paged_kv_stats = enrich_paged_kv_stats(
+            custom_output.get("hunyuan_image3_paged_kv_cache_stats"),
+            num_inference_steps=args.steps,
+        )
+        if args.print_paged_kv_stats or args.require_paged_kv_cache:
+            print("[Paged KV Stats] " + json.dumps(paged_kv_stats, sort_keys=True))
+        if args.require_paged_kv_cache:
+            validate_paged_kv_stats(paged_kv_stats, require_custom_mask=args.require_paged_kv_custom_mask)
+
         ro = getattr(req_output, "request_output", None)
         txt = ""
         if ro and getattr(ro, "outputs", None):
             txt = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
         if not txt:
-            ar_text = getattr(req_output, "custom_output", {}).get("ar_generated_text")
+            ar_text = custom_output.get("ar_generated_text")
             if isinstance(ar_text, list):
                 txt = "\n".join(text for text in ar_text if text)
             else:

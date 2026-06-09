@@ -123,6 +123,9 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        *,
+        causal: bool | None = None,
+        softmax_scale: float | None = None,
     ) -> torch.Tensor:
         """Common wrapper for calling flash_attn_varlen_func for XPU and CUDA in vLLM.
 
@@ -136,6 +139,11 @@ class FlashAttentionImpl(AttentionImpl):
             flash_attn_varlen_func,
         )
 
+        if flash_attn_varlen_func is None:
+            raise ImportError("FlashAttentionBackend requires flash_attn_varlen_func for varlen attention.")
+
+        causal = self.causal if causal is None else causal
+        softmax_scale = self.softmax_scale if softmax_scale is None else softmax_scale
         batch_size, q_len = query.size()[:2]
         k_len = key.size(1)
         cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
@@ -153,8 +161,8 @@ class FlashAttentionImpl(AttentionImpl):
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=q_len,
             max_seqlen_k=k_len,
-            causal=self.causal,
-            softmax_scale=self.softmax_scale,
+            causal=causal,
+            softmax_scale=softmax_scale,
         )
         out = self._unwrap_flash_output(out)
         # (b s) h d -> b s h d
@@ -186,10 +194,20 @@ class FlashAttentionImpl(AttentionImpl):
         # Try piecewise attention
         if full_attn_spans is not None:
             logger.debug("Using piecewise Flash Attention for mixed causal/full mask")
-            attn_func = partial(
-                FlashAttentionImpl._flash_wrapper,
-                attn_func=flash_attn_func,
-            )
+            if flash_attn_func is not None:
+                attn_func = partial(
+                    FlashAttentionImpl._flash_wrapper,
+                    attn_func=flash_attn_func,
+                )
+            else:
+                def attn_func(q, k, v, *, causal, softmax_scale):
+                    return self._forward_varlen_dense(
+                        q,
+                        k,
+                        v,
+                        causal=causal,
+                        softmax_scale=softmax_scale,
+                    )
 
             return piecewise_attn(
                 query,
