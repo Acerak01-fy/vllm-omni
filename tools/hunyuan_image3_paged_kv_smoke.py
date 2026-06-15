@@ -19,7 +19,6 @@ import sys
 import tempfile
 from typing import Any
 
-
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = "tencent/HunyuanImage-3.0-Instruct"
 DEFAULT_DEPLOY_CONFIG = REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3_dit.yaml"
@@ -136,8 +135,7 @@ def estimate_hf_model_size_bytes(model_id: str, endpoint: str) -> int:
     if missing_sizes:
         examples = ", ".join(missing_sizes[:3])
         raise RuntimeError(
-            f"Model metadata for {model_id!r} is missing file sizes "
-            f"({examples}); cannot safely preflight disk usage."
+            f"Model metadata for {model_id!r} is missing file sizes ({examples}); cannot safely preflight disk usage."
         )
     return total_size
 
@@ -240,8 +238,7 @@ def validate_vllm_runtime() -> None:
         validate_python_imports(REQUIRED_VLLM_IMPORTS)
     except RuntimeError as exc:
         raise RuntimeError(
-            "vLLM runtime is incompatible with the current vLLM-Omni Hunyuan Image3 smoke. "
-            f"{exc}"
+            f"vLLM runtime is incompatible with the current vLLM-Omni Hunyuan Image3 smoke. {exc}"
         ) from exc
 
 
@@ -252,10 +249,7 @@ def validate_omni_runtime() -> None:
     try:
         validate_python_imports(REQUIRED_OMNI_IMPORTS)
     except RuntimeError as exc:
-        raise RuntimeError(
-            "vLLM-Omni runtime imports are incomplete for the Hunyuan Image3 smoke. "
-            f"{exc}"
-        ) from exc
+        raise RuntimeError(f"vLLM-Omni runtime imports are incomplete for the Hunyuan Image3 smoke. {exc}") from exc
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -296,19 +290,23 @@ def preflight_runtime(deploy_config: pathlib.Path) -> None:
         raise RuntimeError("PyTorch is required for the Hunyuan Image3 paged KV smoke.") from exc
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available; Hunyuan Image3 paged KV smoke requires CUDA GPUs.")
-    validate_cuda_devices(device_ids, torch.cuda.device_count())
+    validate_cuda_devices(device_ids, torch.accelerator.device_count())
     validate_cuda_runtime(torch, device_ids)
     validate_vllm_runtime()
     validate_omni_runtime()
     try:
-        from flashinfer.page import append_paged_kv_cache  # noqa: F401
-        from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper  # noqa: F401
+        from vllm.v1.attention.backends.fa_utils import (
+            flash_attn_varlen_func,  # noqa: F401
+            is_flash_attn_varlen_func_available,
+            reshape_and_cache_flash,  # noqa: F401
+        )
     except Exception as exc:
         raise RuntimeError(
-            "FlashInfer paged KV APIs are required: "
-            "flashinfer.page.append_paged_kv_cache and "
-            "flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper."
+            "vLLM FlashAttention paged prefill APIs are required: "
+            "vllm.v1.attention.backends.fa_utils.reshape_and_cache_flash and flash_attn_varlen_func."
         ) from exc
+    if not is_flash_attn_varlen_func_available():
+        raise RuntimeError("vLLM flash_attn_varlen_func is unavailable in this runtime.")
 
 
 def write_temp_deploy_config(
@@ -392,7 +390,6 @@ def build_smoke_command(args: argparse.Namespace, deploy_config: pathlib.Path, o
         "en_unified",
         "--enforce-eager",
         "--require-paged-kv-cache",
-        "--require-paged-kv-custom-mask",
         "--paged-kv-cache-page-size",
         str(args.page_size),
         "--print-paged-kv-stats",
@@ -457,7 +454,6 @@ def print_dry_run_plan(args: argparse.Namespace, deploy_config: pathlib.Path, en
         "command": build_wrapper_command(args),
         "offline_required_flags": [
             "--require-paged-kv-cache",
-            "--require-paged-kv-custom-mask",
             "--paged-kv-cache-page-size",
             "--print-paged-kv-stats",
         ],
@@ -466,7 +462,6 @@ def print_dry_run_plan(args: argparse.Namespace, deploy_config: pathlib.Path, en
             "paged_kv_cache_required": True,
             "paged_cache_builds_per_layer": "> 0",
             "paged_attention_calls_per_layer": "> 0",
-            "paged_attention_custom_mask_calls_per_layer": "> 0",
             "paged_attention_fallbacks": 0,
             "paged_attention_runner_errors": 0,
             "paged_cache_build_failures": 0,

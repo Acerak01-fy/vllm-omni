@@ -91,7 +91,7 @@ def parse_args():
     parser.add_argument(
         "--require-paged-kv-custom-mask",
         action="store_true",
-        help="Fail unless the paged KV path used FlashInfer custom masks at least once.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--paged-kv-cache-page-size",
@@ -103,7 +103,7 @@ def parse_args():
         "--paged-kv-cache-workspace-bytes",
         type=int,
         default=None,
-        help="FlashInfer workspace size in bytes for the Hunyuan Image3 paged KV cache runner.",
+        help="Deprecated compatibility option; vLLM paged attention does not use this workspace.",
     )
     parser.add_argument(
         "--print-paged-kv-stats",
@@ -258,14 +258,10 @@ def enrich_paged_kv_stats(stats: dict | None, *, num_inference_steps: int) -> di
     prefix_page_lookups = int(enriched.get("paged_kv_prefix_page_lookups", 0))
     prefix_token_lookups = int(enriched.get("paged_kv_prefix_token_lookups", 0))
     prefix_page_hit_rate = (
-        int(enriched.get("paged_kv_prefix_page_hits", 0)) / prefix_page_lookups
-        if prefix_page_lookups > 0
-        else None
+        int(enriched.get("paged_kv_prefix_page_hits", 0)) / prefix_page_lookups if prefix_page_lookups > 0 else None
     )
     prefix_token_hit_rate = (
-        int(enriched.get("paged_kv_prefix_token_hits", 0)) / prefix_token_lookups
-        if prefix_token_lookups > 0
-        else None
+        int(enriched.get("paged_kv_prefix_token_hits", 0)) / prefix_token_lookups if prefix_token_lookups > 0 else None
     )
     enriched["paged_attention_expected_calls"] = expected_calls
     enriched["paged_attention_reuse_coverage"] = reuse_coverage
@@ -273,9 +269,7 @@ def enrich_paged_kv_stats(stats: dict | None, *, num_inference_steps: int) -> di
     enriched["paged_kv_prefix_token_hit_rate"] = prefix_token_hit_rate
     # Compatibility field for older benchmark parsers. Prefer the explicit
     # paged_kv_prefix_* hit rates for page-cache analysis.
-    enriched["paged_attention_hit_rate"] = (
-        prefix_page_hit_rate if prefix_page_hit_rate is not None else reuse_coverage
-    )
+    enriched["paged_attention_hit_rate"] = prefix_page_hit_rate if prefix_page_hit_rate is not None else reuse_coverage
     return enriched
 
 
@@ -478,7 +472,7 @@ def main():
         if args.print_paged_kv_stats or args.require_paged_kv_cache:
             print("[Paged KV Stats] " + json.dumps(paged_kv_stats, sort_keys=True))
         if args.require_paged_kv_cache:
-            validate_paged_kv_stats(paged_kv_stats, require_custom_mask=args.require_paged_kv_custom_mask)
+            validate_paged_kv_stats(paged_kv_stats, require_custom_mask=False)
 
         ro = getattr(req_output, "request_output", None)
         txt = ""

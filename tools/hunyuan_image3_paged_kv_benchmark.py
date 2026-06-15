@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark dense Hunyuan Image3 KV reuse against FlashInfer paged KV reuse."""
+"""Benchmark dense Hunyuan Image3 KV reuse against vLLM paged attention reuse."""
 
 from __future__ import annotations
 
@@ -17,13 +17,11 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-
 TOOLS_DIR = pathlib.Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 import hunyuan_image3_paged_kv_smoke as smoke  # noqa: E402
-
 
 DEFAULT_SCENARIOS = (
     "text2img-nocfg",
@@ -42,9 +40,8 @@ PROFILE_COUNT_KEYS = (
     "profile_paged_metadata_build_calls",
     "profile_paged_custom_mask_build_calls",
     "profile_paged_runner_calls",
-    "profile_flashinfer_append_calls",
-    "profile_flashinfer_plan_calls",
-    "profile_flashinfer_run_calls",
+    "profile_vllm_cache_write_calls",
+    "profile_vllm_paged_attention_calls",
 )
 PROFILE_TIME_KEYS = (
     "profile_dense_reuse_total_ms",
@@ -52,9 +49,8 @@ PROFILE_TIME_KEYS = (
     "profile_paged_metadata_build_total_ms",
     "profile_paged_custom_mask_build_total_ms",
     "profile_paged_runner_total_ms",
-    "profile_flashinfer_append_total_ms",
-    "profile_flashinfer_plan_total_ms",
-    "profile_flashinfer_run_total_ms",
+    "profile_vllm_cache_write_total_ms",
+    "profile_vllm_paged_attention_total_ms",
 )
 
 
@@ -222,7 +218,11 @@ def _generate_reference_images(output_dir: pathlib.Path, count: int, width: int,
     return paths
 
 
-def resolve_reference_images(args: argparse.Namespace, output_dir: pathlib.Path, scenarios: list[Scenario]) -> list[pathlib.Path]:
+def resolve_reference_images(
+    args: argparse.Namespace,
+    output_dir: pathlib.Path,
+    scenarios: list[Scenario],
+) -> list[pathlib.Path]:
     max_reference_count = max((scenario.reference_count for scenario in scenarios), default=0)
     if max_reference_count <= 0:
         return []
@@ -240,7 +240,13 @@ def resolve_reference_images(args: argparse.Namespace, output_dir: pathlib.Path,
     return _generate_reference_images(output_dir, max_reference_count, args.width, args.height)
 
 
-def case_output_dir(base_output_dir: pathlib.Path, scenario: Scenario, variant: str, run_index: int, warmup: bool) -> pathlib.Path:
+def case_output_dir(
+    base_output_dir: pathlib.Path,
+    scenario: Scenario,
+    variant: str,
+    run_index: int,
+    warmup: bool,
+) -> pathlib.Path:
     run_type = "warmup" if warmup else "run"
     return base_output_dir / scenario.name / variant / f"{run_type}_{run_index}"
 
@@ -289,7 +295,6 @@ def build_offline_command(
         cmd.extend(
             [
                 "--require-paged-kv-cache",
-                "--require-paged-kv-custom-mask",
                 "--paged-kv-cache-page-size",
                 str(args.page_size),
             ]
@@ -392,9 +397,12 @@ def derive_paged_kv_metrics(stats: dict[str, Any] | None, steps: int) -> dict[st
             "profile_paged_custom_mask_build_total_ms",
         ),
         ("profile_paged_runner", "profile_paged_runner_calls", "profile_paged_runner_total_ms"),
-        ("profile_flashinfer_append", "profile_flashinfer_append_calls", "profile_flashinfer_append_total_ms"),
-        ("profile_flashinfer_plan", "profile_flashinfer_plan_calls", "profile_flashinfer_plan_total_ms"),
-        ("profile_flashinfer_run", "profile_flashinfer_run_calls", "profile_flashinfer_run_total_ms"),
+        ("profile_vllm_cache_write", "profile_vllm_cache_write_calls", "profile_vllm_cache_write_total_ms"),
+        (
+            "profile_vllm_paged_attention",
+            "profile_vllm_paged_attention_calls",
+            "profile_vllm_paged_attention_total_ms",
+        ),
     )
     for prefix, calls_key, total_key in avg_pairs:
         calls = int(derived.get(calls_key, 0))
@@ -517,20 +525,16 @@ def summarize_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "paged_kv_current_page_entries": paged_metrics.get("paged_kv_current_page_entries"),
                 "paged_kv_cached_token_uses": paged_metrics.get("paged_kv_cached_token_uses"),
                 "profile_dense_reuse_total_ms": dense_metrics.get("profile_dense_reuse_total_ms"),
-                "profile_dense_later_attention_total_ms": dense_metrics.get(
-                    "profile_dense_later_attention_total_ms"
-                ),
+                "profile_dense_later_attention_total_ms": dense_metrics.get("profile_dense_later_attention_total_ms"),
                 "profile_paged_metadata_build_total_ms": paged_metrics.get("profile_paged_metadata_build_total_ms"),
                 "profile_paged_custom_mask_build_total_ms": paged_metrics.get(
                     "profile_paged_custom_mask_build_total_ms"
                 ),
                 "profile_paged_runner_total_ms": paged_metrics.get("profile_paged_runner_total_ms"),
-                "profile_flashinfer_append_total_ms": paged_metrics.get("profile_flashinfer_append_total_ms"),
-                "profile_flashinfer_plan_total_ms": paged_metrics.get("profile_flashinfer_plan_total_ms"),
-                "profile_flashinfer_run_total_ms": paged_metrics.get("profile_flashinfer_run_total_ms"),
-                "profile_flashinfer_append_avg_ms": paged_metrics.get("profile_flashinfer_append_avg_ms"),
-                "profile_flashinfer_plan_avg_ms": paged_metrics.get("profile_flashinfer_plan_avg_ms"),
-                "profile_flashinfer_run_avg_ms": paged_metrics.get("profile_flashinfer_run_avg_ms"),
+                "profile_vllm_cache_write_total_ms": paged_metrics.get("profile_vllm_cache_write_total_ms"),
+                "profile_vllm_paged_attention_total_ms": paged_metrics.get("profile_vllm_paged_attention_total_ms"),
+                "profile_vllm_cache_write_avg_ms": paged_metrics.get("profile_vllm_cache_write_avg_ms"),
+                "profile_vllm_paged_attention_avg_ms": paged_metrics.get("profile_vllm_paged_attention_avg_ms"),
             }
         )
     return rows
@@ -556,7 +560,8 @@ def write_markdown_summary(path: pathlib.Path, args: argparse.Namespace, summary
         "",
         "## Summary",
         "",
-        "| Scenario | Dense gen s | Paged gen s | Speedup | Prefix page hit rate | Reuse coverage | Calls | Prefix page hits | Prefix token hits |",
+        "| Scenario | Dense gen s | Paged gen s | Speedup | Prefix page hit rate | "
+        "Reuse coverage | Calls | Prefix page hits | Prefix token hits |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in summary:
@@ -594,10 +599,12 @@ def write_markdown_summary(path: pathlib.Path, args: argparse.Namespace, summary
                 "",
                 "## Profile Breakdown",
                 "",
-                "Profile mode synchronizes CUDA around measured regions; use this table for attribution, not throughput.",
+                "Profile mode synchronizes CUDA around measured regions; use this table for "
+                "attribution, not throughput.",
                 "",
-                "| Scenario | Dense reuse ms | Dense attn ms | Paged metadata ms | Custom mask ms | Paged runner ms | FI append ms | FI plan ms | FI run ms |",
-                "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| Scenario | Dense reuse ms | Dense attn ms | Paged metadata ms | Mask build ms | "
+                "Paged runner ms | vLLM cache write ms | vLLM paged attn ms |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row in summary:
@@ -611,9 +618,8 @@ def write_markdown_summary(path: pathlib.Path, args: argparse.Namespace, summary
                         _format_number(row.get("profile_paged_metadata_build_total_ms")),
                         _format_number(row.get("profile_paged_custom_mask_build_total_ms")),
                         _format_number(row.get("profile_paged_runner_total_ms")),
-                        _format_number(row.get("profile_flashinfer_append_total_ms")),
-                        _format_number(row.get("profile_flashinfer_plan_total_ms")),
-                        _format_number(row.get("profile_flashinfer_run_total_ms")),
+                        _format_number(row.get("profile_vllm_cache_write_total_ms")),
+                        _format_number(row.get("profile_vllm_paged_attention_total_ms")),
                     ]
                 )
                 + " |"

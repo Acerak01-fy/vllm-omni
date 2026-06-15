@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pytest
 
-
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _BENCHMARK_TOOL = _REPO_ROOT / "tools" / "hunyuan_image3_paged_kv_benchmark.py"
 
@@ -122,7 +121,6 @@ def test_build_offline_command_sets_img2img_refs_and_paged_flags(tmp_path):
     assert "--image-path" in cmd
     assert cmd[cmd.index("--image-path") + 1] == ",".join(str(path) for path in refs)
     assert "--require-paged-kv-cache" in cmd
-    assert "--require-paged-kv-custom-mask" in cmd
     assert "--paged-kv-cache-page-size" in cmd
     assert cmd[cmd.index("--guidance-scale") + 1] == "5.0"
 
@@ -167,8 +165,8 @@ def test_parse_metrics_and_derive_paged_page_hit_rate():
         "paged_kv_max_cached_tokens": 20,
         "paged_kv_num_pages": 4,
         "paged_kv_prefix_pages": 3,
-        "profile_flashinfer_run_calls": 4,
-        "profile_flashinfer_run_total_ms": 8.0,
+        "profile_vllm_paged_attention_calls": 4,
+        "profile_vllm_paged_attention_total_ms": 8.0,
         "layers_detail": [
             {"paged_kv_cached_tokens": 10, "paged_attention_calls": 2},
             {"paged_kv_cached_tokens": 20, "paged_attention_calls": 2},
@@ -196,7 +194,7 @@ def test_parse_metrics_and_derive_paged_page_hit_rate():
     assert derived["paged_kv_prefix_page_lookups"] == 12
     assert derived["paged_kv_cached_token_uses"] == 60
     assert derived["paged_attention_reuse_coverage"] == 1.0
-    assert derived["profile_flashinfer_run_avg_ms"] == 2.0
+    assert derived["profile_vllm_paged_attention_avg_ms"] == 2.0
 
 
 def test_summarize_results_computes_generation_speedup():
@@ -228,7 +226,7 @@ def test_summarize_results_computes_generation_speedup():
                 "paged_kv_prefix_page_lookups": 6272000,
                 "paged_kv_prefix_token_hits": 100352000,
                 "paged_kv_prefix_token_lookups": 100352000,
-                "profile_flashinfer_plan_total_ms": 100.0,
+                "profile_vllm_cache_write_total_ms": 100.0,
             },
         },
     ]
@@ -242,7 +240,7 @@ def test_summarize_results_computes_generation_speedup():
     assert summary[0]["paged_kv_prefix_page_hits"] == 6272000
     assert summary[0]["paged_attention_actual_calls"] == 1568
     assert summary[0]["paged_attention_reuse_coverage"] == 1.0
-    assert summary[0]["profile_flashinfer_plan_total_ms"] == 100.0
+    assert summary[0]["profile_vllm_cache_write_total_ms"] == 100.0
 
 
 def test_resolve_reference_images_uses_user_paths(tmp_path):

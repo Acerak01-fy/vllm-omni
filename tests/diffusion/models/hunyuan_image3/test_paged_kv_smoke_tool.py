@@ -8,12 +8,11 @@ import argparse
 import importlib.util
 import json
 import os
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
-
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _SMOKE_TOOL = _REPO_ROOT / "tools" / "hunyuan_image3_paged_kv_smoke.py"
@@ -161,9 +160,7 @@ def test_validate_python_imports_reports_missing_runtime_api():
     tool = _load_smoke_tool()
 
     with pytest.raises(RuntimeError, match="definitely_missing_hy3_smoke_module"):
-        tool.validate_python_imports(
-            (("missing-test-module", "import definitely_missing_hy3_smoke_module"),)
-        )
+        tool.validate_python_imports((("missing-test-module", "import definitely_missing_hy3_smoke_module"),))
 
 
 def test_write_temp_deploy_config_rewrites_single_stage_devices(tmp_path):
@@ -349,7 +346,6 @@ def test_dry_run_prints_command_without_model_or_runtime_checks(monkeypatch, tmp
     assert "--quantization" in payload["command"]
     assert payload["quantization_override"] == "fp8"
     assert "--require-paged-kv-cache" in payload["offline_required_flags"]
-    assert "--require-paged-kv-custom-mask" in payload["offline_required_flags"]
     assert "--paged-kv-cache-page-size" in payload["offline_required_flags"]
     assert payload["proof_env"]["VLLM_OMNI_HY3_PAGED_KV_CACHE"] == "required"
     assert payload["proof_env"]["VLLM_OMNI_HY3_PAGED_KV_VALIDATE_RUN_INPUTS"] == "1"

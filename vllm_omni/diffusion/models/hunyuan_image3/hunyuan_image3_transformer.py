@@ -511,7 +511,7 @@ def _ceil_div(a: int, b: int) -> int:
 
 def _profile_sync(device: torch.device | None) -> None:
     if device is not None and device.type == "cuda" and torch.cuda.is_available():
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
 
 def _profile_call_ms(fn: Callable[[], Any], *, device: torch.device | None = None) -> tuple[Any, float]:
@@ -528,6 +528,8 @@ class HunyuanImage3PagedKVAttentionMetadata:
     value_cache: torch.Tensor
     page_size: int
     qo_indptr: torch.Tensor
+    block_table: torch.Tensor
+    slot_mapping: torch.Tensor
     kv_indptr: torch.Tensor
     kv_indices: torch.Tensor
     kv_last_page_len: torch.Tensor
@@ -557,7 +559,7 @@ class _PagedPromptKVState:
 
 
 class HunyuanImage3PagedKVCacheManager:
-    """Owns Hunyuan Image3 prompt-prefix pages and FlashInfer metadata."""
+    """Owns Hunyuan Image3 prompt-prefix pages and vLLM paged attention metadata."""
 
     def __init__(self, *, enabled: bool, required: bool, page_size: int) -> None:
         if page_size <= 0:
@@ -626,14 +628,10 @@ class HunyuanImage3PagedKVCacheManager:
         prefix_page_lookups = self.stats["paged_kv_prefix_page_lookups"]
         prefix_token_lookups = self.stats["paged_kv_prefix_token_lookups"]
         prefix_page_hit_rate = (
-            self.stats["paged_kv_prefix_page_hits"] / prefix_page_lookups
-            if prefix_page_lookups > 0
-            else None
+            self.stats["paged_kv_prefix_page_hits"] / prefix_page_lookups if prefix_page_lookups > 0 else None
         )
         prefix_token_hit_rate = (
-            self.stats["paged_kv_prefix_token_hits"] / prefix_token_lookups
-            if prefix_token_lookups > 0
-            else None
+            self.stats["paged_kv_prefix_token_hits"] / prefix_token_lookups if prefix_token_lookups > 0 else None
         )
         return {
             "paged_kv_cache_enabled": self.enabled,
@@ -662,8 +660,7 @@ class HunyuanImage3PagedKVCacheManager:
         self.state = None
         if self.required:
             raise RuntimeError(
-                "Hunyuan Image3 paged KV cache is required but prompt page cache build failed: "
-                f"{reason}"
+                f"Hunyuan Image3 paged KV cache is required but prompt page cache build failed: {reason}"
             )
 
     def build_prompt_state(
@@ -699,9 +696,7 @@ class HunyuanImage3PagedKVCacheManager:
             self._record_prompt_build_failure("cached prompt lens must be positive")
             return None
         if torch.any(cached_prompt_lens > cache_len):
-            self._record_prompt_build_failure(
-                f"cached prompt lens must be <= cached KV length {cache_len}"
-            )
+            self._record_prompt_build_failure(f"cached prompt lens must be <= cached KV length {cache_len}")
             return None
 
         device = cached_key.device
@@ -794,8 +789,7 @@ class HunyuanImage3PagedKVCacheManager:
             return None
         if attention_mask.dtype != torch.bool:
             raise ValueError(
-                f"Hunyuan Image3 paged KV attention only supports boolean custom masks, "
-                f"got {attention_mask.dtype}"
+                f"Hunyuan Image3 paged KV attention only supports boolean custom masks, got {attention_mask.dtype}"
             )
 
         mask = attention_mask
@@ -822,9 +816,7 @@ class HunyuanImage3PagedKVCacheManager:
             for b in range(bs):
                 cached_len = int(cached_lens[b].item())
                 if cached_len > current_start:
-                    raise ValueError(
-                        f"cached_len({cached_len}) cannot exceed dense prefix length({current_start})"
-                    )
+                    raise ValueError(f"cached_len({cached_len}) cannot exceed dense prefix length({current_start})")
                 prefix_mask = mask[b, :, :cached_len]
                 current_mask = mask[b, :, current_start : current_start + q_len]
                 mask_parts.append(torch.cat([prefix_mask, current_mask], dim=1).contiguous().reshape(-1))
@@ -862,6 +854,8 @@ class HunyuanImage3PagedKVCacheManager:
         device = key.device
         page_size = state.page_size
         kv_indices_parts: list[torch.Tensor] = []
+        block_table_parts: list[torch.Tensor] = []
+        slot_mapping_parts: list[torch.Tensor] = []
         kv_indptr_values = [0]
         kv_last_page_len_values: list[int] = []
         seq_len_values: list[int] = []
@@ -893,6 +887,16 @@ class HunyuanImage3PagedKVCacheManager:
             else:
                 sample_indices = prefix_indices
             kv_indices_parts.append(sample_indices)
+            block_table_parts.append(sample_indices)
+            current_positions = state.cached_lens[b].to(device=device, dtype=torch.int64) + torch.arange(
+                q_len,
+                dtype=torch.int64,
+                device=device,
+            )
+            current_page_offsets = torch.div(current_positions, page_size, rounding_mode="floor")
+            current_page_slots = current_positions % page_size
+            current_pages = sample_indices.to(dtype=torch.int64)[current_page_offsets]
+            slot_mapping_parts.append(current_pages * page_size + current_page_slots)
             kv_indptr_values.append(kv_indptr_values[-1] + int(sample_indices.numel()))
             last_page_len = sample_seq_len % page_size
             kv_last_page_len_values.append(page_size if last_page_len == 0 else last_page_len)
@@ -906,6 +910,11 @@ class HunyuanImage3PagedKVCacheManager:
         assert self.state is not None
         state = self.state
         kv_indices = torch.cat(kv_indices_parts, dim=0).to(dtype=torch.int32)
+        max_block_table_len = max(int(part.numel()) for part in block_table_parts)
+        block_table = torch.zeros(bs, max_block_table_len, dtype=torch.int32, device=device)
+        for b, sample_indices in enumerate(block_table_parts):
+            block_table[b, : sample_indices.numel()] = sample_indices.to(dtype=torch.int32)
+        slot_mapping = torch.cat(slot_mapping_parts, dim=0).to(dtype=torch.int64)
         kv_indptr = torch.tensor(kv_indptr_values, dtype=torch.int32, device=device)
         kv_last_page_len = torch.tensor(kv_last_page_len_values, dtype=torch.int32, device=device)
         seq_lens = torch.tensor(seq_len_values, dtype=torch.int32, device=device)
@@ -933,6 +942,8 @@ class HunyuanImage3PagedKVCacheManager:
             value_cache=state.value_cache,
             page_size=page_size,
             qo_indptr=qo_indptr,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
             kv_indptr=kv_indptr,
             kv_indices=kv_indices,
             kv_last_page_len=kv_last_page_len,
@@ -973,39 +984,36 @@ class HunyuanImage3PagedKVCacheManager:
         self.stats["paged_attention_runner_errors"] += 1
 
 
-class HunyuanImage3FlashInferPagedKVRunner:
-    """FlashInfer paged prefill runner for Hunyuan Image3 denoise reuse."""
+class HunyuanImage3VllmPagedKVRunner:
+    """vLLM FlashAttention paged prefill runner for Hunyuan Image3 denoise reuse."""
 
     def __init__(self, workspace_bytes: int | None = None, validate_inputs: bool | None = None) -> None:
+        # Kept for CLI/env compatibility with the first paged-KV prototype.
         self.workspace_bytes = workspace_bytes or _parse_positive_int_env(
             _HY3_PAGED_KV_WORKSPACE_BYTES_ENV,
             _HY3_PAGED_KV_DEFAULT_WORKSPACE_BYTES,
         )
         self.profile_enabled = should_profile_hunyuan_image3_paged_kv()
         self.validate_inputs = (
-            should_validate_hunyuan_image3_paged_kv_run_inputs()
-            if validate_inputs is None
-            else bool(validate_inputs)
+            should_validate_hunyuan_image3_paged_kv_run_inputs() if validate_inputs is None else bool(validate_inputs)
         )
-        self._append_paged_kv_cache: Any | None = None
-        self._wrapper_cls: Any | None = None
+        self._flash_attn_varlen_func: Callable[..., Any] | None = None
+        self._reshape_and_cache_flash: Callable[..., Any] | None = None
+        self._get_flash_attn_version: Callable[..., int | None] | None = None
         self._load_error: Exception | None = None
-        self._workspace_by_device: dict[tuple[str, int | None], torch.Tensor] = {}
-        self._wrapper_by_device: dict[tuple[str, int | None], Any] = {}
+        self._fa_version_by_head_dim: dict[int, int] = {}
         self._profile_stats: dict[str, float | int | bool] = {
-            "profile_flashinfer_enabled": self.profile_enabled,
-            "profile_flashinfer_append_calls": 0,
-            "profile_flashinfer_append_total_ms": 0.0,
-            "profile_flashinfer_plan_calls": 0,
-            "profile_flashinfer_plan_total_ms": 0.0,
-            "profile_flashinfer_run_calls": 0,
-            "profile_flashinfer_run_total_ms": 0.0,
+            "profile_vllm_paged_attention_enabled": self.profile_enabled,
+            "profile_vllm_cache_write_calls": 0,
+            "profile_vllm_cache_write_total_ms": 0.0,
+            "profile_vllm_paged_attention_calls": 0,
+            "profile_vllm_paged_attention_total_ms": 0.0,
         }
 
     def reset_profile_stats(self) -> None:
         self.profile_enabled = should_profile_hunyuan_image3_paged_kv()
         for key in self._profile_stats:
-            if key == "profile_flashinfer_enabled":
+            if key == "profile_vllm_paged_attention_enabled":
                 self._profile_stats[key] = self.profile_enabled
             else:
                 self._profile_stats[key] = 0.0 if key.endswith("_ms") else 0
@@ -1020,18 +1028,26 @@ class HunyuanImage3FlashInferPagedKVRunner:
         self._profile_stats[total_ms_key] = float(self._profile_stats.get(total_ms_key, 0.0)) + float(elapsed_ms)
 
     def _load(self) -> bool:
-        if self._append_paged_kv_cache is not None and self._wrapper_cls is not None:
+        if self._flash_attn_varlen_func is not None and self._reshape_and_cache_flash is not None:
             return True
         if self._load_error is not None:
             return False
         try:
-            from flashinfer.page import append_paged_kv_cache
-            from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
+            from vllm.v1.attention.backends.fa_utils import (
+                flash_attn_varlen_func,
+                get_flash_attn_version,
+                is_flash_attn_varlen_func_available,
+                reshape_and_cache_flash,
+            )
         except Exception as e:
             self._load_error = e
             return False
-        self._append_paged_kv_cache = append_paged_kv_cache
-        self._wrapper_cls = BatchPrefillWithPagedKVCacheWrapper
+        if not is_flash_attn_varlen_func_available():
+            self._load_error = RuntimeError("vLLM flash_attn_varlen_func is unavailable")
+            return False
+        self._flash_attn_varlen_func = flash_attn_varlen_func
+        self._reshape_and_cache_flash = reshape_and_cache_flash
+        self._get_flash_attn_version = get_flash_attn_version
         return True
 
     def is_available(self) -> bool:
@@ -1040,21 +1056,6 @@ class HunyuanImage3FlashInferPagedKVRunner:
     def load_error(self) -> Exception | None:
         self._load()
         return self._load_error
-
-    @staticmethod
-    def _device_key(device: torch.device) -> tuple[str, int | None]:
-        return (device.type, device.index)
-
-    def _get_wrapper(self, device: torch.device) -> Any:
-        device_key = self._device_key(device)
-        wrapper = self._wrapper_by_device.get(device_key)
-        if wrapper is not None:
-            return wrapper
-        workspace = torch.empty(self.workspace_bytes, dtype=torch.uint8, device=device)
-        wrapper = self._wrapper_cls(workspace, "NHD")
-        self._workspace_by_device[device_key] = workspace
-        self._wrapper_by_device[device_key] = wrapper
-        return wrapper
 
     @staticmethod
     def _validate_run_inputs(
@@ -1097,6 +1098,8 @@ class HunyuanImage3FlashInferPagedKVRunner:
             ("key_cache", metadata.key_cache),
             ("value_cache", metadata.value_cache),
             ("qo_indptr", metadata.qo_indptr),
+            ("block_table", metadata.block_table),
+            ("slot_mapping", metadata.slot_mapping),
             ("kv_indptr", metadata.kv_indptr),
             ("kv_indices", metadata.kv_indices),
             ("kv_last_page_len", metadata.kv_last_page_len),
@@ -1114,11 +1117,13 @@ class HunyuanImage3FlashInferPagedKVRunner:
 
         require(
             metadata.key_cache.dim() == 4 and metadata.value_cache.dim() == 4,
-            f"key/value caches must be 4D, got {tuple(metadata.key_cache.shape)} and {tuple(metadata.value_cache.shape)}",
+            f"key/value caches must be 4D, got {tuple(metadata.key_cache.shape)} "
+            f"and {tuple(metadata.value_cache.shape)}",
         )
         require(
             metadata.key_cache.shape == metadata.value_cache.shape,
-            f"key cache shape {tuple(metadata.key_cache.shape)} must equal value cache shape {tuple(metadata.value_cache.shape)}",
+            f"key cache shape {tuple(metadata.key_cache.shape)} must equal "
+            f"value cache shape {tuple(metadata.value_cache.shape)}",
         )
         require(
             metadata.key_cache.shape[1] == metadata.page_size,
@@ -1127,6 +1132,18 @@ class HunyuanImage3FlashInferPagedKVRunner:
         require(
             metadata.key_cache.shape[2:] == key.shape[2:],
             f"cache KV shape {tuple(metadata.key_cache.shape[2:])} must match current KV shape {tuple(key.shape[2:])}",
+        )
+        require(
+            metadata.block_table.dim() == 2,
+            f"block_table must be 2D, got shape {tuple(metadata.block_table.shape)}",
+        )
+        require(
+            metadata.block_table.shape[0] == bs,
+            f"block_table batch {metadata.block_table.shape[0]} must equal batch size {bs}",
+        )
+        require(
+            metadata.block_table.dtype == torch.int32,
+            f"block_table must use torch.int32, got {metadata.block_table.dtype}",
         )
 
         def require_int32_1d(name: str, tensor: torch.Tensor, expected_numel: int | None = None) -> None:
@@ -1138,8 +1155,18 @@ class HunyuanImage3FlashInferPagedKVRunner:
                     f"{name} length {tensor.numel()} must equal {expected_numel}",
                 )
 
+        def require_int64_1d(name: str, tensor: torch.Tensor, expected_numel: int | None = None) -> None:
+            require(tensor.dim() == 1, f"{name} must be 1D, got shape {tuple(tensor.shape)}")
+            require(tensor.dtype == torch.int64, f"{name} must use torch.int64, got {tensor.dtype}")
+            if expected_numel is not None:
+                require(
+                    tensor.numel() == expected_numel,
+                    f"{name} length {tensor.numel()} must equal {expected_numel}",
+                )
+
         token_count = bs * q_len
         require_int32_1d("qo_indptr", metadata.qo_indptr, bs + 1)
+        require_int64_1d("slot_mapping", metadata.slot_mapping, token_count)
         require_int32_1d("kv_indptr", metadata.kv_indptr, bs + 1)
         require_int32_1d("kv_indices", metadata.kv_indices)
         require_int32_1d("kv_last_page_len", metadata.kv_last_page_len, bs)
@@ -1175,7 +1202,8 @@ class HunyuanImage3FlashInferPagedKVRunner:
         )
         require(
             int(metadata.kv_indptr[-1].item()) == metadata.kv_indices.numel(),
-            f"kv_indptr last value {int(metadata.kv_indptr[-1].item())} must equal kv_indices length {metadata.kv_indices.numel()}",
+            f"kv_indptr last value {int(metadata.kv_indptr[-1].item())} "
+            f"must equal kv_indices length {metadata.kv_indices.numel()}",
         )
         require(
             bool(torch.all(metadata.kv_indptr[1:] >= metadata.kv_indptr[:-1]).item()),
@@ -1184,6 +1212,15 @@ class HunyuanImage3FlashInferPagedKVRunner:
         require(
             bool(torch.all((metadata.kv_indices >= 0) & (metadata.kv_indices < metadata.key_cache.shape[0])).item()),
             "kv_indices must reference existing cache pages",
+        )
+        require(
+            bool(torch.all((metadata.block_table >= 0) & (metadata.block_table < metadata.key_cache.shape[0])).item()),
+            "block_table must reference existing cache pages",
+        )
+        max_cache_slots = metadata.key_cache.shape[0] * metadata.page_size
+        require(
+            bool(torch.all((metadata.slot_mapping >= 0) & (metadata.slot_mapping < max_cache_slots)).item()),
+            "slot_mapping must reference existing cache slots",
         )
         require(
             bool(torch.all((metadata.kv_last_page_len > 0) & (metadata.kv_last_page_len <= metadata.page_size)).item()),
@@ -1214,15 +1251,58 @@ class HunyuanImage3FlashInferPagedKVRunner:
             torch.equal(metadata.append_positions, expected_positions),
             "append_positions must immediately follow each cached prefix",
         )
+        expected_slot_mapping_parts = []
+        for b in range(bs):
+            page_start = int(metadata.kv_indptr[b].item())
+            page_end = int(metadata.kv_indptr[b + 1].item())
+            block_count = page_end - page_start
+            require(
+                block_count <= metadata.block_table.shape[1],
+                "block_table must have enough columns for every sequence page",
+            )
+            require(
+                torch.equal(
+                    metadata.block_table[b, :block_count],
+                    metadata.kv_indices[page_start:page_end],
+                ),
+                "block_table must match per-sample kv_indices",
+            )
+            positions = expected_positions[b * q_len : (b + 1) * q_len].to(dtype=torch.int64)
+            page_offsets = torch.div(positions, metadata.page_size, rounding_mode="floor")
+            page_slots = positions % metadata.page_size
+            pages = metadata.kv_indices[page_start + page_offsets.to(dtype=torch.int64)].to(dtype=torch.int64)
+            expected_slot_mapping_parts.append(pages * metadata.page_size + page_slots)
+        expected_slot_mapping = torch.cat(expected_slot_mapping_parts)
+        require(
+            torch.equal(metadata.slot_mapping, expected_slot_mapping),
+            "slot_mapping must map current tokens to cache slots",
+        )
 
         if metadata.custom_mask is not None:
-            require(metadata.custom_mask.dim() == 1, f"custom_mask must be 1D, got {tuple(metadata.custom_mask.shape)}")
-            require(metadata.custom_mask.dtype == torch.bool, f"custom_mask must be bool, got {metadata.custom_mask.dtype}")
+            require(
+                metadata.custom_mask.dim() == 1,
+                f"custom_mask must be 1D, got {tuple(metadata.custom_mask.shape)}",
+            )
+            require(
+                metadata.custom_mask.dtype == torch.bool,
+                f"custom_mask must be bool, got {metadata.custom_mask.dtype}",
+            )
             expected_custom_mask_numel = int(torch.sum(metadata.seq_lens.to(dtype=torch.int64)).item()) * q_len
             require(
                 metadata.custom_mask.numel() == expected_custom_mask_numel,
                 f"custom_mask length {metadata.custom_mask.numel()} must equal {expected_custom_mask_numel}",
             )
+
+    def _get_fa_version(self, head_dim: int) -> int:
+        cached = self._fa_version_by_head_dim.get(head_dim)
+        if cached is not None:
+            return cached
+        assert self._get_flash_attn_version is not None
+        fa_version = self._get_flash_attn_version(head_size=head_dim)
+        if fa_version is None:
+            raise RuntimeError(f"vLLM FlashAttention does not support head_dim={head_dim}")
+        self._fa_version_by_head_dim[head_dim] = fa_version
+        return fa_version
 
     def run(
         self,
@@ -1237,73 +1317,70 @@ class HunyuanImage3FlashInferPagedKVRunner:
     ) -> torch.Tensor:
         del attn_mask
         if not self._load():
-            raise ImportError("FlashInfer is unavailable for Hunyuan Image3 paged KV attention") from self._load_error
+            raise ImportError(
+                "vLLM FlashAttention paged attention is unavailable for Hunyuan Image3"
+            ) from self._load_error
         if self.validate_inputs:
             self._validate_run_inputs(query, key, value, metadata)
+        if metadata.custom_mask is not None:
+            raise ValueError("vLLM FlashAttention paged attention does not support Hunyuan custom masks")
 
         append_key = key.reshape(-1, key.shape[2], key.shape[3]).contiguous()
         append_value = value.reshape(-1, value.shape[2], value.shape[3]).contiguous()
-        append_call = lambda: self._append_paged_kv_cache(
-            append_key,
-            append_value,
-            metadata.append_batch_indices,
-            metadata.append_positions,
-            (metadata.key_cache, metadata.value_cache),
-            metadata.kv_indices,
-            metadata.kv_indptr,
-            metadata.kv_last_page_len,
-            kv_layout=metadata.kv_layout,
-        )
-        if self.profile_enabled:
-            _, elapsed_ms = _profile_call_ms(append_call, device=query.device)
-            self._record_profile(
-                "profile_flashinfer_append_calls",
-                "profile_flashinfer_append_total_ms",
-                elapsed_ms,
-            )
-        else:
-            append_call()
+        one = torch.ones((1,), dtype=torch.float32, device=query.device)
+        assert self._reshape_and_cache_flash is not None
 
-        wrapper = self._get_wrapper(query.device)
-        plan_call = lambda: wrapper.plan(
-            metadata.qo_indptr,
-            metadata.kv_indptr,
-            metadata.kv_indices,
-            metadata.kv_last_page_len,
-            query.shape[2],
-            key.shape[2],
-            query.shape[3],
-            metadata.page_size,
-            custom_mask=metadata.custom_mask,
-            causal=causal,
-            sm_scale=sm_scale,
-            q_data_type=query.dtype,
-            kv_data_type=key.dtype,
-        )
-        if self.profile_enabled:
-            _, elapsed_ms = _profile_call_ms(plan_call, device=query.device)
-            self._record_profile(
-                "profile_flashinfer_plan_calls",
-                "profile_flashinfer_plan_total_ms",
-                elapsed_ms,
+        def cache_write_call() -> None:
+            self._reshape_and_cache_flash(
+                append_key,
+                append_value,
+                metadata.key_cache,
+                metadata.value_cache,
+                metadata.slot_mapping,
+                "auto",
+                one,
+                one,
             )
-        else:
-            plan_call()
 
-        run_call = lambda: wrapper.run(
-            query.reshape(-1, query.shape[2], query.shape[3]).contiguous(),
-            (metadata.key_cache, metadata.value_cache),
-            return_lse=False,
-        )
         if self.profile_enabled:
-            out, elapsed_ms = _profile_call_ms(run_call, device=query.device)
+            _, elapsed_ms = _profile_call_ms(cache_write_call, device=query.device)
             self._record_profile(
-                "profile_flashinfer_run_calls",
-                "profile_flashinfer_run_total_ms",
+                "profile_vllm_cache_write_calls",
+                "profile_vllm_cache_write_total_ms",
                 elapsed_ms,
             )
         else:
-            out = run_call()
+            cache_write_call()
+
+        out = torch.empty_like(query)
+        fa_version = self._get_fa_version(query.shape[3])
+        assert self._flash_attn_varlen_func is not None
+
+        def run_call() -> torch.Tensor:
+            return self._flash_attn_varlen_func(
+                q=query.reshape(-1, query.shape[2], query.shape[3]).contiguous(),
+                k=metadata.key_cache,
+                v=metadata.value_cache,
+                out=out.reshape(-1, out.shape[2], out.shape[3]),
+                cu_seqlens_q=metadata.qo_indptr,
+                max_seqlen_q=metadata.max_qo_len,
+                seqused_k=metadata.seq_lens,
+                max_seqlen_k=metadata.max_kv_len,
+                softmax_scale=sm_scale,
+                causal=causal,
+                block_table=metadata.block_table,
+                fa_version=fa_version,
+            )
+
+        if self.profile_enabled:
+            _, elapsed_ms = _profile_call_ms(run_call, device=query.device)
+            self._record_profile(
+                "profile_vllm_paged_attention_calls",
+                "profile_vllm_paged_attention_total_ms",
+                elapsed_ms,
+            )
+        else:
+            run_call()
         return out.reshape(query.shape)
 
 
@@ -1940,7 +2017,7 @@ class ImageKVCacheManager:
 
     def _get_paged_kv_runner(self) -> Any:
         if self._paged_kv_runner is None:
-            self._paged_kv_runner = HunyuanImage3FlashInferPagedKVRunner()
+            self._paged_kv_runner = HunyuanImage3VllmPagedKVRunner()
         return self._paged_kv_runner
 
     def _paged_kv_fallback(self, reason: str) -> None:
@@ -1965,9 +2042,7 @@ class ImageKVCacheManager:
                 f"must equal (batch={bs}, q_len={q_len})."
             )
         if not torch.all(position_ids[:, 0] == self.image_kv_cache_lens):
-            raise ValueError(
-                "The first current position must immediately follow each sample's cached prompt KV."
-            )
+            raise ValueError("The first current position must immediately follow each sample's cached prompt KV.")
 
     def _can_use_paged_prompt_kv_attention(
         self,
@@ -2048,17 +2123,23 @@ class ImageKVCacheManager:
         except Exception as e:
             self._paged_kv_fallback(f"metadata build failed: {e}")
             return None
+        if metadata.custom_mask is not None:
+            self._paged_kv_fallback("vLLM paged attention does not support custom attention masks")
+            return None
         runner = self._get_paged_kv_runner()
         try:
-            runner_call = lambda: runner.run(
-                query.contiguous(),
-                key.contiguous(),
-                value.contiguous(),
-                metadata,
-                sm_scale=self.scaling,
-                causal=False,
-                attn_mask=attention_mask,
-            )
+
+            def runner_call() -> torch.Tensor:
+                return runner.run(
+                    query.contiguous(),
+                    key.contiguous(),
+                    value.contiguous(),
+                    metadata,
+                    sm_scale=self.scaling,
+                    causal=False,
+                    attn_mask=attention_mask,
+                )
+
             if getattr(self._paged_kv_cache_manager, "profile_enabled", False):
                 out, elapsed_ms = _profile_call_ms(runner_call, device=query.device)
                 self._paged_kv_cache_manager.record_profile(
@@ -2220,13 +2301,16 @@ class ImageKVCacheManager:
                     )
                     if paged_attn_output is not None:
                         return paged_attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
-                dense_reuse_call = lambda: self._reuse_prompt_kv(
-                    key,
-                    value,
-                    seq_len,
-                    bs,
-                    position_ids=kwargs.get("position_ids"),
-                )
+
+                def dense_reuse_call() -> tuple[torch.Tensor, torch.Tensor]:
+                    return self._reuse_prompt_kv(
+                        key,
+                        value,
+                        seq_len,
+                        bs,
+                        position_ids=kwargs.get("position_ids"),
+                    )
+
                 if getattr(self._paged_kv_cache_manager, "profile_enabled", False):
                     (key, value), elapsed_ms = _profile_call_ms(dense_reuse_call, device=key.device)
                     self._paged_kv_cache_manager.record_profile(
@@ -3202,9 +3286,8 @@ class HunyuanImage3Model(nn.Module):
             "profile_paged_metadata_build_calls",
             "profile_paged_custom_mask_build_calls",
             "profile_paged_runner_calls",
-            "profile_flashinfer_append_calls",
-            "profile_flashinfer_plan_calls",
-            "profile_flashinfer_run_calls",
+            "profile_vllm_cache_write_calls",
+            "profile_vllm_paged_attention_calls",
         )
         profile_time_keys = (
             "profile_dense_reuse_total_ms",
@@ -3212,9 +3295,8 @@ class HunyuanImage3Model(nn.Module):
             "profile_paged_metadata_build_total_ms",
             "profile_paged_custom_mask_build_total_ms",
             "profile_paged_runner_total_ms",
-            "profile_flashinfer_append_total_ms",
-            "profile_flashinfer_plan_total_ms",
-            "profile_flashinfer_run_total_ms",
+            "profile_vllm_cache_write_total_ms",
+            "profile_vllm_paged_attention_total_ms",
         )
         aggregate: dict[str, Any] = {
             "layers": 0,
@@ -3228,7 +3310,7 @@ class HunyuanImage3Model(nn.Module):
             "paged_kv_batch_size": 0,
             "paged_kv_max_cached_tokens": 0,
             "paged_kv_profile_enabled": False,
-            "profile_flashinfer_enabled": False,
+            "profile_vllm_paged_attention_enabled": False,
         }
         for key in counter_keys:
             aggregate[key] = 0
@@ -3264,9 +3346,9 @@ class HunyuanImage3Model(nn.Module):
             aggregate["paged_kv_profile_enabled"] = bool(aggregate["paged_kv_profile_enabled"]) or bool(
                 stats.get("paged_kv_profile_enabled")
             )
-            aggregate["profile_flashinfer_enabled"] = bool(aggregate["profile_flashinfer_enabled"]) or bool(
-                stats.get("profile_flashinfer_enabled")
-            )
+            aggregate["profile_vllm_paged_attention_enabled"] = bool(
+                aggregate["profile_vllm_paged_attention_enabled"]
+            ) or bool(stats.get("profile_vllm_paged_attention_enabled"))
             aggregate["paged_kv_max_cached_tokens"] = max(
                 int(aggregate["paged_kv_max_cached_tokens"]),
                 int(stats.get("paged_kv_max_cached_tokens", 0)),

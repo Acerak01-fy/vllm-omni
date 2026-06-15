@@ -55,9 +55,9 @@ class FakePagedKVRunner:
 
     def run(self, query, key, value, metadata, *, sm_scale, causal, attn_mask=None):
         del causal, attn_mask
+        assert metadata.custom_mask is None
         self.calls.append((query, key, value, metadata))
         outputs = []
-        custom_mask_offset = 0
         for b in range(query.shape[0]):
             page_start = int(metadata.kv_indptr[b].item())
             page_end = int(metadata.kv_indptr[b + 1].item())
@@ -67,15 +67,7 @@ class FakePagedKVRunner:
             prefix_value = metadata.value_cache[page_indices].reshape(-1, value.shape[2], value.shape[3])[:cached_len]
             dense_key = torch.cat([prefix_key, key[b]], dim=0).unsqueeze(0)
             dense_value = torch.cat([prefix_value, value[b]], dim=0).unsqueeze(0)
-            custom_mask = None
-            if metadata.custom_mask is not None:
-                kv_len = int(metadata.seq_lens[b].item())
-                item_size = query.shape[1] * kv_len
-                custom_mask = metadata.custom_mask[
-                    custom_mask_offset : custom_mask_offset + item_size
-                ].reshape(1, query.shape[1], kv_len)
-                custom_mask_offset += item_size
-            outputs.append(_dense_attention(query[b : b + 1], dense_key, dense_value, sm_scale, attn_mask=custom_mask)[0])
+            outputs.append(_dense_attention(query[b : b + 1], dense_key, dense_value, sm_scale)[0])
         return torch.stack(outputs, dim=0)
 
 
@@ -735,6 +727,8 @@ def test_paged_update_dispatches_runner_without_dense_reuse():
     _, _, _, metadata = runner.calls[0]
     assert metadata.kv_indptr.tolist() == [0, 3]
     assert metadata.kv_last_page_len.tolist() == [3]
+    assert metadata.block_table.tolist() == [[0, 1, 2]]
+    assert metadata.slot_mapping.tolist() == list(range(prompt_len, prompt_len + IMAGE_TOKEN_LEN))
     assert metadata.append_batch_indices.tolist() == [0] * IMAGE_TOKEN_LEN
     assert metadata.append_positions.tolist() == list(range(prompt_len, prompt_len + IMAGE_TOKEN_LEN))
     stats = mgr.get_paged_kv_cache_stats()
@@ -802,7 +796,7 @@ def test_fake_paged_runner_matches_dense_attention_reference():
     assert torch.allclose(out.reshape_as(expected), expected)
 
 
-def test_paged_update_accepts_boolean_attention_mask_as_custom_mask():
+def test_paged_update_falls_back_for_boolean_attention_mask_custom_mask():
     CAPTURED_ATTN_CALLS.clear()
     mgr = _make_cache_mgr()
     runner = FakePagedKVRunner()
@@ -845,29 +839,18 @@ def test_paged_update_accepts_boolean_attention_mask_as_custom_mask():
         position_ids=position_ids,
     )
 
-    assert not CAPTURED_ATTN_CALLS
-    assert len(runner.calls) == 1
-    _, _, _, metadata = runner.calls[0]
-    assert metadata.custom_mask is not None
-    assert metadata.custom_mask.numel() == IMAGE_TOKEN_LEN * update_seq_len
-    assert mgr.get_paged_kv_cache_stats()["paged_attention_custom_mask_calls"] == 1
-
-    cached_key, cached_value = mgr.image_kv_cache_map
-    current_key = img_k.reshape(bs, IMAGE_TOKEN_LEN, NUM_KV_HEADS, HEAD_DIM)
-    current_value = img_v.reshape(bs, IMAGE_TOKEN_LEN, NUM_KV_HEADS, HEAD_DIM)
-    dense_key = torch.cat([cached_key, current_key], dim=1)
-    dense_value = torch.cat([cached_value, current_value], dim=1)
-    expected = _dense_attention(
-        query.reshape(bs, IMAGE_TOKEN_LEN, NUM_HEADS, HEAD_DIM),
-        dense_key,
-        dense_value,
-        SCALING,
-        attn_mask=mask[:, 0],
-    )
-    assert torch.allclose(out.reshape_as(expected), expected)
+    assert out.shape == (IMAGE_TOKEN_LEN, NUM_HEADS, HEAD_DIM)
+    assert runner.calls == []
+    assert CAPTURED_ATTN_CALLS
+    _, dense_key, _, _ = CAPTURED_ATTN_CALLS[-1]
+    assert dense_key.shape[1] == update_seq_len
+    stats = mgr.get_paged_kv_cache_stats()
+    assert stats["paged_attention_fallbacks"] == 1
+    assert stats["paged_attention_calls"] == 0
+    assert stats["paged_attention_custom_mask_calls"] == 0
 
 
-def test_paged_update_matches_ragged_dense_reference_for_non_uniform_cfg_batch():
+def test_paged_update_falls_back_for_non_uniform_cfg_batch_custom_mask():
     CAPTURED_ATTN_CALLS.clear()
     mgr = _make_cache_mgr()
     runner = FakePagedKVRunner()
@@ -915,37 +898,16 @@ def test_paged_update_matches_ragged_dense_reference_for_non_uniform_cfg_batch()
         position_ids=position_ids,
     )
 
-    assert not CAPTURED_ATTN_CALLS
-    assert len(runner.calls) == 1
-    _, _, _, metadata = runner.calls[0]
-    assert metadata.cached_lens.tolist() == cached_lens.tolist()
-    assert metadata.seq_lens.tolist() == [int(cached_len.item()) + IMAGE_TOKEN_LEN for cached_len in cached_lens]
-    assert metadata.custom_mask is not None
-
-    cached_key, cached_value = mgr.image_kv_cache_map
-    current_key = img_k.reshape(bs, IMAGE_TOKEN_LEN, NUM_KV_HEADS, HEAD_DIM)
-    current_value = img_v.reshape(bs, IMAGE_TOKEN_LEN, NUM_KV_HEADS, HEAD_DIM)
-    query_4d = query.reshape(bs, IMAGE_TOKEN_LEN, NUM_HEADS, HEAD_DIM)
-    expected_parts = []
-    for b in range(bs):
-        cached_len = int(cached_lens[b].item())
-        dense_key = torch.cat([cached_key[b, :cached_len], current_key[b]], dim=0).unsqueeze(0)
-        dense_value = torch.cat([cached_value[b, :cached_len], current_value[b]], dim=0).unsqueeze(0)
-        prefix_mask = mask[b, 0, :, :cached_len]
-        current_mask = mask[b, 0, :, max_prompt_len : max_prompt_len + IMAGE_TOKEN_LEN]
-        ragged_mask = torch.cat([prefix_mask, current_mask], dim=1).unsqueeze(0)
-        expected_parts.append(
-            _dense_attention(
-                query_4d[b : b + 1],
-                dense_key,
-                dense_value,
-                SCALING,
-                attn_mask=ragged_mask,
-            )[0]
-        )
-    expected = torch.stack(expected_parts, dim=0)
-    assert torch.allclose(out.reshape_as(expected), expected)
-    assert mgr.get_paged_kv_cache_stats()["paged_attention_custom_mask_calls"] == 1
+    assert out.shape == (bs * IMAGE_TOKEN_LEN, NUM_HEADS, HEAD_DIM)
+    assert runner.calls == []
+    assert CAPTURED_ATTN_CALLS
+    _, dense_key, _, _ = CAPTURED_ATTN_CALLS[-1]
+    assert dense_key.shape[0] == bs
+    assert dense_key.shape[1] == update_seq_len
+    stats = mgr.get_paged_kv_cache_stats()
+    assert stats["paged_attention_fallbacks"] == 1
+    assert stats["paged_attention_calls"] == 0
+    assert stats["paged_attention_custom_mask_calls"] == 0
 
 
 def test_paged_update_falls_back_for_float_attention_mask():
