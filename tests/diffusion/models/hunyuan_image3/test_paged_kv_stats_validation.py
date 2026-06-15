@@ -15,18 +15,13 @@ from pathlib import Path
 
 import pytest
 
-
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _END2END_SCRIPT = _REPO_ROOT / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
 
 
 def _load_end2end_function(name: str):
     module = ast.parse(_END2END_SCRIPT.read_text())
-    function = next(
-        node
-        for node in module.body
-        if isinstance(node, ast.FunctionDef) and node.name == name
-    )
+    function = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == name)
     namespace = {}
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(_END2END_SCRIPT), "exec"), namespace)
     return namespace[name]
@@ -46,6 +41,9 @@ def _layer_stats(layer_idx: int, **overrides):
         "paged_cache_build_failures": 0,
         "paged_attention_calls": 1,
         "paged_attention_custom_mask_calls": 1,
+        "paged_attention_split_calls": 1,
+        "paged_attention_paged_query_tokens": 4096,
+        "paged_attention_dense_masked_query_tokens": 1,
         "paged_attention_fallbacks": 0,
         "paged_attention_runner_errors": 0,
         "paged_kv_prefix_page_hits": 4,
@@ -70,6 +68,9 @@ def _valid_stats():
         "paged_cache_build_failures": 0,
         "paged_attention_calls": len(layers_detail),
         "paged_attention_custom_mask_calls": len(layers_detail),
+        "paged_attention_split_calls": len(layers_detail),
+        "paged_attention_paged_query_tokens": 8192,
+        "paged_attention_dense_masked_query_tokens": len(layers_detail),
         "paged_attention_fallbacks": 0,
         "paged_attention_runner_errors": 0,
         "paged_kv_prefix_page_hits": 8,
@@ -103,6 +104,8 @@ def test_enrich_paged_kv_stats_adds_expected_calls_and_page_hit_rate():
     assert enriched is not stats
     assert enriched["paged_attention_expected_calls"] == 6
     assert enriched["paged_attention_reuse_coverage"] == 2 / 6
+    assert enriched["paged_attention_paged_query_tokens_per_call"] == 4096.0
+    assert enriched["paged_attention_dense_masked_query_tokens_per_call"] == 1.0
     assert enriched["paged_kv_prefix_page_hit_rate"] == 1.0
     assert enriched["paged_kv_prefix_token_hit_rate"] == 1.0
     assert enriched["paged_attention_hit_rate"] == 1.0
@@ -129,6 +132,14 @@ def test_enrich_paged_kv_stats_adds_expected_calls_and_page_hit_rate():
         (
             lambda stats: stats["layers_detail"][1].update({"paged_attention_custom_mask_calls": 0}),
             "did not use custom masks on layer 1",
+        ),
+        (
+            lambda stats: stats["layers_detail"][1].update({"paged_attention_split_calls": 0}),
+            "did not split custom-mask query rows on layer 1",
+        ),
+        (
+            lambda stats: stats.update({"paged_attention_paged_query_tokens": 0}),
+            "did not run any paged query rows",
         ),
         (
             lambda stats: stats.update({"paged_kv_prefix_page_hits": 0}),

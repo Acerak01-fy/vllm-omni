@@ -523,6 +523,18 @@ def _profile_call_ms(fn: Callable[[], Any], *, device: torch.device | None = Non
 
 
 @dataclass
+class HunyuanImage3PagedKVAttentionSplit:
+    paged_query_mask: torch.Tensor
+    paged_query_indices: torch.Tensor
+    paged_batch_indices: torch.Tensor
+    paged_qo_indptr: torch.Tensor
+    dense_query_indices: torch.Tensor
+    max_paged_qo_len: int
+    paged_query_count: int
+    dense_query_count: int
+
+
+@dataclass
 class HunyuanImage3PagedKVAttentionMetadata:
     key_cache: torch.Tensor
     value_cache: torch.Tensor
@@ -544,6 +556,7 @@ class HunyuanImage3PagedKVAttentionMetadata:
     page_table_entry_count: int = 0
     current_page_count: int = 0
     custom_mask: torch.Tensor | None = None
+    attention_split: HunyuanImage3PagedKVAttentionSplit | None = None
     kv_layout: str = "NHD"
 
 
@@ -575,6 +588,9 @@ class HunyuanImage3PagedKVCacheManager:
             "paged_cache_expansions": 0,
             "paged_attention_calls": 0,
             "paged_attention_custom_mask_calls": 0,
+            "paged_attention_split_calls": 0,
+            "paged_attention_paged_query_tokens": 0,
+            "paged_attention_dense_masked_query_tokens": 0,
             "paged_attention_fallbacks": 0,
             "paged_attention_runner_errors": 0,
             "paged_kv_prefix_page_lookups": 0,
@@ -775,13 +791,12 @@ class HunyuanImage3PagedKVCacheManager:
         return bool(torch.all(attention_mask != 0).item())
 
     @classmethod
-    def build_custom_attention_mask(
+    def _broadcast_boolean_attention_mask(
         cls,
         attention_mask: torch.Tensor | None,
         bs: int,
         q_len: int,
         seq_len: int,
-        cached_lens: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         if attention_mask is None or attention_mask.numel() == 0:
             return None
@@ -807,24 +822,131 @@ class HunyuanImage3PagedKVCacheManager:
                 f"attention_mask shape {tuple(attention_mask.shape)} cannot broadcast to "
                 f"(batch={bs}, q_len={q_len}, seq_len={seq_len})"
             ) from e
+        return mask
 
+    @classmethod
+    def _build_compressed_boolean_attention_mask_parts(
+        cls,
+        attention_mask: torch.Tensor | None,
+        bs: int,
+        q_len: int,
+        seq_len: int,
+        cached_lens: torch.Tensor | None,
+    ) -> list[torch.Tensor] | None:
+        mask = cls._broadcast_boolean_attention_mask(attention_mask, bs, q_len, seq_len)
+        if mask is None:
+            return None
+
+        mask_parts: list[torch.Tensor] = []
         if cached_lens is not None:
             current_start = seq_len - q_len
             if current_start < 0:
                 raise ValueError(f"seq_len({seq_len}) must be >= q_len({q_len})")
-            mask_parts = []
             for b in range(bs):
                 cached_len = int(cached_lens[b].item())
                 if cached_len > current_start:
                     raise ValueError(f"cached_len({cached_len}) cannot exceed dense prefix length({current_start})")
                 prefix_mask = mask[b, :, :cached_len]
                 current_mask = mask[b, :, current_start : current_start + q_len]
-                mask_parts.append(torch.cat([prefix_mask, current_mask], dim=1).contiguous().reshape(-1))
-            mask = torch.cat(mask_parts, dim=0)
+                mask_parts.append(torch.cat([prefix_mask, current_mask], dim=1).contiguous())
+        else:
+            mask_parts = [mask[b].contiguous() for b in range(bs)]
 
-        if bool(torch.all(mask).item()):
+        if all(bool(torch.all(part).item()) for part in mask_parts):
             return None
-        return mask.contiguous().reshape(-1)
+        return mask_parts
+
+    @classmethod
+    def build_custom_attention_mask(
+        cls,
+        attention_mask: torch.Tensor | None,
+        bs: int,
+        q_len: int,
+        seq_len: int,
+        cached_lens: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        mask_parts = cls._build_compressed_boolean_attention_mask_parts(
+            attention_mask,
+            bs,
+            q_len,
+            seq_len,
+            cached_lens,
+        )
+        if mask_parts is None:
+            return None
+        return torch.cat([part.reshape(-1) for part in mask_parts], dim=0).contiguous()
+
+    @classmethod
+    def _build_attention_split_from_mask_parts(
+        cls,
+        bs: int,
+        q_len: int,
+        cached_lens: torch.Tensor,
+        mask_parts: list[torch.Tensor],
+    ) -> HunyuanImage3PagedKVAttentionSplit | None:
+        row_all_keep = torch.stack([torch.all(part, dim=1) for part in mask_parts], dim=0)
+        if not bool(torch.any(row_all_keep).item()):
+            return None
+        if bool(torch.all(row_all_keep).item()):
+            return None
+
+        device = cached_lens.device
+        paged_qo_lens = row_all_keep.sum(dim=1).to(dtype=torch.int32)
+        paged_qo_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+        paged_qo_indptr[1:] = torch.cumsum(paged_qo_lens, dim=0)
+        max_paged_qo_len = int(paged_qo_lens.max().item())
+        paged_query_count = int(paged_qo_indptr[-1].item())
+        dense_query_count = bs * q_len - paged_query_count
+
+        flat_mask = row_all_keep.reshape(-1)
+        flat_indices = torch.arange(bs * q_len, dtype=torch.int64, device=device)
+        paged_query_indices = flat_indices[flat_mask]
+        dense_query_indices = flat_indices[~flat_mask]
+        paged_batch_indices = torch.arange(bs, dtype=torch.int64, device=device).repeat_interleave(q_len)[flat_mask]
+        return HunyuanImage3PagedKVAttentionSplit(
+            paged_query_mask=row_all_keep,
+            paged_query_indices=paged_query_indices,
+            paged_batch_indices=paged_batch_indices,
+            paged_qo_indptr=paged_qo_indptr,
+            dense_query_indices=dense_query_indices,
+            max_paged_qo_len=max_paged_qo_len,
+            paged_query_count=paged_query_count,
+            dense_query_count=dense_query_count,
+        )
+
+    @classmethod
+    def build_custom_attention_mask_and_split(
+        cls,
+        attention_mask: torch.Tensor | None,
+        bs: int,
+        q_len: int,
+        seq_len: int,
+        cached_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, HunyuanImage3PagedKVAttentionSplit | None]:
+        mask_parts = cls._build_compressed_boolean_attention_mask_parts(attention_mask, bs, q_len, seq_len, cached_lens)
+        if mask_parts is None:
+            return None, None
+        custom_mask = torch.cat([part.reshape(-1) for part in mask_parts], dim=0).contiguous()
+        attention_split = cls._build_attention_split_from_mask_parts(bs, q_len, cached_lens, mask_parts)
+        return custom_mask, attention_split
+
+    @classmethod
+    def build_attention_split(
+        cls,
+        attention_mask: torch.Tensor | None,
+        bs: int,
+        q_len: int,
+        seq_len: int,
+        cached_lens: torch.Tensor,
+    ) -> HunyuanImage3PagedKVAttentionSplit | None:
+        _, attention_split = cls.build_custom_attention_mask_and_split(
+            attention_mask,
+            bs,
+            q_len,
+            seq_len,
+            cached_lens,
+        )
+        return attention_split
 
     def build_attention_metadata(
         self,
@@ -925,8 +1047,14 @@ class HunyuanImage3PagedKVCacheManager:
             + torch.arange(q_len, dtype=torch.int32, device=device).unsqueeze(0)
         ).reshape(-1)
         if self.profile_enabled:
-            custom_mask, elapsed_ms = _profile_call_ms(
-                lambda: self.build_custom_attention_mask(attention_mask, bs, q_len, seq_len, state.cached_lens),
+            (custom_mask, attention_split), elapsed_ms = _profile_call_ms(
+                lambda: self.build_custom_attention_mask_and_split(
+                    attention_mask,
+                    bs,
+                    q_len,
+                    seq_len,
+                    state.cached_lens,
+                ),
                 device=device,
             )
             self.record_profile(
@@ -935,7 +1063,13 @@ class HunyuanImage3PagedKVCacheManager:
                 elapsed_ms,
             )
         else:
-            custom_mask = self.build_custom_attention_mask(attention_mask, bs, q_len, seq_len, state.cached_lens)
+            custom_mask, attention_split = self.build_custom_attention_mask_and_split(
+                attention_mask,
+                bs,
+                q_len,
+                seq_len,
+                state.cached_lens,
+            )
 
         return HunyuanImage3PagedKVAttentionMetadata(
             key_cache=state.key_cache,
@@ -958,6 +1092,7 @@ class HunyuanImage3PagedKVCacheManager:
             page_table_entry_count=page_table_entry_count,
             current_page_count=current_page_count,
             custom_mask=custom_mask,
+            attention_split=attention_split,
         )
 
     def record_attention_call(
@@ -970,6 +1105,12 @@ class HunyuanImage3PagedKVCacheManager:
         if custom_mask_used:
             self.stats["paged_attention_custom_mask_calls"] += 1
         if metadata is not None:
+            if metadata.attention_split is not None:
+                self.stats["paged_attention_split_calls"] += 1
+                self.stats["paged_attention_paged_query_tokens"] += int(metadata.attention_split.paged_query_count)
+                self.stats["paged_attention_dense_masked_query_tokens"] += int(
+                    metadata.attention_split.dense_query_count
+                )
             self.stats["paged_kv_prefix_page_lookups"] += int(metadata.prefix_page_count)
             self.stats["paged_kv_prefix_page_hits"] += int(metadata.prefix_page_count)
             self.stats["paged_kv_prefix_token_lookups"] += int(metadata.prefix_token_count)
@@ -1292,6 +1433,57 @@ class HunyuanImage3VllmPagedKVRunner:
                 metadata.custom_mask.numel() == expected_custom_mask_numel,
                 f"custom_mask length {metadata.custom_mask.numel()} must equal {expected_custom_mask_numel}",
             )
+        if metadata.attention_split is not None:
+            split = metadata.attention_split
+            require(
+                split.paged_query_mask.shape == (bs, q_len),
+                f"attention_split paged_query_mask shape {tuple(split.paged_query_mask.shape)} "
+                f"must equal {(bs, q_len)}",
+            )
+            require(
+                split.paged_query_mask.dtype == torch.bool,
+                f"attention_split paged_query_mask must be bool, got {split.paged_query_mask.dtype}",
+            )
+            require(
+                split.paged_query_mask.device == device,
+                f"attention_split paged_query_mask device {split.paged_query_mask.device} "
+                f"must match query device {device}",
+            )
+            require_int64_1d("attention_split.paged_query_indices", split.paged_query_indices)
+            require_int64_1d("attention_split.paged_batch_indices", split.paged_batch_indices)
+            require_int32_1d("attention_split.paged_qo_indptr", split.paged_qo_indptr, bs + 1)
+            require_int64_1d("attention_split.dense_query_indices", split.dense_query_indices)
+            require(
+                split.paged_query_count == split.paged_query_indices.numel(),
+                "attention_split paged_query_count must equal paged_query_indices length",
+            )
+            require(
+                split.dense_query_count == split.dense_query_indices.numel(),
+                "attention_split dense_query_count must equal dense_query_indices length",
+            )
+            require(
+                split.paged_batch_indices.numel() == split.paged_query_count,
+                "attention_split paged_batch_indices length must equal paged_query_count",
+            )
+            require(
+                int(split.paged_qo_indptr[-1].item()) == split.paged_query_count,
+                "attention_split paged_qo_indptr last value must equal paged_query_count",
+            )
+            require(split.paged_query_count > 0, "attention_split must include paged query tokens")
+            require(split.dense_query_count > 0, "attention_split must include dense query tokens")
+            require(
+                split.max_paged_qo_len == int(split.paged_query_mask.sum(dim=1).max().item()),
+                "attention_split max_paged_qo_len must match paged_query_mask",
+            )
+            require(
+                bool(
+                    torch.equal(
+                        torch.sort(torch.cat([split.paged_query_indices, split.dense_query_indices])).values,
+                        torch.arange(token_count, dtype=torch.int64, device=device),
+                    )
+                ),
+                "attention_split query indices must partition all query tokens",
+            )
 
     def _get_fa_version(self, head_dim: int) -> int:
         cached = self._fa_version_by_head_dim.get(head_dim)
@@ -1322,7 +1514,7 @@ class HunyuanImage3VllmPagedKVRunner:
             ) from self._load_error
         if self.validate_inputs:
             self._validate_run_inputs(query, key, value, metadata)
-        if metadata.custom_mask is not None:
+        if metadata.custom_mask is not None and metadata.attention_split is None:
             raise ValueError("vLLM FlashAttention paged attention does not support Hunyuan custom masks")
 
         append_key = key.reshape(-1, key.shape[2], key.shape[3]).contiguous()
@@ -1352,18 +1544,22 @@ class HunyuanImage3VllmPagedKVRunner:
         else:
             cache_write_call()
 
-        out = torch.empty_like(query)
+        split = metadata.attention_split
+        paged_query = (
+            query if split is None else query.reshape(-1, query.shape[2], query.shape[3])[split.paged_query_indices]
+        )
+        out = torch.empty_like(query if split is None else paged_query)
         fa_version = self._get_fa_version(query.shape[3])
         assert self._flash_attn_varlen_func is not None
 
         def run_call() -> torch.Tensor:
             return self._flash_attn_varlen_func(
-                q=query.reshape(-1, query.shape[2], query.shape[3]).contiguous(),
+                q=paged_query.reshape(-1, paged_query.shape[-2], paged_query.shape[-1]).contiguous(),
                 k=metadata.key_cache,
                 v=metadata.value_cache,
-                out=out.reshape(-1, out.shape[2], out.shape[3]),
-                cu_seqlens_q=metadata.qo_indptr,
-                max_seqlen_q=metadata.max_qo_len,
+                out=out.reshape(-1, out.shape[-2], out.shape[-1]),
+                cu_seqlens_q=metadata.qo_indptr if split is None else split.paged_qo_indptr,
+                max_seqlen_q=metadata.max_qo_len if split is None else split.max_paged_qo_len,
                 seqused_k=metadata.seq_lens,
                 max_seqlen_k=metadata.max_kv_len,
                 softmax_scale=sm_scale,
@@ -1381,7 +1577,9 @@ class HunyuanImage3VllmPagedKVRunner:
             )
         else:
             run_call()
-        return out.reshape(query.shape)
+        if split is None:
+            return out.reshape(query.shape)
+        return out.reshape(-1, query.shape[2], query.shape[3])
 
 
 def default(value, default_value):
@@ -2084,6 +2282,91 @@ class ImageKVCacheManager:
     ) -> HunyuanImage3PagedKVAttentionMetadata:
         return self._paged_kv_cache_manager.build_attention_metadata(key, seq_len, attention_mask)
 
+    @staticmethod
+    def _dense_kv_from_paged_metadata(
+        metadata: HunyuanImage3PagedKVAttentionMetadata,
+        *,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dense_keys = []
+        dense_values = []
+        for b in range(int(metadata.seq_lens.numel())):
+            page_start = int(metadata.kv_indptr[b].item())
+            page_end = int(metadata.kv_indptr[b + 1].item())
+            page_indices = metadata.kv_indices[page_start:page_end].to(dtype=torch.int64)
+            seq_len = int(metadata.seq_lens[b].item())
+            key = metadata.key_cache[page_indices].reshape(-1, num_kv_heads, head_dim)[:seq_len]
+            value = metadata.value_cache[page_indices].reshape(-1, num_kv_heads, head_dim)[:seq_len]
+            if seq_len < metadata.max_kv_len:
+                pad_shape = (metadata.max_kv_len - seq_len, num_kv_heads, head_dim)
+                key = torch.cat([key, key.new_zeros(pad_shape)], dim=0)
+                value = torch.cat([value, value.new_zeros(pad_shape)], dim=0)
+            dense_keys.append(key)
+            dense_values.append(value)
+        return torch.stack(dense_keys, dim=0).contiguous(), torch.stack(dense_values, dim=0).contiguous()
+
+    def _run_dense_masked_query_attention(
+        self,
+        query: torch.Tensor,
+        metadata: HunyuanImage3PagedKVAttentionMetadata,
+        attention_mask: torch.Tensor,
+        *,
+        repeat_num: int,
+    ) -> torch.Tensor:
+        split = metadata.attention_split
+        assert split is not None
+        bs, _, _, head_dim = query.shape
+        dense_key, dense_value = self._dense_kv_from_paged_metadata(
+            metadata,
+            num_kv_heads=metadata.key_cache.shape[2],
+            head_dim=metadata.key_cache.shape[3],
+        )
+        dense_key = repeat_kv(dense_key, repeat_num)
+        dense_value = repeat_kv(dense_value, repeat_num)
+
+        flat_query = query.reshape(-1, query.shape[2], query.shape[3])
+        masked_query = flat_query[split.dense_query_indices].unsqueeze(1).contiguous()
+        batch_indices = torch.div(
+            split.dense_query_indices,
+            query.shape[1],
+            rounding_mode="floor",
+        ).to(dtype=torch.int64)
+        selected_key = dense_key[batch_indices]
+        selected_value = dense_value[batch_indices]
+
+        mask_parts = HunyuanImage3PagedKVCacheManager._build_compressed_boolean_attention_mask_parts(
+            attention_mask,
+            bs,
+            query.shape[1],
+            metadata.max_kv_len,
+            metadata.cached_lens,
+        )
+        assert mask_parts is not None
+        dense_mask_rows = []
+        for flat_idx in split.dense_query_indices.tolist():
+            batch_idx = flat_idx // query.shape[1]
+            query_idx = flat_idx % query.shape[1]
+            row = mask_parts[batch_idx][query_idx]
+            if row.numel() < metadata.max_kv_len:
+                row = torch.cat([row, row.new_zeros(metadata.max_kv_len - row.numel())], dim=0)
+            dense_mask_rows.append(row)
+        flat_mask = torch.stack(dense_mask_rows, dim=0).unsqueeze(1).contiguous()
+        dense_out = torch.nn.functional.scaled_dot_product_attention(
+            masked_query.permute(0, 2, 1, 3),
+            selected_key.permute(0, 2, 1, 3),
+            selected_value.permute(0, 2, 1, 3),
+            attn_mask=flat_mask.unsqueeze(1),
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.scaling,
+        ).permute(0, 2, 1, 3)
+        return dense_out.reshape(
+            -1,
+            query.shape[2],
+            head_dim,
+        )
+
     def _run_paged_prompt_kv_attention(
         self,
         query: torch.Tensor,
@@ -2123,7 +2406,7 @@ class ImageKVCacheManager:
         except Exception as e:
             self._paged_kv_fallback(f"metadata build failed: {e}")
             return None
-        if metadata.custom_mask is not None:
+        if metadata.custom_mask is not None and metadata.attention_split is None:
             self._paged_kv_fallback("vLLM paged attention does not support custom attention masks")
             return None
         runner = self._get_paged_kv_runner()
@@ -2155,6 +2438,31 @@ class ImageKVCacheManager:
                 raise RuntimeError("Hunyuan Image3 paged KV attention runner failed") from e
             logger.debug("Hunyuan Image3 paged KV attention runner failed; falling back to dense", exc_info=True)
             return None
+
+        if metadata.attention_split is not None:
+            if attention_mask is None:
+                self._paged_kv_cache_manager.record_runner_error()
+                if self._paged_kv_cache_required:
+                    raise RuntimeError("Hunyuan Image3 paged KV split attention requires an attention mask")
+                return None
+            split = metadata.attention_split
+            combined = torch.empty_like(query.reshape(-1, query.shape[2], query.shape[3]))
+            combined[split.paged_query_indices] = out.reshape(-1, out.shape[-2], out.shape[-1])
+            try:
+                dense_out = self._run_dense_masked_query_attention(
+                    query,
+                    metadata,
+                    attention_mask,
+                    repeat_num=query.shape[2] // key.shape[2],
+                )
+            except Exception as e:
+                self._paged_kv_cache_manager.record_runner_error()
+                if self._paged_kv_cache_required:
+                    raise RuntimeError("Hunyuan Image3 paged KV split dense attention failed") from e
+                logger.debug("Hunyuan Image3 paged KV split dense attention failed; falling back", exc_info=True)
+                return None
+            combined[split.dense_query_indices] = dense_out
+            out = combined.reshape(query.shape)
 
         self._paged_kv_cache_manager.record_attention_call(
             custom_mask_used=metadata.custom_mask is not None,
@@ -3268,6 +3576,9 @@ class HunyuanImage3Model(nn.Module):
             "paged_cache_expansions",
             "paged_attention_calls",
             "paged_attention_custom_mask_calls",
+            "paged_attention_split_calls",
+            "paged_attention_paged_query_tokens",
+            "paged_attention_dense_masked_query_tokens",
             "paged_attention_fallbacks",
             "paged_attention_runner_errors",
             "paged_kv_num_pages",

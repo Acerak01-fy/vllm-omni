@@ -25,6 +25,7 @@ _TRANSFORMER = _REPO_ROOT / "vllm_omni" / "diffusion" / "models" / "hunyuan_imag
 def _load_paged_kv_manager():
     wanted_names = {
         "_ceil_div",
+        "HunyuanImage3PagedKVAttentionSplit",
         "HunyuanImage3PagedKVAttentionMetadata",
         "_PagedPromptKVState",
         "HunyuanImage3PagedKVCacheManager",
@@ -47,6 +48,7 @@ def _load_paged_kv_manager():
 
 def _load_paged_kv_runner_contract():
     wanted_names = {
+        "HunyuanImage3PagedKVAttentionSplit",
         "HunyuanImage3PagedKVAttentionMetadata",
         "HunyuanImage3VllmPagedKVRunner",
     }
@@ -116,8 +118,11 @@ def _load_paged_run_harness_base():
 
     namespace = {
         "Any": object,
+        "HunyuanImage3PagedKVAttentionSplit": object,
         "HunyuanImage3PagedKVAttentionMetadata": object,
+        "AttentionMetadata": object,
         "logger": _DummyLogger(),
+        "repeat_kv": lambda tensor, repeats: tensor,
         "torch": torch,
     }
     exec(compile(ast.Module(body=[harness], type_ignores=[]), str(_TRANSFORMER), "exec"), namespace)
@@ -187,6 +192,29 @@ class _NeverCalledRunner:
         raise AssertionError("runner must not run when metadata build fails")
 
 
+class _SplitRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.last_custom_mask = None
+        self.last_split = None
+
+    def run(self, query, key, value, metadata, **kwargs):
+        del key
+        del value
+        del kwargs
+        self.calls += 1
+        self.last_custom_mask = metadata.custom_mask
+        self.last_split = metadata.attention_split
+        assert metadata.attention_split is not None
+        return torch.ones(
+            metadata.attention_split.paged_query_count,
+            query.shape[2],
+            query.shape[3],
+            dtype=query.dtype,
+            device=query.device,
+        )
+
+
 def _make_metadata_failure_harness(*, required: bool):
     base_cls = _load_paged_run_harness_base()
 
@@ -241,6 +269,59 @@ def _make_custom_mask_harness(*, required: bool):
             return _NeverCalledRunner()
 
     return Harness()
+
+
+def _make_split_mask_harness(*, required: bool):
+    base_cls = _load_paged_run_harness_base()
+    manager_cls = _load_paged_kv_manager()
+    manager = manager_cls(enabled=True, required=required, page_size=4)
+    cached_key, cached_value = _known_kv(batch_size=1, seq_len=4)
+    manager.build_prompt_state(cached_key, cached_value, torch.tensor([4], dtype=torch.long))
+    current_key = torch.zeros(1, 3, 2, 4)
+    mask = torch.ones(1, 1, 3, 7, dtype=torch.bool)
+    mask[0, 0, 0, 6] = False
+    metadata = manager.build_attention_metadata(current_key, seq_len=7, attention_mask=mask)
+    assert metadata.custom_mask is not None
+    assert metadata.attention_split is not None
+    runner = _SplitRunner()
+
+    class Harness(base_cls):
+        def __init__(self) -> None:
+            self._paged_kv_cache_required = required
+            self._paged_kv_cache_manager = manager
+            self.scaling = 1.0
+
+        def _can_use_paged_prompt_kv_attention(self, *args, **kwargs):
+            return True, ""
+
+        def _validate_current_position_ids(self, *args, **kwargs) -> None:
+            return None
+
+        def _build_paged_prompt_kv_attention_metadata(self, *args, **kwargs):
+            return metadata
+
+        def _run_dense_masked_query_attention(self, query, metadata, attention_mask, *, repeat_num):
+            del attention_mask
+            del repeat_num
+            assert metadata.attention_split is not None
+            return torch.full(
+                (
+                    metadata.attention_split.dense_query_count,
+                    query.shape[2],
+                    query.shape[3],
+                ),
+                2.0,
+                dtype=query.dtype,
+                device=query.device,
+            )
+
+        def _get_paged_kv_runner(self):
+            return runner
+
+    harness = Harness()
+    harness.runner = runner
+    harness.attention_mask = mask
+    return harness
 
 
 def test_build_prompt_state_packs_prefix_pages_and_stats():
@@ -611,6 +692,37 @@ def test_non_uniform_cached_lens_padding_only_mask_becomes_all_keep():
     assert metadata.custom_mask is None
 
 
+def test_boolean_attention_mask_builds_split_for_all_keep_query_rows():
+    manager_cls = _load_paged_kv_manager()
+    manager = manager_cls(enabled=True, required=True, page_size=4)
+    key, value = _known_kv(batch_size=2, seq_len=5)
+    manager.build_prompt_state(key, value, torch.tensor([3, 5], dtype=torch.long))
+    current_key = torch.zeros(2, 3, 2, 4)
+    mask = torch.ones(2, 1, 3, 8, dtype=torch.bool)
+    mask[0, 0, 0, 5] = False
+    mask[1, 0, 2, 7] = False
+
+    metadata = manager.build_attention_metadata(current_key, seq_len=8, attention_mask=mask)
+
+    assert metadata.custom_mask is not None
+    assert metadata.attention_split is not None
+    split = metadata.attention_split
+    assert split.paged_query_mask.tolist() == [[False, True, True], [True, True, False]]
+    assert split.paged_query_indices.tolist() == [1, 2, 3, 4]
+    assert split.dense_query_indices.tolist() == [0, 5]
+    assert split.paged_qo_indptr.tolist() == [0, 2, 4]
+    assert split.max_paged_qo_len == 2
+    assert split.paged_query_count == 4
+    assert split.dense_query_count == 2
+
+    manager.record_attention_call(custom_mask_used=True, metadata=metadata)
+    stats = manager.get_stats()
+    assert stats["paged_attention_custom_mask_calls"] == 1
+    assert stats["paged_attention_split_calls"] == 1
+    assert stats["paged_attention_paged_query_tokens"] == 4
+    assert stats["paged_attention_dense_masked_query_tokens"] == 2
+
+
 def test_non_boolean_non_all_keep_mask_is_rejected():
     manager_cls = _load_paged_kv_manager()
     manager = manager_cls(enabled=True, required=True, page_size=4)
@@ -668,8 +780,8 @@ def test_run_paged_attention_required_mode_raises_when_metadata_build_fails():
     assert harness._paged_kv_cache_manager.runner_errors == 0
 
 
-def test_run_paged_attention_falls_back_when_custom_mask_is_present():
-    harness = _make_custom_mask_harness(required=False)
+def test_run_paged_attention_splits_supported_custom_mask():
+    harness = _make_split_mask_harness(required=True)
     query = torch.zeros(1, 3, 4, 4)
     key = torch.zeros(1, 3, 2, 4)
     value = torch.zeros(1, 3, 2, 4)
@@ -680,17 +792,28 @@ def test_run_paged_attention_falls_back_when_custom_mask_is_present():
         value,
         seq_len=7,
         bs=1,
-        attention_mask=torch.ones(1, 1, 3, 7, dtype=torch.bool),
+        attention_mask=harness.attention_mask,
         full_attn_spans=None,
     )
 
-    assert result is None
-    assert harness._paged_kv_cache_manager.fallbacks == 1
-    assert harness._paged_kv_cache_manager.calls == 0
-    assert harness._paged_kv_cache_manager.runner_errors == 0
+    assert result is not None
+    assert result.shape == query.shape
+    assert result[0, 0].eq(2.0).all()
+    assert result[0, 1:].eq(1.0).all()
+    assert harness.runner.calls == 1
+    assert harness.runner.last_custom_mask is not None
+    assert harness.runner.last_split is not None
+    stats = harness._paged_kv_cache_manager.get_stats()
+    assert stats["paged_attention_calls"] == 1
+    assert stats["paged_attention_custom_mask_calls"] == 1
+    assert stats["paged_attention_split_calls"] == 1
+    assert stats["paged_attention_paged_query_tokens"] == 2
+    assert stats["paged_attention_dense_masked_query_tokens"] == 1
+    assert stats["paged_attention_fallbacks"] == 0
+    assert stats["paged_attention_runner_errors"] == 0
 
 
-def test_run_paged_attention_required_mode_raises_when_custom_mask_is_present():
+def test_run_paged_attention_required_mode_raises_when_custom_mask_has_no_paged_rows():
     harness = _make_custom_mask_harness(required=True)
     query = torch.zeros(1, 3, 4, 4)
     key = torch.zeros(1, 3, 2, 4)

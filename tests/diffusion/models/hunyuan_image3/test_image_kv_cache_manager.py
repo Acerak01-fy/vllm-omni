@@ -55,7 +55,7 @@ class FakePagedKVRunner:
 
     def run(self, query, key, value, metadata, *, sm_scale, causal, attn_mask=None):
         del causal, attn_mask
-        assert metadata.custom_mask is None
+        assert metadata.custom_mask is None or metadata.attention_split is not None
         self.calls.append((query, key, value, metadata))
         outputs = []
         for b in range(query.shape[0]):
@@ -68,7 +68,10 @@ class FakePagedKVRunner:
             dense_key = torch.cat([prefix_key, key[b]], dim=0).unsqueeze(0)
             dense_value = torch.cat([prefix_value, value[b]], dim=0).unsqueeze(0)
             outputs.append(_dense_attention(query[b : b + 1], dense_key, dense_value, sm_scale)[0])
-        return torch.stack(outputs, dim=0)
+        output = torch.stack(outputs, dim=0)
+        if metadata.attention_split is None:
+            return output
+        return output.reshape(-1, output.shape[2], output.shape[3])[metadata.attention_split.paged_query_indices]
 
 
 @contextmanager
@@ -850,7 +853,7 @@ def test_paged_update_falls_back_for_boolean_attention_mask_custom_mask():
     assert stats["paged_attention_custom_mask_calls"] == 0
 
 
-def test_paged_update_falls_back_for_non_uniform_cfg_batch_custom_mask():
+def test_paged_update_splits_non_uniform_cfg_batch_custom_mask():
     CAPTURED_ATTN_CALLS.clear()
     mgr = _make_cache_mgr()
     runner = FakePagedKVRunner()
@@ -899,15 +902,21 @@ def test_paged_update_falls_back_for_non_uniform_cfg_batch_custom_mask():
     )
 
     assert out.shape == (bs * IMAGE_TOKEN_LEN, NUM_HEADS, HEAD_DIM)
-    assert runner.calls == []
-    assert CAPTURED_ATTN_CALLS
-    _, dense_key, _, _ = CAPTURED_ATTN_CALLS[-1]
-    assert dense_key.shape[0] == bs
-    assert dense_key.shape[1] == update_seq_len
+    assert len(runner.calls) == 1
+    _, _, _, metadata = runner.calls[0]
+    assert metadata.custom_mask is not None
+    assert metadata.attention_split is not None
+    split = metadata.attention_split
+    assert split.paged_query_count == bs * IMAGE_TOKEN_LEN - 3
+    assert split.dense_query_count == 3
     stats = mgr.get_paged_kv_cache_stats()
-    assert stats["paged_attention_fallbacks"] == 1
-    assert stats["paged_attention_calls"] == 0
-    assert stats["paged_attention_custom_mask_calls"] == 0
+    assert stats["paged_attention_fallbacks"] == 0
+    assert stats["paged_attention_runner_errors"] == 0
+    assert stats["paged_attention_calls"] == 1
+    assert stats["paged_attention_custom_mask_calls"] == 1
+    assert stats["paged_attention_split_calls"] == 1
+    assert stats["paged_attention_paged_query_tokens"] == bs * IMAGE_TOKEN_LEN - 3
+    assert stats["paged_attention_dense_masked_query_tokens"] == 3
 
 
 def test_paged_update_falls_back_for_float_attention_mask():
