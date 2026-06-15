@@ -484,6 +484,23 @@ def resolve_model_class_name(model: str | None, diffusion_load_format: str = "de
     return None
 
 
+# Model classes that default to the BDE (AR-diffusion) engine.
+_BDE_ENGINE_MODEL_CLASSES = frozenset({"DreamZeroPipeline"})
+
+
+def default_engine_backend_for_model(model_class_name: str | None) -> str | None:
+    """Engine backend a model opts into by default.
+
+    Returns ``"bde"`` for AR-diffusion world models (DreamZero today) so they run
+    on the Block Diffusion Engine with engine-level KV cache management; returns
+    ``None`` to keep the base ``DiffusionEngine``. Extend
+    ``_BDE_ENGINE_MODEL_CLASSES`` as more AR-DiT models migrate onto BDE.
+    """
+    if model_class_name in _BDE_ENGINE_MODEL_CLASSES:
+        return "bde"
+    return None
+
+
 @dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
@@ -528,6 +545,14 @@ class OmniDiffusionConfig:
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None
+
+    # Engine backend selection. Resolved by ``DiffusionEngine.make_engine``
+    # (mirrors ``distributed_executor_backend`` / ``DiffusionExecutor.get_class``):
+    #   "default" -> DiffusionEngine
+    #   "bde"     -> BDEEngine (AR-diffusion engine with engine-level KV cache
+    #                management); also accepts a DiffusionEngine subclass or an
+    #                import path string.
+    engine_backend: str = "default"
 
     # HuggingFace specific parameters
     trust_remote_code: bool = False
@@ -1051,6 +1076,12 @@ class OmniDiffusionConfig:
                         self.model_class_name = "DreamZeroPipeline"
                         self.set_tf_model_config(TransformerConfig())
                         self.update_multimodal_support()
+                        # DreamZero is an AR-diffusion world model: route it to the
+                        # BDE engine (engine-level KV cache management) unless the
+                        # caller explicitly selected an engine backend.
+                        bde_default = default_engine_backend_for_model(self.model_class_name)
+                        if bde_default is not None and self.engine_backend == "default":
+                            self.engine_backend = bde_default
                     else:
                         raise
                 elif architectures and len(architectures) == 1:
