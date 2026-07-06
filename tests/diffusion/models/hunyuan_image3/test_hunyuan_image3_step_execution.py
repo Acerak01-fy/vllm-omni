@@ -8,6 +8,7 @@ import torch
 
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.models.hunyuan_image3.paged_kv import HunyuanPromptKVPagePool
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,
@@ -369,3 +370,52 @@ def test_denoise_step_uses_input_batch_group_order_and_splits_back(monkeypatch):
     assert states[1].extra[_STEP_MODEL_KWARGS]["attention_mask"].shape == (2, 1, 2, 6)
     assert states[0].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(2, 4)], [(2, 4)]]
     assert states[1].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(4, 6)], [(4, 6)]]
+
+
+def test_prompt_kv_capture_restore_preserves_paged_branch_handles():
+    pipeline = _pipeline()
+    states = [_state("req-0", 0), _state("req-1", 0)]
+    key = torch.arange(4 * 5, dtype=torch.float32).reshape(4, 5, 1, 1)
+    value = key + 100.0
+    lens = torch.tensor([3, 5, 2, 4], dtype=torch.long)
+
+    class DummyManager:
+        def __init__(self):
+            self.image_kv_cache_map = (key, value)
+            self.image_kv_cache_lens = lens
+            self.page_pool = HunyuanPromptKVPagePool(page_size=2, enabled=True, required=True)
+            self.page_batch = self.page_pool.capture_prefix(key, value, lens)
+            self.restored_lens = None
+
+        def capture_paged_prompt_kv_rows(self, row_indices, branches):
+            return self.page_batch.view_rows(row_indices, branches)
+
+        def restore_paged_prompt_kv_rows(self, row_refs):
+            self.restored_lens = [row.lens for row in row_refs]
+            self.page_pool.restore_batch(row_refs)
+
+        def clear_paged_prompt_kv_current_batch(self):
+            self.page_pool.clear_current()
+
+    mgr = DummyManager()
+    pipeline.model = SimpleNamespace(layers=[SimpleNamespace(self_attn=SimpleNamespace(image_attn=mgr))])
+    row_state_indexes = [0, 1, 0, 1]
+    row_branches = [0, 0, 1, 1]
+
+    pipeline._capture_prompt_kv_cache(states, row_state_indexes, row_branches)
+
+    req0_cache = states[0].extra[_STEP_PROMPT_KV][0]
+    req1_cache = states[1].extra[_STEP_PROMPT_KV][0]
+    assert req0_cache["lens"].tolist() == [3, 2]
+    assert req1_cache["lens"].tolist() == [5, 4]
+    assert req0_cache["paged"].select_branch(0).lens == 3
+    assert req0_cache["paged"].select_branch(1).lens == 2
+    assert req1_cache["paged"].select_branch(0).lens == 5
+    assert req1_cache["paged"].select_branch(1).lens == 4
+
+    states[0].step_index = 1
+    states[1].step_index = 1
+    pipeline._restore_prompt_kv_cache(states, row_state_indexes=[1, 0], row_branches=[1, 1])
+
+    assert mgr.restored_lens == [4, 2]
+    assert mgr.image_kv_cache_lens.tolist() == [4, 2]

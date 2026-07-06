@@ -837,21 +837,31 @@ class HunyuanImage3Pipeline(
                 mgr = layer.self_attn.image_attn
                 mgr.image_kv_cache_map = None
                 mgr.image_kv_cache_lens = None
+                if hasattr(mgr, "clear_paged_prompt_kv_current_batch"):
+                    mgr.clear_paged_prompt_kv_current_batch()
             return
 
         for layer_idx, layer in enumerate(self.model.layers):
             rows_k, rows_v, lens = [], [], []
+            paged_row_refs = []
             for state_idx, branch in zip(row_state_indexes, row_branches):
                 cache = states[state_idx].extra[_STEP_PROMPT_KV][layer_idx]
                 rows_k.append(cache["key"][branch : branch + 1])
                 rows_v.append(cache["value"][branch : branch + 1])
                 lens.append(cache["lens"][branch : branch + 1])
+                paged_rows = cache.get("paged")
+                if paged_rows is not None:
+                    paged_row_refs.append(paged_rows.select_branch(branch))
             mgr = layer.self_attn.image_attn
             mgr.image_kv_cache_map = (
                 self._pad_tensor_rows(rows_k),
                 self._pad_tensor_rows(rows_v),
             )
             mgr.image_kv_cache_lens = torch.cat(lens, dim=0).to(device=mgr.image_kv_cache_map[0].device)
+            if len(paged_row_refs) == len(row_state_indexes):
+                mgr.restore_paged_prompt_kv_rows(paged_row_refs)
+            elif hasattr(mgr, "clear_paged_prompt_kv_current_batch"):
+                mgr.clear_paged_prompt_kv_current_batch()
 
     def _capture_prompt_kv_cache(
         self,
@@ -872,13 +882,17 @@ class HunyuanImage3Pipeline(
                 ]
                 state_lens = lens[branch_rows]
                 max_len = int(state_lens.max().item())
-                by_state[state_idx].append(
-                    {
-                        "key": key[branch_rows, :max_len].detach().clone(),
-                        "value": value[branch_rows, :max_len].detach().clone(),
-                        "lens": state_lens.detach().clone(),
-                    }
-                )
+                entry = {
+                    "key": key[branch_rows, :max_len].detach().clone(),
+                    "value": value[branch_rows, :max_len].detach().clone(),
+                    "lens": state_lens.detach().clone(),
+                }
+                if hasattr(mgr, "capture_paged_prompt_kv_rows"):
+                    branches = [branch for idx, branch in zip(row_state_indexes, row_branches) if idx == state_idx]
+                    paged_rows = mgr.capture_paged_prompt_kv_rows(branch_rows, branches)
+                    if paged_rows is not None:
+                        entry["paged"] = paged_rows
+                by_state[state_idx].append(entry)
         for state_idx, cache in by_state.items():
             states[state_idx].extra[_STEP_PROMPT_KV] = cache
 
@@ -2300,11 +2314,17 @@ class HunyuanImage3Pipeline(
 
         model_inputs.update(ar_kv_kwargs)
 
+        if hasattr(self.model, "reset_paged_prompt_kv_stats"):
+            self.model.reset_paged_prompt_kv_stats()
         outputs = self._generate(**model_inputs, **kwargs)
         image = outputs[0]
         custom_output = {}
         if any(t is not None for t in cot_text_list):
             custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
+        if hasattr(self.model, "get_paged_prompt_kv_stats"):
+            custom_output["hunyuan_image3_paged_kv_cache_stats"] = self.model.get_paged_prompt_kv_stats(
+                include_layers=True,
+            )
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
         return DiffusionOutput(
             output=image,
