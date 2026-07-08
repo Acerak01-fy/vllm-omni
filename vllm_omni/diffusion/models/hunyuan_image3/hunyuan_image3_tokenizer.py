@@ -924,7 +924,7 @@ class TokenizerWrapper:
             )
             return self.batch_gen_infer(
                 infer_fn=self.apply_general_template,
-                prompt_list=[[]],
+                prompt_list=[[] for _ in message_list],
                 infer_fn_kwargs_list=[
                     dict(
                         message_list=message_list_i,

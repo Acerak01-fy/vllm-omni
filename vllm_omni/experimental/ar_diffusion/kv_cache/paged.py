@@ -60,8 +60,8 @@ def compute_slot_mapping(
     """
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
-    table = torch.as_tensor(block_ids, dtype=torch.long)
     pos = torch.as_tensor(positions, dtype=torch.long)
+    table = torch.as_tensor(block_ids, dtype=torch.long, device=pos.device)
     block_index = torch.div(pos, block_size, rounding_mode="floor")
     offset = pos % block_size
     return table[block_index] * block_size + offset

@@ -334,6 +334,15 @@ def _reference_paged_attention(
         physical_blocks = block_table[i, logical_blocks].long()
         k = key_cache[physical_blocks, offsets]
         v = value_cache[physical_blocks, offsets]
+        if q.shape[-2] != k.shape[-2]:
+            if q.shape[-2] % k.shape[-2] != 0:
+                raise ValueError(
+                    f"query heads ({q.shape[-2]}) must be divisible by KV heads ({k.shape[-2]}) "
+                    "for grouped-query paged attention."
+                )
+            repeat = q.shape[-2] // k.shape[-2]
+            k = k.repeat_interleave(repeat, dim=-2)
+            v = v.repeat_interleave(repeat, dim=-2)
         scores = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * float(softmax_scale)
         probs = torch.softmax(scores, dim=-1).to(v.dtype)
         outs.append(torch.einsum("hqk,khd->qhd", probs, v))

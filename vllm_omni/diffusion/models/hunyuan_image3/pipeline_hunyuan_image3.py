@@ -341,7 +341,7 @@ class HunyuanImage3Pipeline(
     DiffusionPipelineProfilerMixin,
 ):
     supports_step_execution: ClassVar[bool] = True
-    supports_request_batch = False
+    supports_request_batch = True
     support_image_input = True
     _dit_modules: ClassVar[list[str]] = ["model"]
     _encoder_modules: ClassVar[list[str]] = ["vision_model"]
@@ -846,20 +846,30 @@ class HunyuanImage3Pipeline(
             paged_row_refs = []
             for state_idx, branch in zip(row_state_indexes, row_branches):
                 cache = states[state_idx].extra[_STEP_PROMPT_KV][layer_idx]
-                rows_k.append(cache["key"][branch : branch + 1])
-                rows_v.append(cache["value"][branch : branch + 1])
+                if "key" in cache and "value" in cache:
+                    rows_k.append(cache["key"][branch : branch + 1])
+                    rows_v.append(cache["value"][branch : branch + 1])
                 lens.append(cache["lens"][branch : branch + 1])
                 paged_rows = cache.get("paged")
                 if paged_rows is not None:
                     paged_row_refs.append(paged_rows.select_branch(branch))
             mgr = layer.self_attn.image_attn
-            mgr.image_kv_cache_map = (
-                self._pad_tensor_rows(rows_k),
-                self._pad_tensor_rows(rows_v),
-            )
-            mgr.image_kv_cache_lens = torch.cat(lens, dim=0).to(device=mgr.image_kv_cache_map[0].device)
+            if rows_k:
+                if len(rows_k) != len(row_state_indexes):
+                    raise ValueError("Hunyuan prompt KV cache has only partial dense rows.")
+                mgr.image_kv_cache_map = (
+                    self._pad_tensor_rows(rows_k),
+                    self._pad_tensor_rows(rows_v),
+                )
+                lens_device = mgr.image_kv_cache_map[0].device
+            else:
+                mgr.image_kv_cache_map = None
+                lens_device = lens[0].device
+            mgr.image_kv_cache_lens = torch.cat(lens, dim=0).to(device=lens_device)
             if len(paged_row_refs) == len(row_state_indexes):
                 mgr.restore_paged_prompt_kv_rows(paged_row_refs)
+            elif not rows_k:
+                raise ValueError("Hunyuan prompt KV cache has no dense rows or paged rows.")
             elif hasattr(mgr, "clear_paged_prompt_kv_current_batch"):
                 mgr.clear_paged_prompt_kv_current_batch()
 
@@ -869,12 +879,16 @@ class HunyuanImage3Pipeline(
         row_state_indexes: list[int],
         row_branches: list[int],
     ) -> None:
-        by_state: dict[int, list[dict[str, torch.Tensor]]] = {i: [] for i in range(len(states))}
+        by_state: dict[int, list[dict[str, Any]]] = {i: [] for i in range(len(states))}
         for layer in self.model.layers:
             mgr = layer.self_attn.image_attn
-            if mgr.image_kv_cache_map is None or mgr.image_kv_cache_lens is None:
+            if mgr.image_kv_cache_lens is None:
                 raise ValueError("Hunyuan first step did not produce prompt KV cache.")
-            key, value = mgr.image_kv_cache_map
+            key_value = mgr.image_kv_cache_map
+            if key_value is not None:
+                key, value = key_value
+            else:
+                key = value = None
             lens = mgr.image_kv_cache_lens
             for state_idx in by_state:
                 branch_rows = [
@@ -883,8 +897,6 @@ class HunyuanImage3Pipeline(
                 state_lens = lens[branch_rows]
                 max_len = int(state_lens.max().item())
                 entry = {
-                    "key": key[branch_rows, :max_len].detach().clone(),
-                    "value": value[branch_rows, :max_len].detach().clone(),
                     "lens": state_lens.detach().clone(),
                 }
                 if hasattr(mgr, "capture_paged_prompt_kv_rows"):
@@ -892,7 +904,18 @@ class HunyuanImage3Pipeline(
                     paged_rows = mgr.capture_paged_prompt_kv_rows(branch_rows, branches)
                     if paged_rows is not None:
                         entry["paged"] = paged_rows
+                drop_dense = bool(getattr(mgr, "paged_prompt_kv_enabled", False)) and "paged" in entry
+                if not drop_dense:
+                    if key is None or value is None:
+                        raise ValueError("Hunyuan first step did not produce dense prompt KV cache.")
+                    entry["key"] = key[branch_rows, :max_len].detach().clone()
+                    entry["value"] = value[branch_rows, :max_len].detach().clone()
                 by_state[state_idx].append(entry)
+            if bool(getattr(mgr, "paged_prompt_kv_enabled", False)) and hasattr(
+                mgr, "clear_paged_prompt_kv_current_batch"
+            ):
+                mgr.image_kv_cache_map = None
+                mgr.clear_paged_prompt_kv_current_batch()
         for state_idx, cache in by_state.items():
             states[state_idx].extra[_STEP_PROMPT_KV] = cache
 
@@ -1259,7 +1282,7 @@ class HunyuanImage3Pipeline(
 
             if batch_cot_text is not None:
                 if isinstance(batch_cot_text, str):
-                    batch_cot_text = [batch_cot_text]
+                    batch_cot_text = [batch_cot_text] * batch_size
                 else:
                     assert isinstance(batch_cot_text, list) and len(batch_cot_text) == batch_size, (
                         "`cot_text` should be a string or a list of strings with the same length as `prompt`."
@@ -1267,7 +1290,7 @@ class HunyuanImage3Pipeline(
 
             if batch_system_prompt is not None:
                 if isinstance(batch_system_prompt, str):
-                    batch_system_prompt = [batch_system_prompt]
+                    batch_system_prompt = [batch_system_prompt] * batch_size
                 else:
                     assert isinstance(batch_system_prompt, list) and len(batch_system_prompt) == batch_size, (
                         "`system_prompts` should be a string or a list of strings with the same length as `prompt`."
@@ -1835,6 +1858,13 @@ class HunyuanImage3Pipeline(
         )
         return {"ar_kv_data": ar_kv_data}
 
+    def _extract_ar_kv_from_request_batch(self, req: DiffusionRequestBatch) -> dict[str, Any]:
+        if req.num_reqs == 1:
+            return self._extract_ar_kv_from_request(req)
+        if any(getattr(sampling, "past_key_values", None) is not None for sampling in req.sampling_params_list):
+            raise RuntimeError("HunyuanImage3 request batching does not yet support per-request AR KV reuse.")
+        return {}
+
     def _extract_ar_kv_from_sampling(self, sampling: Any) -> dict[str, Any]:
         kv = getattr(sampling, "past_key_values", None)
         if kv is None:
@@ -2266,8 +2296,10 @@ class HunyuanImage3Pipeline(
         guidance_scale: float = 5.0,
         generator: torch.Generator | list[torch.Generator] | None = None,
         **kwargs,
-    ) -> DiffusionOutput:
-        extra_args = getattr(getattr(req, "sampling_params", None), "extra_args", {}) or {}
+    ) -> list[DiffusionOutput]:
+        sampling_params_list = req.sampling_params_list
+        common_sampling_params = sampling_params_list[0]
+        extra_args = getattr(common_sampling_params, "extra_args", {}) or {}
         (
             prompt_from_req,
             cot_text_list,
@@ -2285,18 +2317,18 @@ class HunyuanImage3Pipeline(
             [self._normalize_cot_text(t) for t in cot_text_list] if any(t is not None for t in cot_text_list) else None
         )
 
-        generator = req.sampling_params.generator or generator
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
+        generator = req.collate_request_generators(1, generator)
+        height = common_sampling_params.height or height
+        width = common_sampling_params.width or width
+        num_inference_steps = common_sampling_params.num_inference_steps or num_inference_steps
+        if common_sampling_params.guidance_scale_provided:
+            guidance_scale = common_sampling_params.guidance_scale
         if guidance_scale <= 1.0:
             logger.info("HunyuanImage3.0 runs without classifier-free guidance when guidance_scale <= 1.0.")
         image_size = (height, width)
 
         # ---- AR KV Reuse: extract injected KV from request ----
-        ar_kv_kwargs = self._extract_ar_kv_from_request(req)
+        ar_kv_kwargs = self._extract_ar_kv_from_request_batch(req)
 
         model_inputs = self.prepare_model_inputs(
             prompt=prompt,
@@ -2315,19 +2347,30 @@ class HunyuanImage3Pipeline(
         model_inputs.update(ar_kv_kwargs)
 
         if hasattr(self.model, "reset_paged_prompt_kv_stats"):
-            self.model.reset_paged_prompt_kv_stats()
+            self.model.reset_paged_prompt_kv_stats(clear_cache=True)
         outputs = self._generate(**model_inputs, **kwargs)
-        image = outputs[0]
-        custom_output = {}
-        if any(t is not None for t in cot_text_list):
-            custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
+        paged_kv_stats = None
         if hasattr(self.model, "get_paged_prompt_kv_stats"):
-            custom_output["hunyuan_image3_paged_kv_cache_stats"] = self.model.get_paged_prompt_kv_stats(
+            paged_kv_stats = self.model.get_paged_prompt_kv_stats(
                 include_layers=True,
             )
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
-        return DiffusionOutput(
-            output=image,
-            custom_output=custom_output,
-            stage_durations=stage_durations,
-        )
+        results: list[DiffusionOutput] = []
+        for idx in range(req.num_reqs):
+            if isinstance(outputs, torch.Tensor):
+                image = outputs[idx : idx + 1]
+            else:
+                image = outputs[idx]
+            custom_output = {}
+            if idx < len(cot_text_list) and cot_text_list[idx] is not None:
+                custom_output["ar_generated_text"] = cot_text_list[idx]
+            if paged_kv_stats is not None:
+                custom_output["hunyuan_image3_paged_kv_cache_stats"] = paged_kv_stats
+            results.append(
+                DiffusionOutput(
+                    output=image,
+                    custom_output=custom_output,
+                    stage_durations=stage_durations,
+                )
+            )
+        return results

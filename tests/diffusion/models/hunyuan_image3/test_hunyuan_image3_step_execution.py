@@ -8,7 +8,11 @@ import torch
 
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
-from vllm_omni.diffusion.models.hunyuan_image3.paged_kv import HunyuanPromptKVPagePool
+from vllm_omni.diffusion.models.hunyuan_image3.paged_kv import (
+    HunyuanFlashInferPagedKVRunner,
+    HunyuanPagedAttentionInputs,
+    HunyuanPromptKVPagePool,
+)
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,
@@ -177,6 +181,42 @@ def test_forward_uses_same_hunyuan_bot_task_semantics(monkeypatch):
 
     assert captured["bot_task"] == "think"
     assert captured["system_prompt_bot_task"] == "think"
+
+
+def test_prepare_model_inputs_broadcasts_string_context_for_prompt_batch(monkeypatch):
+    pipeline = _pipeline()
+    captured: dict[str, object] = {}
+
+    class FakeTokenizer:
+        def apply_chat_template(self, **kwargs):
+            captured.update(kwargs)
+            raise RuntimeError("stop after chat template")
+
+    pipeline._tkwrapper = FakeTokenizer()
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    pipeline.config = SimpleNamespace(image_base_size=1024)
+    pipeline.generation_config = SimpleNamespace(drop_think=False, sequence_template="instruct")
+    pipeline.image_processor = SimpleNamespace(
+        build_image_info=lambda image_size: SimpleNamespace(image_size=image_size),
+    )
+
+    generators = [torch.Generator(device="cpu").manual_seed(i) for i in range(4)]
+    with pytest.raises(RuntimeError, match="stop after chat template"):
+        pipeline.prepare_model_inputs(
+            prompt=[f"prompt-{idx}" for idx in range(4)],
+            cot_text="shared cot",
+            system_prompt="shared system",
+            mode="gen_image",
+            image_size=(512, 512),
+            guidance_scale=5.0,
+            generator=generators,
+        )
+
+    assert captured["batch_system_prompt"] == ["shared system"] * 4
+    assert captured["batch_cot_text"] == ["shared cot"] * 4
+    assert len(captured["batch_prompt"]) == 4
+    assert len(captured["batch_gen_image_info"]) == 4
+    assert captured["cfg_factor"] == 2
 
 
 def test_grouped_denoise_rejects_non_sdpa_attention_backend():
@@ -387,6 +427,14 @@ def test_prompt_kv_capture_restore_preserves_paged_branch_handles():
             self.page_batch = self.page_pool.capture_prefix(key, value, lens)
             self.restored_lens = None
 
+        @property
+        def paged_prompt_kv_enabled(self):
+            return True
+
+        @property
+        def paged_prompt_kv_required(self):
+            return True
+
         def capture_paged_prompt_kv_rows(self, row_indices, branches):
             return self.page_batch.view_rows(row_indices, branches)
 
@@ -408,6 +456,9 @@ def test_prompt_kv_capture_restore_preserves_paged_branch_handles():
     req1_cache = states[1].extra[_STEP_PROMPT_KV][0]
     assert req0_cache["lens"].tolist() == [3, 2]
     assert req1_cache["lens"].tolist() == [5, 4]
+    assert "key" not in req0_cache
+    assert "value" not in req0_cache
+    assert mgr.image_kv_cache_map is None
     assert req0_cache["paged"].select_branch(0).lens == 3
     assert req0_cache["paged"].select_branch(1).lens == 2
     assert req1_cache["paged"].select_branch(0).lens == 5
@@ -418,4 +469,178 @@ def test_prompt_kv_capture_restore_preserves_paged_branch_handles():
     pipeline._restore_prompt_kv_cache(states, row_state_indexes=[1, 0], row_branches=[1, 1])
 
     assert mgr.restored_lens == [4, 2]
+    assert mgr.image_kv_cache_map is None
     assert mgr.image_kv_cache_lens.tolist() == [4, 2]
+
+
+def test_paged_prompt_kv_custom_mask_drops_dense_prefix_padding():
+    page_pool = HunyuanPromptKVPagePool(page_size=2, enabled=True, required=True)
+    key = torch.arange(2 * 5 * 2 * 3, dtype=torch.float32).reshape(2, 5, 2, 3)
+    value = key + 0.5
+    lens = torch.tensor([3, 5], dtype=torch.long)
+    batch = page_pool.capture_prefix(key, value, lens, reserve_current_tokens=2)
+    reserved_num_blocks = page_pool.get_stats()["paged_kv_num_blocks"]
+    assert reserved_num_blocks == 7
+
+    q_len = 2
+    dense_prefix_len = int(lens.max().item())
+    seq_len = dense_prefix_len + q_len
+    attention_mask = torch.ones(2, 1, q_len, seq_len, dtype=torch.bool)
+    attention_mask[0, :, :, 3:5] = False  # dense padding columns for row 0; must be dropped.
+    attention_mask[0, :, 1, 6] = False  # current-token mask; must be preserved.
+    attention_mask[1, :, :, 1] = False  # valid prefix-token mask; must be preserved.
+
+    packed = HunyuanPromptKVPagePool.build_custom_attention_mask(
+        attention_mask,
+        row_refs=batch.row_refs,
+        q_len=q_len,
+        seq_len=seq_len,
+    )
+
+    expected_row0 = torch.tensor(
+        [
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            False,
+        ],
+        dtype=torch.bool,
+    )
+    expected_row1_one_query = torch.tensor([True, False, True, True, True, True, True], dtype=torch.bool)
+    expected = torch.cat([expected_row0, expected_row1_one_query, expected_row1_one_query])
+    assert torch.equal(packed, expected)
+
+    current_key = torch.zeros(2, q_len, 2, 3)
+    inputs = page_pool._build_attention_inputs(current_key, seq_len, attention_mask)
+    assert inputs.custom_mask is not None
+    assert torch.equal(inputs.custom_mask, expected)
+    assert inputs.kv_indptr.tolist() == [0, 3, 7]
+    assert inputs.kv_last_page_len.tolist() == [1, 1]
+    assert page_pool.get_stats()["paged_kv_num_blocks"] == reserved_num_blocks
+
+
+def test_paged_prompt_kv_custom_mask_dispatches_flashinfer_runner():
+    page_pool = HunyuanPromptKVPagePool(page_size=2, enabled=True, required=True)
+    key = torch.tensor([[[[1.0]], [[2.0]], [[3.0]]]])
+    value = key + 10.0
+    page_pool.capture_prefix(key, value, torch.tensor([3], dtype=torch.long))
+
+    current_key = torch.tensor([[[[30.0]], [[31.0]]]])
+    current_value = current_key + 10.0
+    query = torch.ones(1, 2, 1, 1)
+    attention_mask = torch.ones(1, 1, 2, 5, dtype=torch.bool)
+    attention_mask[0, 0, 1, 0] = False
+
+    class FakeRunner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, query, key_cache, value_cache, inputs, *, softmax_scale):
+            self.calls.append((query, key_cache, value_cache, inputs, softmax_scale))
+            assert inputs.custom_mask is not None
+            return query + 7.0
+
+    fake_runner = FakeRunner()
+    page_pool._flashinfer_runner = fake_runner
+
+    output = page_pool.run_paged_attention(
+        query,
+        current_key,
+        current_value,
+        seq_len=5,
+        softmax_scale=1.0,
+        attention_mask=attention_mask,
+    )
+
+    torch.testing.assert_close(output, query + 7.0)
+    assert len(fake_runner.calls) == 1
+    _, key_cache, value_cache, inputs, softmax_scale = fake_runner.calls[0]
+    assert softmax_scale == 1.0
+    assert inputs.kv_indptr.tolist() == [0, 3]
+    assert inputs.kv_indices.tolist() == [0, 1, 2]
+    assert inputs.kv_last_page_len.tolist() == [1]
+    assert inputs.custom_mask.tolist() == [True, True, True, True, True, False, True, True, True, True]
+    torch.testing.assert_close(key_cache.reshape(-1, 1, 1)[3:5], current_key[0])
+    torch.testing.assert_close(value_cache.reshape(-1, 1, 1)[3:5], current_value[0])
+    stats = page_pool.get_stats()
+    assert stats["paged_attention_calls"] == 1
+    assert stats["paged_attention_custom_mask_calls"] == 1
+
+
+def test_flashinfer_runner_reuses_identical_plan_and_passes_packed_mask():
+    runner = HunyuanFlashInferPagedKVRunner()
+    runner._wrapper_cls = object
+
+    class FakeWrapper:
+        def __init__(self):
+            self.plan_calls = []
+
+        def plan(self, *args, custom_mask=None, packed_custom_mask=None, **kwargs):
+            self.plan_calls.append((args, custom_mask, packed_custom_mask, kwargs))
+
+        def run(self, query, kv_cache, *, return_lse=False):
+            return query + 3.0
+
+    fake_wrapper = FakeWrapper()
+    runner._wrapper_by_device[("cpu", None)] = fake_wrapper
+
+    query = torch.ones(1, 2, 1, 1)
+    key_cache = torch.zeros(1, 2, 1, 1)
+    value_cache = torch.zeros_like(key_cache)
+    custom_mask = torch.ones(4, dtype=torch.bool)
+    packed_custom_mask = torch.tensor([0xFF], dtype=torch.uint8)
+    inputs = HunyuanPagedAttentionInputs(
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([2], dtype=torch.int32),
+        kv_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        kv_indices=torch.tensor([0], dtype=torch.int32),
+        kv_last_page_len=torch.tensor([2], dtype=torch.int32),
+        custom_mask=custom_mask,
+        packed_custom_mask=packed_custom_mask,
+        plan_cache_key=("unit", 1),
+        max_query_len=2,
+        max_seq_len=2,
+        prefix_blocks=1,
+        current_blocks=0,
+    )
+    stats = {"paged_profile_flashinfer_plan_cache_hits": 0}
+
+    torch.testing.assert_close(
+        runner.run(query, key_cache, value_cache, inputs, softmax_scale=1.0, profile_stats=stats),
+        query + 3.0,
+    )
+    torch.testing.assert_close(
+        runner.run(query, key_cache, value_cache, inputs, softmax_scale=1.0, profile_stats=stats),
+        query + 3.0,
+    )
+
+    assert len(fake_wrapper.plan_calls) == 1
+    _, planned_custom_mask, planned_packed_mask, _ = fake_wrapper.plan_calls[0]
+    assert planned_custom_mask is None
+    assert planned_packed_mask is packed_custom_mask
+    assert stats["paged_profile_flashinfer_plan_cache_hits"] == 1
+
+
+def test_paged_prompt_kv_reset_stats_can_clear_prefix_cursor_without_freeing_capacity():
+    page_pool = HunyuanPromptKVPagePool(page_size=2, enabled=True, required=True)
+    key = torch.arange(5, dtype=torch.float32).reshape(1, 5, 1, 1)
+    page_pool.capture_prefix(key, key, torch.tensor([5], dtype=torch.long), reserve_current_tokens=2)
+    before = page_pool.get_stats()
+    assert before["paged_cache_builds"] == 1
+    assert before["paged_kv_persistent_blocks"] == 3
+    assert before["paged_kv_num_blocks"] == 4
+
+    page_pool.reset_stats(clear_cache=True)
+
+    after = page_pool.get_stats()
+    assert after["paged_cache_builds"] == 0
+    assert after["paged_kv_cache_active"] is False
+    assert after["paged_kv_persistent_blocks"] == 0
+    assert after["paged_kv_num_blocks"] == before["paged_kv_num_blocks"]

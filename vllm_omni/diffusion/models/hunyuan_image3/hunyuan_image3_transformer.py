@@ -988,14 +988,17 @@ class ImageKVCacheManager:
     def paged_prompt_kv_required(self) -> bool:
         return self._paged_prompt_kv.required
 
-    def get_paged_prompt_kv_stats(self) -> dict[str, int | bool]:
+    def get_paged_prompt_kv_stats(self) -> dict[str, Any]:
         return self._paged_prompt_kv.get_stats()
 
-    def reset_paged_prompt_kv_stats(self) -> None:
-        self._paged_prompt_kv.reset_stats()
+    def reset_paged_prompt_kv_stats(self, *, clear_cache: bool = False) -> None:
+        self._paged_prompt_kv.reset_stats(clear_cache=clear_cache)
 
     def clear_paged_prompt_kv_current_batch(self) -> None:
         self._paged_prompt_kv.clear_current()
+
+    def clear_paged_prompt_kv_cache(self) -> None:
+        self._paged_prompt_kv.clear_cache()
 
     def capture_paged_prompt_kv_rows(
         self,
@@ -1020,16 +1023,15 @@ class ImageKVCacheManager:
         )
         return gen_timestep_scatter_index[:, -1].to(dtype=torch.long) + ar_kv_len
 
-    def _cache_prompt_kv(
+    def _prepare_prompt_kv(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
         seq_len: int,
         shard_image_size: int | None = None,
         gen_timestep_scatter_index: torch.Tensor | None = None,
-        cache_repeat_num: int = 1,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Cache prompt KV on first_step. Consumes _injected_ar_kv.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare first-step prompt KV metadata. Consumes _injected_ar_kv.
 
         _injected_ar_kv is a per-batch list: [(k,v)] for bs=1,
         [(pos_k,pos_v), (neg_k,neg_v)] for bs=2 CFG.
@@ -1067,34 +1069,67 @@ class ImageKVCacheManager:
                 f"cached_prompt_lens({cached_prompt_lens.tolist()}) != "
                 f"seq_len({seq_len}) - shard_image_size({shard_image_size})"
             )
+        if self._paged_prompt_kv.enabled and shard_image_size is not None:
+            self._paged_prompt_kv.record_error()
+            raise RuntimeError("Hunyuan Image3 paged KV cache does not support sequence parallel.")
 
-        max_cached_prompt_len = int(cached_prompt_lens.max().item())
-        cached_key = key.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
-        cached_value = value.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
-        for b in range(bs):
-            cached_prompt_len = int(cached_prompt_lens[b].item())
-            cached_key[b, :cached_prompt_len] = key[b, :cached_prompt_len]
-            cached_value[b, :cached_prompt_len] = value[b, :cached_prompt_len]
-        self.image_kv_cache_map = (cached_key, cached_value)
+        return key, value, cached_prompt_lens
+
+    def _store_prompt_kv(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cached_prompt_lens: torch.Tensor,
+    ) -> None:
+        bs, _, num_kv_heads, head_dim = key.shape
+
         self.image_kv_cache_lens = cached_prompt_lens
         self._paged_prompt_kv.clear_current()
-        if self._paged_prompt_kv.enabled and shard_image_size is None:
+        if self._paged_prompt_kv.enabled:
             try:
-                paged_key = repeat_kv(cached_key, cache_repeat_num)
-                paged_value = repeat_kv(cached_value, cache_repeat_num)
-                self._paged_prompt_kv.capture_prefix(paged_key, paged_value, cached_prompt_lens)
+                self._paged_prompt_kv.capture_prefix(
+                    key,
+                    value,
+                    cached_prompt_lens,
+                    reserve_current_tokens=int(self.image_token_len or 0),
+                )
+                self.image_kv_cache_map = None
             except Exception:
                 self._paged_prompt_kv.record_error()
-                if self._paged_prompt_kv.required:
-                    raise
-                logger.debug("Hunyuan Image3 paged prompt KV cache build failed; using dense fallback.", exc_info=True)
+                raise
+        else:
+            max_cached_prompt_len = int(cached_prompt_lens.max().item())
+            cached_key = key.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
+            cached_value = value.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
+            for b in range(bs):
+                cached_prompt_len = int(cached_prompt_lens[b].item())
+                cached_key[b, :cached_prompt_len] = key[b, :cached_prompt_len]
+                cached_value[b, :cached_prompt_len] = value[b, :cached_prompt_len]
+            self.image_kv_cache_map = (cached_key, cached_value)
+
+    def _cache_prompt_kv(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        seq_len: int,
+        shard_image_size: int | None = None,
+        gen_timestep_scatter_index: torch.Tensor | None = None,
+        cache_repeat_num: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del cache_repeat_num
+        key, value, cached_prompt_lens = self._prepare_prompt_kv(
+            key,
+            value,
+            seq_len,
+            shard_image_size,
+            gen_timestep_scatter_index,
+        )
+        self._store_prompt_kv(key, value, cached_prompt_lens)
         return key, value
 
-    def _paged_prompt_kv_fallback(self, reason: str) -> None:
-        self._paged_prompt_kv.record_fallback()
-        if self._paged_prompt_kv.required:
-            raise RuntimeError(f"Hunyuan Image3 paged KV cache is required but cannot run: {reason}")
-        logger.debug("Hunyuan Image3 paged KV cache fallback: %s", reason)
+    @staticmethod
+    def _paged_prompt_kv_error(reason: str) -> RuntimeError:
+        return RuntimeError(f"Hunyuan Image3 paged KV cache cannot run: {reason}")
 
     def _run_paged_prompt_kv_attention(
         self,
@@ -1111,48 +1146,75 @@ class ImageKVCacheManager:
         if not self._paged_prompt_kv.enabled:
             return None
         if self.sp_size > 1:
-            self._paged_prompt_kv_fallback("sequence parallel is unsupported")
-            return None
+            raise self._paged_prompt_kv_error("sequence parallel is unsupported")
         if self._paged_prompt_kv.current_batch is None or self.image_kv_cache_lens is None:
-            self._paged_prompt_kv_fallback("missing paged prompt KV state")
-            return None
+            raise self._paged_prompt_kv_error("missing paged prompt KV state")
         mask_all_keep = HunyuanPromptKVPagePool.attention_mask_is_all_keep(attention_mask)
-        if not mask_all_keep:
-            self._paged_prompt_kv_fallback("custom attention masks are not supported by the AR paged attention path")
-            return None
+        if not mask_all_keep and attention_mask is not None and attention_mask.dtype != torch.bool:
+            raise self._paged_prompt_kv_error("non-boolean custom attention masks are unsupported")
         if full_attn_spans is not None and attention_mask is None and any(full_attn_spans):
-            self._paged_prompt_kv_fallback("full_attn_spans require an explicit all-keep attention mask")
-            return None
+            raise self._paged_prompt_kv_error("full_attn_spans require an explicit all-keep attention mask")
 
         q_len = key.shape[1]
         max_cached_prompt_len = int(self.image_kv_cache_lens.max().item())
         if max_cached_prompt_len + q_len != seq_len:
-            self._paged_prompt_kv_fallback("seq_len does not match cached prefix plus current length")
-            return None
+            raise self._paged_prompt_kv_error("seq_len does not match cached prefix plus current length")
         if position_ids is not None:
             if position_ids.shape != (bs, q_len):
-                self._paged_prompt_kv_fallback("position_ids shape does not match current image KV")
-                return None
+                raise self._paged_prompt_kv_error("position_ids shape does not match current image KV")
             if not torch.all(position_ids[:, 0] == self.image_kv_cache_lens.to(position_ids.device)):
-                self._paged_prompt_kv_fallback("current positions do not immediately follow cached prompt KV")
-                return None
+                raise self._paged_prompt_kv_error("current positions do not immediately follow cached prompt KV")
 
         try:
-            paged_key = repeat_kv(key, repeat_num)
-            paged_value = repeat_kv(value, repeat_num)
             return self._paged_prompt_kv.run_paged_attention(
                 query,
-                paged_key,
-                paged_value,
+                key,
+                value,
                 seq_len=seq_len,
                 softmax_scale=self.scaling,
+                attention_mask=attention_mask,
             )
         except Exception:
             self._paged_prompt_kv.record_error()
-            if self._paged_prompt_kv.required:
-                raise
-            logger.debug("Hunyuan Image3 paged KV attention failed; using dense fallback.", exc_info=True)
+            raise
+
+    def _run_first_step_paged_prompt_kv_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cached_prompt_lens: torch.Tensor,
+        seq_len: int,
+        attention_mask: torch.Tensor | None,
+        full_attn_spans: list[list[tuple[int, int]]] | None,
+    ) -> torch.Tensor | None:
+        if not self._paged_prompt_kv.enabled:
             return None
+        if self.sp_size > 1:
+            raise self._paged_prompt_kv_error("sequence parallel is unsupported")
+        mask_all_keep = HunyuanPromptKVPagePool.attention_mask_is_all_keep(attention_mask)
+        if not mask_all_keep and attention_mask is not None and attention_mask.dtype != torch.bool:
+            raise self._paged_prompt_kv_error("non-boolean custom attention masks are unsupported")
+        if full_attn_spans is not None and attention_mask is None and any(full_attn_spans):
+            raise self._paged_prompt_kv_error("full_attn_spans require an explicit attention mask")
+        if key.shape[1] != seq_len:
+            raise self._paged_prompt_kv_error("first-step seq_len does not match prepared KV length")
+
+        self.image_kv_cache_lens = cached_prompt_lens
+        self.image_kv_cache_map = None
+        try:
+            return self._paged_prompt_kv.run_first_step_paged_attention(
+                query,
+                key,
+                value,
+                cached_prompt_lens,
+                seq_len=seq_len,
+                softmax_scale=self.scaling,
+                attention_mask=attention_mask,
+            )
+        except Exception:
+            self._paged_prompt_kv.record_error()
+            raise
 
     def _reuse_prompt_kv(
         self,
@@ -1169,6 +1231,8 @@ class ImageKVCacheManager:
         Non-SP: concatenates cached prompt KV with current image KV.
         SP: returns cached prompt KV only (used as joint_text).
         """
+        if self.image_kv_cache_map is None:
+            raise RuntimeError("Hunyuan dense prompt KV cache is not available.")
         cached_key, cached_value = self.image_kv_cache_map
         _, q_len, _, _ = key.shape
         assert cached_key.dim() == 4 and cached_key.shape[0] == bs
@@ -1250,6 +1314,8 @@ class ImageKVCacheManager:
         key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
         value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
 
+        deferred_prompt_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+
         if uncond_cfg_prefill:
             key, value = self._build_neg_ar_kv(key, value, seq_len)
             if self.sp_size > 1:
@@ -1263,14 +1329,25 @@ class ImageKVCacheManager:
             self.image_kv_cache_map = None  # reset first
             self.image_kv_cache_lens = None
             self._paged_prompt_kv.clear_current()
-            key, value = self._cache_prompt_kv(
+            key, value, cached_prompt_lens = self._prepare_prompt_kv(
                 key,
                 value,
                 seq_len,
                 shard_image_size,
                 kwargs.get("gen_timestep_scatter_index"),
-                cache_repeat_num=repeat_num,
             )
+            paged_attn_output = self._run_first_step_paged_prompt_kv_attention(
+                query,
+                key,
+                value,
+                cached_prompt_lens,
+                seq_len,
+                attention_mask,
+                full_attn_spans,
+            )
+            if paged_attn_output is not None:
+                return paged_attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+            deferred_prompt_cache = (key, value, cached_prompt_lens)
             if self.sp_size > 1:
                 local_prompt_len = seq_len - shard_image_size
                 join_query_len = query.shape[1] - shard_image_size
@@ -1325,6 +1402,9 @@ class ImageKVCacheManager:
             )
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+        if deferred_prompt_cache is not None:
+            cache_key, cache_value, cached_prompt_lens = deferred_prompt_cache
+            self._store_prompt_kv(cache_key, cache_value, cached_prompt_lens)
         return attn_output
 
 
@@ -2215,11 +2295,11 @@ class HunyuanImage3Model(nn.Module):
         self.unifiled_cat = UnifiledCat()
         self.post_processor = HunyuanImagePostprocessor()
 
-    def reset_paged_prompt_kv_stats(self) -> None:
+    def reset_paged_prompt_kv_stats(self, *, clear_cache: bool = False) -> None:
         for layer in self.layers:
             mgr = getattr(getattr(layer, "self_attn", None), "image_attn", None)
             if mgr is not None and hasattr(mgr, "reset_paged_prompt_kv_stats"):
-                mgr.reset_paged_prompt_kv_stats()
+                mgr.reset_paged_prompt_kv_stats(clear_cache=clear_cache)
 
     def get_paged_prompt_kv_stats(self, *, include_layers: bool = False) -> dict[str, Any]:
         layer_stats = []
@@ -2240,7 +2320,7 @@ class HunyuanImage3Model(nn.Module):
         for key in (
             "paged_cache_builds",
             "paged_attention_calls",
-            "paged_attention_fallbacks",
+            "paged_attention_custom_mask_calls",
             "paged_attention_errors",
             "paged_prefix_blocks",
             "paged_current_blocks",

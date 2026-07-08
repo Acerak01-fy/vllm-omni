@@ -34,6 +34,14 @@ def test_slot_mapping_matches_block_offsets():
     assert slots.tolist() == [20, 21, 8, 9, 36, 37]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for device placement coverage.")
+def test_slot_mapping_follows_position_device_on_cuda():
+    positions = torch.tensor([0, 1, 4, 5, 8, 9], device="cuda")
+    slots = compute_slot_mapping([5, 2, 9], positions, block_size=4)
+    assert slots.device == positions.device
+    assert slots.cpu().tolist() == [20, 21, 8, 9, 36, 37]
+
+
 def test_slot_mapping_rejects_bad_block_size():
     with pytest.raises(ValueError):
         compute_slot_mapping([1], [0], block_size=0)

@@ -202,9 +202,11 @@ def test_no_ar_kv(bs):
 
 
 def test_paged_prompt_kv_attention_matches_dense_concat(monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_HY3_PAGED_KV_CACHE", "required")
+    monkeypatch.setenv("VLLM_OMNI_HY3_PAGED_KV_CACHE", "1")
     monkeypatch.setenv("VLLM_OMNI_HY3_PAGED_KV_CACHE_PAGE_SIZE", "2")
     mgr = _make_cache_mgr()
+    assert mgr.paged_prompt_kv_enabled
+    assert not mgr.paged_prompt_kv_required
 
     bs = 2
     prompt_len = 4
@@ -222,6 +224,7 @@ def test_paged_prompt_kv_attention_matches_dense_concat(monkeypatch):
         cache_repeat_num=repeat_num,
     )
     assert mgr.get_paged_prompt_kv_stats()["paged_cache_builds"] == 1
+    assert mgr.image_kv_cache_map is None
 
     img_q_len = IMAGE_TOKEN_LEN
     query = torch.randn(bs, img_q_len, NUM_HEADS, HEAD_DIM)
@@ -242,8 +245,14 @@ def test_paged_prompt_kv_attention_matches_dense_concat(monkeypatch):
         position_ids=torch.arange(prompt_len, prompt_len + img_q_len).repeat(bs, 1),
     )
 
-    cached_key, cached_value = mgr.image_kv_cache_map
-    expected_key = torch.cat([_repeat_kv_local(cached_key, repeat_num), _repeat_kv_local(key_input, repeat_num)], dim=1)
+    page_batch = mgr._paged_prompt_kv.current_batch
+    assert page_batch is not None
+    cached_key, cached_value, _ = mgr._paged_prompt_kv.materialize_rows(page_batch.row_refs)
+    assert cached_key.shape[2] == NUM_KV_HEADS
+    expected_key = torch.cat(
+        [_repeat_kv_local(cached_key, repeat_num), _repeat_kv_local(key_input, repeat_num)],
+        dim=1,
+    )
     expected_value = torch.cat(
         [_repeat_kv_local(cached_value, repeat_num), _repeat_kv_local(value_input, repeat_num)],
         dim=1,
@@ -253,6 +262,154 @@ def test_paged_prompt_kv_attention_matches_dense_concat(monkeypatch):
     assert output is not None
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
     assert mgr.get_paged_prompt_kv_stats()["paged_attention_calls"] == 1
+
+
+def test_first_step_paged_attention_matches_dense_with_ar_prefix(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_HY3_PAGED_KV_CACHE", "1")
+    monkeypatch.setenv("VLLM_OMNI_HY3_PAGED_KV_CACHE_PAGE_SIZE", "2")
+    mgr = _make_cache_mgr()
+
+    bs = 1
+    ar_len = 3
+    prompt_len = 2
+    q_len = prompt_len + IMAGE_TOKEN_LEN + SUFFIX_TOKEN_LEN
+    seq_len = ar_len + q_len
+    repeat_num = NUM_HEADS // NUM_KV_HEADS
+
+    ar_k, ar_v = _make_known_kv(ar_len, base=100.0)
+    mgr._injected_ar_kv = [(ar_k.clone(), ar_v.clone())]
+    k_flat, v_flat = _make_known_kv(q_len, base=1.0)
+    query = torch.randn(bs * q_len, NUM_HEADS, HEAD_DIM)
+    attention_mask = torch.ones(bs, 1, q_len, seq_len, dtype=torch.bool)
+
+    output = mgr(
+        query,
+        k_flat,
+        v_flat,
+        attention_mask,
+        query_lens=[q_len],
+        seq_lens=[seq_len],
+        first_step=True,
+        num_image_tokens=IMAGE_TOKEN_LEN,
+        gen_timestep_scatter_index=_gen_timestep_index(bs, prompt_len),
+    )
+
+    full_key = torch.cat(
+        [ar_k.reshape(1, ar_len, NUM_KV_HEADS, HEAD_DIM), k_flat.reshape(1, q_len, NUM_KV_HEADS, HEAD_DIM)],
+        dim=1,
+    )
+    full_value = torch.cat(
+        [ar_v.reshape(1, ar_len, NUM_KV_HEADS, HEAD_DIM), v_flat.reshape(1, q_len, NUM_KV_HEADS, HEAD_DIM)],
+        dim=1,
+    )
+    expected = _dense_attention(
+        query.reshape(bs, q_len, NUM_HEADS, HEAD_DIM),
+        _repeat_kv_local(full_key, repeat_num),
+        _repeat_kv_local(full_value, repeat_num),
+    )
+
+    torch.testing.assert_close(output.reshape(bs, q_len, NUM_HEADS, HEAD_DIM), expected, rtol=1e-5, atol=1e-5)
+    assert mgr.image_kv_cache_map is None
+    assert torch.equal(mgr.image_kv_cache_lens, torch.tensor([ar_len + prompt_len]))
+    page_batch = mgr._paged_prompt_kv.current_batch
+    assert page_batch is not None
+    cached_key, cached_value, lens = mgr._paged_prompt_kv.materialize_rows(page_batch.row_refs)
+    assert torch.equal(lens, torch.tensor([ar_len + prompt_len]))
+    torch.testing.assert_close(cached_key[0, :ar_len], ar_k)
+    torch.testing.assert_close(cached_value[0, ar_len : ar_len + prompt_len], v_flat[:prompt_len])
+    stats = mgr.get_paged_prompt_kv_stats()
+    assert stats["paged_cache_builds"] == 1
+    assert stats["paged_attention_calls"] == 1
+
+
+def test_first_step_paged_attention_dispatches_boolean_custom_mask(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_HY3_PAGED_KV_CACHE", "1")
+    monkeypatch.setenv("VLLM_OMNI_HY3_PAGED_KV_CACHE_PAGE_SIZE", "2")
+    mgr = _make_cache_mgr()
+
+    captured = {}
+
+    class FakeRunner:
+        def run(self, query, key_cache, value_cache, inputs, *, softmax_scale):
+            captured["custom_mask"] = inputs.custom_mask
+            captured["block_table_shape"] = tuple(inputs.block_table.shape)
+            captured["seq_lens"] = inputs.seq_lens.clone()
+            return query + 1
+
+    mgr._paged_prompt_kv._flashinfer_runner = FakeRunner()
+
+    bs = 1
+    prompt_len = 3
+    q_len = prompt_len + IMAGE_TOKEN_LEN + SUFFIX_TOKEN_LEN
+    seq_len = q_len
+    k_flat, v_flat = _make_known_kv(q_len, base=1.0)
+    query = torch.randn(bs * q_len, NUM_HEADS, HEAD_DIM)
+    attention_mask = torch.ones(bs, 1, q_len, seq_len, dtype=torch.bool)
+    attention_mask[0, 0, 0, 0] = False
+
+    output = mgr(
+        query,
+        k_flat,
+        v_flat,
+        attention_mask,
+        query_lens=[q_len],
+        seq_lens=[seq_len],
+        first_step=True,
+        num_image_tokens=IMAGE_TOKEN_LEN,
+        gen_timestep_scatter_index=_gen_timestep_index(bs, prompt_len),
+        full_attn_spans=[[(prompt_len, prompt_len + IMAGE_TOKEN_LEN)]],
+    )
+
+    torch.testing.assert_close(output.reshape(bs, q_len, NUM_HEADS, HEAD_DIM), query.reshape(bs, q_len, NUM_HEADS, HEAD_DIM) + 1)
+    assert captured["custom_mask"] is not None
+    assert captured["custom_mask"].numel() == q_len * seq_len
+    assert not bool(captured["custom_mask"][0].item())
+    assert captured["block_table_shape"][0] == bs
+    assert torch.equal(captured["seq_lens"], torch.tensor([seq_len], dtype=torch.int32))
+    assert mgr.image_kv_cache_map is None
+    stats = mgr.get_paged_prompt_kv_stats()
+    assert stats["paged_cache_builds"] == 1
+    assert stats["paged_attention_calls"] == 1
+    assert stats["paged_attention_custom_mask_calls"] == 1
+
+
+def test_paged_prompt_kv_unsupported_mask_raises_without_dense_fallback(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_HY3_PAGED_KV_CACHE", "1")
+    monkeypatch.setenv("VLLM_OMNI_HY3_PAGED_KV_CACHE_PAGE_SIZE", "2")
+    mgr = _make_cache_mgr()
+
+    bs = 1
+    prompt_len = 4
+    q_len = prompt_len + IMAGE_TOKEN_LEN + SUFFIX_TOKEN_LEN
+    repeat_num = NUM_HEADS // NUM_KV_HEADS
+    k_flat, v_flat = _make_known_kv(bs * q_len, base=1.0)
+
+    mgr._cache_prompt_kv(
+        k_flat.reshape(bs, q_len, NUM_KV_HEADS, HEAD_DIM),
+        v_flat.reshape(bs, q_len, NUM_KV_HEADS, HEAD_DIM),
+        q_len,
+        gen_timestep_scatter_index=_gen_timestep_index(bs, prompt_len),
+        cache_repeat_num=repeat_num,
+    )
+    assert mgr.image_kv_cache_map is None
+
+    img_q_len = IMAGE_TOKEN_LEN
+    new_img_k, new_img_v = _make_known_kv(bs * img_q_len, base=50.0)
+    attention_mask = torch.zeros(bs, 1, img_q_len, prompt_len + img_q_len)
+    attention_mask[:, :, :, 0] = float("-inf")
+
+    with pytest.raises(RuntimeError, match="non-boolean custom attention masks"):
+        mgr._run_paged_prompt_kv_attention(
+            torch.randn(bs, img_q_len, NUM_HEADS, HEAD_DIM),
+            new_img_k.reshape(bs, img_q_len, NUM_KV_HEADS, HEAD_DIM),
+            new_img_v.reshape(bs, img_q_len, NUM_KV_HEADS, HEAD_DIM),
+            prompt_len + img_q_len,
+            bs,
+            repeat_num,
+            attention_mask=attention_mask,
+            full_attn_spans=[[(prompt_len, prompt_len + img_q_len)]],
+            position_ids=torch.arange(prompt_len, prompt_len + img_q_len).reshape(bs, img_q_len),
+        )
 
 
 # ============================================================
