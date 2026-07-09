@@ -249,6 +249,7 @@ datasets/
 # Output files
 outputs/
 results/
+profile_runs/
 generated/
 output_*/
 

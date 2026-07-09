@@ -19,6 +19,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ar_diffusion_paged_attention,
 )
+from vllm_omni.profiler import profile_range
 
 _HY3_PAGED_KV_CACHE_ENV = "VLLM_OMNI_HY3_PAGED_KV_CACHE"
 _HY3_PAGED_KV_PAGE_SIZE_ENV = "VLLM_OMNI_HY3_PAGED_KV_CACHE_PAGE_SIZE"
@@ -47,9 +48,7 @@ def _load_reshape_and_cache_flash() -> Any:
         from vllm import _custom_ops as vllm_custom_ops
     except Exception as exc:
         _RESHAPE_AND_CACHE_FLASH_LOAD_ERROR = exc
-        raise RuntimeError(
-            "vLLM reshape_and_cache_flash is unavailable for Hunyuan Image3 paged KV writes."
-        ) from exc
+        raise RuntimeError("vLLM reshape_and_cache_flash is unavailable for Hunyuan Image3 paged KV writes.") from exc
     _RESHAPE_AND_CACHE_FLASH = vllm_custom_ops.reshape_and_cache_flash
     return _RESHAPE_AND_CACHE_FLASH
 
@@ -66,9 +65,7 @@ def _load_flashinfer_segment_packbits() -> Any:
         from flashinfer.quantization import segment_packbits
     except Exception as exc:
         _FLASHINFER_SEGMENT_PACKBITS_LOAD_ERROR = exc
-        raise RuntimeError(
-            "FlashInfer segment_packbits is unavailable for Hunyuan Image3 custom masks."
-        ) from exc
+        raise RuntimeError("FlashInfer segment_packbits is unavailable for Hunyuan Image3 custom masks.") from exc
     _FLASHINFER_SEGMENT_PACKBITS = segment_packbits
     return _FLASHINFER_SEGMENT_PACKBITS
 
@@ -134,7 +131,7 @@ def _profile_start(tensor: torch.Tensor) -> float | None:
     if not is_hunyuan_image3_paged_kv_profile_enabled():
         return None
     if tensor.is_cuda:
-        torch.cuda.synchronize(tensor.device)
+        torch.accelerator.synchronize(tensor.device)
     return time.perf_counter()
 
 
@@ -147,7 +144,7 @@ def _profile_finish(
     if start is None or stats is None:
         return
     if tensor.is_cuda:
-        torch.cuda.synchronize(tensor.device)
+        torch.accelerator.synchronize(tensor.device)
     stats[key] = float(stats.get(key, 0.0)) + (time.perf_counter() - start) * 1000.0
     stats["paged_profile_syncs"] = int(stats.get("paged_profile_syncs", 0)) + 1
 
@@ -300,38 +297,40 @@ class HunyuanFlashInferPagedKVRunner:
         plan_cache_key = self._runtime_plan_cache_key(query, key_cache, inputs, softmax_scale=softmax_scale)
         if plan_cache_key is not None and self._plan_key_by_device.get(device_key) == plan_cache_key:
             if profile_stats is not None:
-                profile_stats["paged_profile_flashinfer_plan_cache_hits"] = int(
-                    profile_stats.get("paged_profile_flashinfer_plan_cache_hits", 0)
-                ) + 1
+                profile_stats["paged_profile_flashinfer_plan_cache_hits"] = (
+                    int(profile_stats.get("paged_profile_flashinfer_plan_cache_hits", 0)) + 1
+                )
         else:
             profile_start = _profile_start(query)
-            wrapper.plan(
-                inputs.query_start_loc,
-                inputs.kv_indptr,
-                inputs.kv_indices,
-                inputs.kv_last_page_len,
-                query.shape[2],
-                key_cache.shape[2],
-                query.shape[3],
-                key_cache.shape[1],
-                custom_mask=None if inputs.packed_custom_mask is not None else inputs.custom_mask,
-                packed_custom_mask=inputs.packed_custom_mask,
-                causal=False,
-                sm_scale=float(softmax_scale),
-                q_data_type=query.dtype,
-                kv_data_type=key_cache.dtype,
-            )
+            with profile_range("hy3.paged_kv.flashinfer.plan"):
+                wrapper.plan(
+                    inputs.query_start_loc,
+                    inputs.kv_indptr,
+                    inputs.kv_indices,
+                    inputs.kv_last_page_len,
+                    query.shape[2],
+                    key_cache.shape[2],
+                    query.shape[3],
+                    key_cache.shape[1],
+                    custom_mask=None if inputs.packed_custom_mask is not None else inputs.custom_mask,
+                    packed_custom_mask=inputs.packed_custom_mask,
+                    causal=False,
+                    sm_scale=float(softmax_scale),
+                    q_data_type=query.dtype,
+                    kv_data_type=key_cache.dtype,
+                )
             _profile_finish(profile_stats, "paged_profile_flashinfer_plan_ms", profile_start, query)
             if plan_cache_key is not None:
                 self._plan_key_by_device[device_key] = plan_cache_key
             else:
                 self._plan_key_by_device.pop(device_key, None)
         profile_start = _profile_start(query)
-        out = wrapper.run(
-            query.reshape(-1, query.shape[2], query.shape[3]).contiguous(),
-            (key_cache, value_cache),
-            return_lse=False,
-        )
+        with profile_range("hy3.paged_kv.flashinfer.run"):
+            out = wrapper.run(
+                query.reshape(-1, query.shape[2], query.shape[3]).contiguous(),
+                (key_cache, value_cache),
+                return_lse=False,
+            )
         _profile_finish(profile_stats, "paged_profile_flashinfer_run_ms", profile_start, query)
         return out.reshape(query.shape)
 
@@ -488,23 +487,25 @@ class HunyuanPromptKVPagePool:
             try:
                 reshape_and_cache_flash = _load_reshape_and_cache_flash()
                 scale = self._cache_scale_tensor()
-                reshape_and_cache_flash(
-                    key.contiguous(),
-                    value.contiguous(),
-                    self._kv_pool[0],
-                    self._kv_pool[1],
-                    slot_mapping,
-                    "auto",
-                    scale,
-                    scale,
-                )
+                with profile_range("hy3.paged_kv.write_slots.flash"):
+                    reshape_and_cache_flash(
+                        key.contiguous(),
+                        value.contiguous(),
+                        self._kv_pool[0],
+                        self._kv_pool[1],
+                        slot_mapping,
+                        "auto",
+                        scale,
+                        scale,
+                    )
             finally:
                 _profile_finish(self.stats, "paged_profile_page_write_ms", profile_start, key)
             return
 
         try:
-            self._k_pool[slot_mapping] = key.to(dtype=self._k_pool.dtype)
-            self._v_pool[slot_mapping] = value.to(dtype=self._v_pool.dtype)
+            with profile_range("hy3.paged_kv.write_slots.torch"):
+                self._k_pool[slot_mapping] = key.to(dtype=self._k_pool.dtype)
+                self._v_pool[slot_mapping] = value.to(dtype=self._v_pool.dtype)
         finally:
             _profile_finish(self.stats, "paged_profile_page_write_ms", profile_start, key)
 
@@ -519,49 +520,50 @@ class HunyuanPromptKVPagePool:
         *,
         reserve_current_tokens: int = 0,
     ) -> HunyuanPromptKVBatch:
-        if not self.enabled:
-            raise RuntimeError("Hunyuan paged KV capture called while disabled.")
-        if key.shape != value.shape:
-            raise ValueError(f"key shape {tuple(key.shape)} != value shape {tuple(value.shape)}")
-        self._ensure_compatible(key)
-        assert self._k_pool is not None and self._v_pool is not None
+        with profile_range("hy3.paged_kv.capture_prefix"):
+            if not self.enabled:
+                raise RuntimeError("Hunyuan paged KV capture called while disabled.")
+            if key.shape != value.shape:
+                raise ValueError(f"key shape {tuple(key.shape)} != value shape {tuple(value.shape)}")
+            self._ensure_compatible(key)
+            assert self._k_pool is not None and self._v_pool is not None
 
-        if lens.dim() != 1 or lens.numel() != key.shape[0]:
-            raise ValueError("lens must be 1D and match the key/value batch size.")
-        if torch.any(lens <= 0):
-            raise ValueError("Hunyuan paged KV prefix lens must be positive.")
-        if torch.any(lens > key.shape[1]):
-            raise ValueError("Hunyuan paged KV prefix lens exceeds key/value length.")
+            if lens.dim() != 1 or lens.numel() != key.shape[0]:
+                raise ValueError("lens must be 1D and match the key/value batch size.")
+            if torch.any(lens <= 0):
+                raise ValueError("Hunyuan paged KV prefix lens must be positive.")
+            if torch.any(lens > key.shape[1]):
+                raise ValueError("Hunyuan paged KV prefix lens exceeds key/value length.")
 
-        row_refs: list[HunyuanPromptKVRowRef] = []
-        next_block = self._persistent_blocks
-        total_new_blocks = 0
-        for row in range(key.shape[0]):
-            row_len = int(lens[row].item())
-            num_blocks = _ceil_div(row_len, self.page_size)
-            block_ids = tuple(range(next_block, next_block + num_blocks))
-            next_block += num_blocks
-            total_new_blocks += num_blocks
-            row_refs.append(HunyuanPromptKVRowRef(owner=self, block_ids=block_ids, lens=row_len))
+            row_refs: list[HunyuanPromptKVRowRef] = []
+            next_block = self._persistent_blocks
+            total_new_blocks = 0
+            for row in range(key.shape[0]):
+                row_len = int(lens[row].item())
+                num_blocks = _ceil_div(row_len, self.page_size)
+                block_ids = tuple(range(next_block, next_block + num_blocks))
+                next_block += num_blocks
+                total_new_blocks += num_blocks
+                row_refs.append(HunyuanPromptKVRowRef(owner=self, block_ids=block_ids, lens=row_len))
 
-        reserve_blocks = 0
-        reserve_current_tokens = max(int(reserve_current_tokens), 0)
-        if reserve_current_tokens:
-            for row_ref in row_refs:
-                row_seq_len = row_ref.lens + reserve_current_tokens
-                reserve_blocks += max(0, _ceil_div(row_seq_len, self.page_size) - len(row_ref.block_ids))
+            reserve_blocks = 0
+            reserve_current_tokens = max(int(reserve_current_tokens), 0)
+            if reserve_current_tokens:
+                for row_ref in row_refs:
+                    row_seq_len = row_ref.lens + reserve_current_tokens
+                    reserve_blocks += max(0, _ceil_div(row_seq_len, self.page_size) - len(row_ref.block_ids))
 
-        self._ensure_capacity(next_block + reserve_blocks)
-        for row, row_ref in enumerate(row_refs):
-            positions = torch.arange(row_ref.lens, dtype=torch.long, device=key.device)
-            slots = compute_slot_mapping(row_ref.block_ids, positions, self.page_size).to(device=key.device)
-            self._write_paged_kv_slots(key[row, : row_ref.lens], value[row, : row_ref.lens], slots)
+            self._ensure_capacity(next_block + reserve_blocks)
+            for row, row_ref in enumerate(row_refs):
+                positions = torch.arange(row_ref.lens, dtype=torch.long, device=key.device)
+                slots = compute_slot_mapping(row_ref.block_ids, positions, self.page_size).to(device=key.device)
+                self._write_paged_kv_slots(key[row, : row_ref.lens], value[row, : row_ref.lens], slots)
 
-        self._persistent_blocks = next_block
-        self.stats["paged_cache_builds"] += 1
-        self.stats["paged_prefix_blocks"] += total_new_blocks
-        self._current_batch = HunyuanPromptKVBatch(owner=self, row_refs=row_refs)
-        return self._current_batch
+            self._persistent_blocks = next_block
+            self.stats["paged_cache_builds"] += 1
+            self.stats["paged_prefix_blocks"] += total_new_blocks
+            self._current_batch = HunyuanPromptKVBatch(owner=self, row_refs=row_refs)
+            return self._current_batch
 
     def restore_batch(self, row_refs: list[HunyuanPromptKVRowRef]) -> None:
         if any(row.owner is not self for row in row_refs):
@@ -612,8 +614,7 @@ class HunyuanPromptKVPagePool:
             return None
         if attention_mask.dtype != torch.bool:
             raise ValueError(
-                "Hunyuan Image3 paged KV attention only supports boolean custom masks, "
-                f"got {attention_mask.dtype}."
+                f"Hunyuan Image3 paged KV attention only supports boolean custom masks, got {attention_mask.dtype}."
             )
 
         bs = len(row_refs)
@@ -667,8 +668,7 @@ class HunyuanPromptKVPagePool:
             return None
         if attention_mask.dtype != torch.bool:
             raise ValueError(
-                "Hunyuan Image3 paged KV attention only supports boolean custom masks, "
-                f"got {attention_mask.dtype}."
+                f"Hunyuan Image3 paged KV attention only supports boolean custom masks, got {attention_mask.dtype}."
             )
 
         mask = attention_mask
@@ -744,11 +744,12 @@ class HunyuanPromptKVPagePool:
         profile_start = _profile_start(custom_mask)
         try:
             segment_packbits = _load_flashinfer_segment_packbits()
-            packed_custom_mask, _ = segment_packbits(
-                custom_mask.contiguous().view(-1),
-                mask_indptr,
-                bitorder="little",
-            )
+            with profile_range("hy3.paged_kv.custom_mask.packbits"):
+                packed_custom_mask, _ = segment_packbits(
+                    custom_mask.contiguous().view(-1),
+                    mask_indptr,
+                    bitorder="little",
+                )
         finally:
             _profile_finish(self.stats, "paged_profile_packed_mask_build_ms", profile_start, custom_mask)
         self._store_packed_custom_mask(cache_key, packed_custom_mask)
@@ -772,35 +773,38 @@ class HunyuanPromptKVPagePool:
         if inputs.custom_mask is not None or inputs.packed_custom_mask is not None:
             runner = self._get_flashinfer_runner()
             if is_hunyuan_image3_paged_kv_profile_enabled():
+                with profile_range("hy3.paged_kv.attention.flashinfer"):
+                    return runner.run(
+                        query,
+                        self._kv_pool[0],
+                        self._kv_pool[1],
+                        inputs,
+                        softmax_scale=softmax_scale,
+                        profile_stats=self.stats,
+                    )
+            with profile_range("hy3.paged_kv.attention.flashinfer"):
                 return runner.run(
                     query,
                     self._kv_pool[0],
                     self._kv_pool[1],
                     inputs,
                     softmax_scale=softmax_scale,
-                    profile_stats=self.stats,
                 )
-            return runner.run(
-                query,
-                self._kv_pool[0],
-                self._kv_pool[1],
-                inputs,
-                softmax_scale=softmax_scale,
-            )
         profile_start = _profile_start(query)
         try:
-            return ar_diffusion_paged_attention(
-                query,
-                self._kv_pool[0],
-                self._kv_pool[1],
-                block_table=inputs.block_table,
-                query_start_loc=inputs.query_start_loc,
-                seq_lens=inputs.seq_lens,
-                max_query_len=inputs.max_query_len,
-                max_seq_len=inputs.max_seq_len,
-                softmax_scale=softmax_scale,
-                causal=False,
-            )
+            with profile_range("hy3.paged_kv.attention.fast"):
+                return ar_diffusion_paged_attention(
+                    query,
+                    self._kv_pool[0],
+                    self._kv_pool[1],
+                    block_table=inputs.block_table,
+                    query_start_loc=inputs.query_start_loc,
+                    seq_lens=inputs.seq_lens,
+                    max_query_len=inputs.max_query_len,
+                    max_seq_len=inputs.max_seq_len,
+                    softmax_scale=softmax_scale,
+                    causal=False,
+                )
         finally:
             _profile_finish(self.stats, "paged_profile_fast_attention_ms", profile_start, query)
 
@@ -877,20 +881,22 @@ class HunyuanPromptKVPagePool:
             seq_lens.append(key_len)
 
         self._ensure_capacity(scratch_cursor)
-        for row, row_blocks in enumerate(block_rows):
-            positions = torch.arange(key_len, dtype=torch.long, device=key.device)
-            slots = compute_slot_mapping(row_blocks, positions, self.page_size).to(device=key.device)
-            self._write_paged_kv_slots(key[row], value[row], slots)
+        with profile_range("hy3.paged_kv.first_step_write_all"):
+            for row, row_blocks in enumerate(block_rows):
+                positions = torch.arange(key_len, dtype=torch.long, device=key.device)
+                slots = compute_slot_mapping(row_blocks, positions, self.page_size).to(device=key.device)
+                self._write_paged_kv_slots(key[row], value[row], slots)
 
-        max_pages = max(len(row) for row in block_rows)
-        padded_rows = [row + [0] * (max_pages - len(row)) for row in block_rows]
-        device = key.device
-        block_table = torch.tensor(padded_rows, dtype=torch.int32, device=device)
-        query_start_loc = torch.arange(0, (batch_size + 1) * q_len, q_len, dtype=torch.int32, device=device)
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-        kv_indptr_tensor = torch.tensor(kv_indptr, dtype=torch.int32, device=device)
-        kv_indices_tensor = torch.tensor(kv_indices, dtype=torch.int32, device=device)
-        kv_last_page_len_tensor = torch.tensor(kv_last_page_len, dtype=torch.int32, device=device)
+        with profile_range("hy3.paged_kv.first_step_build_inputs"):
+            max_pages = max(len(row) for row in block_rows)
+            padded_rows = [row + [0] * (max_pages - len(row)) for row in block_rows]
+            device = key.device
+            block_table = torch.tensor(padded_rows, dtype=torch.int32, device=device)
+            query_start_loc = torch.arange(0, (batch_size + 1) * q_len, q_len, dtype=torch.int32, device=device)
+            seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+            kv_indptr_tensor = torch.tensor(kv_indptr, dtype=torch.int32, device=device)
+            kv_indices_tensor = torch.tensor(kv_indices, dtype=torch.int32, device=device)
+            kv_last_page_len_tensor = torch.tensor(kv_last_page_len, dtype=torch.int32, device=device)
         mask_cache_key = (
             "first",
             _tensor_identity_key(attention_mask),
@@ -903,12 +909,13 @@ class HunyuanPromptKVPagePool:
         if packed_custom_mask is None:
             profile_start = _profile_start(key)
             try:
-                custom_mask = self.build_full_attention_mask(
-                    attention_mask,
-                    batch_size=batch_size,
-                    q_len=int(q_len),
-                    seq_len=int(key_len),
-                )
+                with profile_range("hy3.paged_kv.first_step_mask_build"):
+                    custom_mask = self.build_full_attention_mask(
+                        attention_mask,
+                        batch_size=batch_size,
+                        q_len=int(q_len),
+                        seq_len=int(key_len),
+                    )
             finally:
                 _profile_finish(self.stats, "paged_profile_mask_build_ms", profile_start, key)
             if custom_mask is not None:
@@ -954,7 +961,8 @@ class HunyuanPromptKVPagePool:
 
         self._persistent_blocks = next_block
         self._current_batch = HunyuanPromptKVBatch(owner=self, row_refs=prefix_row_refs)
-        out = self._run_attention_from_inputs(query, inputs, softmax_scale=softmax_scale)
+        with profile_range("hy3.paged_kv.first_step_run_attention"):
+            out = self._run_attention_from_inputs(query, inputs, softmax_scale=softmax_scale)
         self.stats["paged_cache_builds"] += 1
         self.stats["paged_attention_calls"] += 1
         if inputs.custom_mask is not None or inputs.packed_custom_mask is not None:
@@ -1027,12 +1035,13 @@ class HunyuanPromptKVPagePool:
         if packed_custom_mask is None:
             profile_start = _profile_start(key)
             try:
-                custom_mask = self.build_custom_attention_mask(
-                    attention_mask,
-                    row_refs=batch.row_refs,
-                    q_len=int(q_len),
-                    seq_len=int(seq_len),
-                )
+                with profile_range("hy3.paged_kv.reuse_mask_build"):
+                    custom_mask = self.build_custom_attention_mask(
+                        attention_mask,
+                        row_refs=batch.row_refs,
+                        q_len=int(q_len),
+                        seq_len=int(seq_len),
+                    )
             finally:
                 _profile_finish(self.stats, "paged_profile_mask_build_ms", profile_start, key)
             if custom_mask is not None:
@@ -1089,20 +1098,23 @@ class HunyuanPromptKVPagePool:
         if key.shape != value.shape:
             raise ValueError(f"key shape {tuple(key.shape)} != value shape {tuple(value.shape)}")
         self._ensure_compatible(key)
-        inputs = self._build_attention_inputs(key, seq_len, attention_mask)
+        with profile_range("hy3.paged_kv.reuse_build_inputs"):
+            inputs = self._build_attention_inputs(key, seq_len, attention_mask)
         assert self._kv_pool is not None and self._k_pool is not None and self._v_pool is not None
 
         batch = self._current_batch
         assert batch is not None
         q_len = key.shape[1]
-        for row, row_ref in enumerate(batch.row_refs):
-            positions = torch.arange(row_ref.lens, row_ref.lens + q_len, dtype=torch.long, device=key.device)
-            slots = compute_slot_mapping(inputs.block_table[row].tolist(), positions, self.page_size).to(
-                device=key.device
-            )
-            self._write_paged_kv_slots(key[row], value[row], slots)
+        with profile_range("hy3.paged_kv.reuse_write_current"):
+            for row, row_ref in enumerate(batch.row_refs):
+                positions = torch.arange(row_ref.lens, row_ref.lens + q_len, dtype=torch.long, device=key.device)
+                slots = compute_slot_mapping(inputs.block_table[row].tolist(), positions, self.page_size).to(
+                    device=key.device
+                )
+                self._write_paged_kv_slots(key[row], value[row], slots)
 
-        out = self._run_attention_from_inputs(query, inputs, softmax_scale=softmax_scale)
+        with profile_range("hy3.paged_kv.reuse_run_attention"):
+            out = self._run_attention_from_inputs(query, inputs, softmax_scale=softmax_scale)
         self.stats["paged_attention_calls"] += 1
         if inputs.custom_mask is not None or inputs.packed_custom_mask is not None:
             self.stats["paged_attention_custom_mask_calls"] += 1

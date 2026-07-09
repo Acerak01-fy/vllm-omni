@@ -15,6 +15,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
 )
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniPromptType
+from vllm_omni.profiler import profile_range
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image_3_moe.yaml")
@@ -42,6 +43,18 @@ _MODALITY_MODE = {
 }
 
 _PAGED_KV_STATS_KEY = "hunyuan_image3_paged_kv_cache_stats"
+
+
+def parse_profiler_config(raw_value: str | None) -> dict | None:
+    if raw_value is None:
+        return None
+    try:
+        config = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {exc}") from exc
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError("--profiler-config must decode to a JSON object")
+    return config
 
 
 def parse_args():
@@ -83,6 +96,18 @@ def parse_args():
         help="Enable streaming CoT display; print AR text token-by-token in real time.",
     )
     parser.add_argument("--log-stats", action="store_true", default=False)
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        default=False,
+        help="Enable diffusion pipeline stage-duration profiling.",
+    )
+    parser.add_argument(
+        "--profiler-config",
+        type=parse_profiler_config,
+        default=None,
+        help='JSON profiler config, for example \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
+    )
     parser.add_argument(
         "--print-paged-kv-stats",
         action="store_true",
@@ -235,6 +260,8 @@ def main():
         "log_stats": args.log_stats,
         "init_timeout": args.init_timeout,
         "enforce_eager": args.enforce_eager,
+        "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
+        "profiler_config": args.profiler_config,
         "mode": _MODALITY_MODE[args.modality],
         "diffusion_kv_cache_dtype": args.diffusion_kv_cache_dtype,
         "diffusion_kv_cache_skip_steps": args.diffusion_kv_cache_skip_steps,
@@ -359,6 +386,8 @@ def main():
         print(f"  diffusion_kv_cache_dtype: {args.diffusion_kv_cache_dtype}")
         print(f"  diffusion_kv_cache_skip_steps: {args.diffusion_kv_cache_skip_steps}")
         print(f"  diffusion_kv_cache_skip_layers: {args.diffusion_kv_cache_skip_layers}")
+        print(f"  enable_diffusion_pipeline_profiler: {args.enable_diffusion_pipeline_profiler}")
+        print(f"  profiler_config: {args.profiler_config}")
         print(f"  print_paged_kv_stats: {args.print_paged_kv_stats}")
         print(f"  require_paged_kv_cache: {args.require_paged_kv_cache}")
         print(f"  require_paged_kv_custom_mask: {args.require_paged_kv_custom_mask}")
@@ -373,44 +402,57 @@ def main():
 
     # When --stream is set, print AR CoT text token-by-token in real time.
     # Otherwise, collect and print the full AR text once when stage 0 finishes.
-    omni_outputs = omni.generate(
-        prompts=formatted_prompts,
-        sampling_params_list=params_list,
-        py_generator=True,
-        use_tqdm=False,
-    )
+    profiler_enabled = args.profiler_config is not None
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
+        omni.start_profile()
+
     img_idx = 0
     last_paged_kv_stats = None
-    for req_output in omni_outputs:
-        custom_output = _extract_custom_output(req_output)
-        if _PAGED_KV_STATS_KEY in custom_output:
-            last_paged_kv_stats = custom_output[_PAGED_KV_STATS_KEY]
+    try:
+        with profile_range("hy3.e2e.generate"):
+            omni_outputs = omni.generate(
+                prompts=formatted_prompts,
+                sampling_params_list=params_list,
+                py_generator=True,
+                use_tqdm=False,
+            )
+            for req_output in omni_outputs:
+                custom_output = _extract_custom_output(req_output)
+                if _PAGED_KV_STATS_KEY in custom_output:
+                    last_paged_kv_stats = custom_output[_PAGED_KV_STATS_KEY]
 
-        ro = getattr(req_output, "request_output", None)
-        stage_id = getattr(req_output, "stage_id", None)
+                ro = getattr(req_output, "request_output", None)
+                stage_id = getattr(req_output, "stage_id", None)
 
-        # AR stage text — each CompletionOutput.text is already a delta when
-        # output_kind=DELTA, so we can print it directly (matching the pattern
-        # in serving_chat.py).
-        if stage_id == 0 and ro and getattr(ro, "outputs", None):
-            for o in ro.outputs:
-                text = getattr(o, "text", "") or ""
-                if text:
-                    print(text, end="", flush=True)
-            # Non-streaming: one shot with full text — emit a trailing newline.
-            if not args.stream:
-                print(flush=True)
+                # AR stage text — each CompletionOutput.text is already a delta when
+                # output_kind=DELTA, so we can print it directly (matching the pattern
+                # in serving_chat.py).
+                if stage_id == 0 and ro and getattr(ro, "outputs", None):
+                    for o in ro.outputs:
+                        text = getattr(o, "text", "") or ""
+                        if text:
+                            print(text, end="", flush=True)
+                    # Non-streaming: one shot with full text — emit a trailing newline.
+                    if not args.stream:
+                        print(flush=True)
 
-        # Collect images from diffusion stage
-        images = getattr(req_output, "images", None)
-        if not images and ro and hasattr(ro, "images"):
-            images = ro.images
-        if images:
-            for j, img in enumerate(images):
-                save_path = os.path.join(args.output, f"output_{img_idx}_{j}.png")
-                img.save(save_path)
-                print(f"\n[Output] Saved image to {save_path}")
-            img_idx += 1
+                # Collect images from diffusion stage
+                images = getattr(req_output, "images", None)
+                if not images and ro and hasattr(ro, "images"):
+                    images = ro.images
+                if images:
+                    for j, img in enumerate(images):
+                        save_path = os.path.join(args.output, f"output_{img_idx}_{j}.png")
+                        img.save(save_path)
+                        print(f"\n[Output] Saved image to {save_path}")
+                    img_idx += 1
+    finally:
+        if profiler_enabled:
+            print("\n[Profiler] Stopping profiler and collecting results...")
+            profile_results = omni.stop_profile()
+            print("[Profiler] Results:")
+            print(json.dumps(profile_results, indent=2, sort_keys=True, default=str))
 
     if args.print_paged_kv_stats and last_paged_kv_stats is not None:
         print("\n[PagedKVStats]")

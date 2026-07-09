@@ -58,6 +58,73 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 logger = init_logger(__name__)
 
 
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _install_native_moe_activation_if_requested() -> None:
+    if not _env_flag_enabled("VLLM_OMNI_USE_NATIVE_MOE_ACTIVATION"):
+        return
+
+    import torch.nn.functional as F
+    import vllm.model_executor.layers.fused_moe.activation as activation_module
+    import vllm.model_executor.layers.fused_moe.modular_kernel as modular_kernel
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    if getattr(activation_module, "_vllm_omni_native_moe_activation", False):
+        return
+
+    original_apply_moe_activation = activation_module.apply_moe_activation
+
+    def apply_moe_activation_native(
+        activation: MoEActivation,
+        output: torch.Tensor,
+        input: torch.Tensor,
+    ) -> torch.Tensor:
+        assert input.dim() == 2, "Input must be 2D"
+        assert output.dim() == 2, "Output must be 2D"
+
+        if activation.is_gated:
+            assert output.size(-1) * 2 == input.size(-1), (
+                f"{activation.value} expects 2x ratio: {output.size(-1) * 2} vs {input.size(-1)}"
+            )
+            d = output.size(-1)
+            gate = input[:, :d]
+            up = input[:, d:]
+        else:
+            assert output.size(-1) == input.size(-1), (
+                f"{activation.value} expects equal sizes: {output.size(-1)} vs {input.size(-1)}"
+            )
+            gate = input
+            up = input
+
+        if activation == MoEActivation.SILU:
+            output.copy_(F.silu(gate) * up)
+        elif activation == MoEActivation.GELU:
+            output.copy_(F.gelu(gate) * up)
+        elif activation == MoEActivation.GELU_TANH:
+            output.copy_(F.gelu(gate, approximate="tanh") * up)
+        elif activation == MoEActivation.SILU_NO_MUL:
+            output.copy_(F.silu(input))
+        elif activation == MoEActivation.GELU_NO_MUL:
+            output.copy_(F.gelu(input))
+        elif activation == MoEActivation.GELU_TANH_NO_MUL:
+            output.copy_(F.gelu(input, approximate="tanh"))
+        elif activation == MoEActivation.RELU2_NO_MUL:
+            output.copy_(torch.square(F.relu(input)))
+        else:
+            return original_apply_moe_activation(activation, output, input)
+        return output
+
+    activation_module.apply_moe_activation = apply_moe_activation_native
+    activation_module._vllm_omni_native_moe_activation = True
+    modular_kernel.apply_moe_activation = apply_moe_activation_native
+    logger.warning(
+        "Using native PyTorch MoE activation because VLLM_OMNI_USE_NATIVE_MOE_ACTIVATION=1. "
+        "This is intended for profiling on hosts where vLLM custom CUDA ops cannot load."
+    )
+
+
 @dataclass
 class _DiffusionVllmModelConfig:
     model: str
@@ -285,6 +352,8 @@ class DiffusionWorker:
         vllm_config.profiler_config = self.od_config.profiler_config
         vllm_config.model_config = _make_diffusion_vllm_model_config(self.od_config)  # type: ignore[assignment]
         vllm_config.quant_config = self.od_config.quantization_config
+        if _env_flag_enabled("VLLM_OMNI_DISABLE_DIFFUSION_CUSTOM_ALL_REDUCE"):
+            vllm_config.parallel_config.disable_custom_all_reduce = True
         # Since vLLM v0.20.0, IR wraps GPU ops. Set IR op priority preference to enforce GPU op fusion during wrapping.
         # Also need to log, because vLLM internally logs another line in VllmConfig.__post_init__. Avoid confusion.
         vllm_config.kernel_config.ir_op_priority = _resolve_ir_op_priority(self.od_config, vllm_config)
@@ -293,12 +362,16 @@ class DiffusionWorker:
         )
         self.vllm_config = vllm_config
         current_omni_platform.init_diffusion_worker_vllm_config(vllm_config)
+        _install_native_moe_activation_if_requested()
 
         # Initialize distributed environment
         with (
             set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
             set_current_vllm_config(self.vllm_config),
         ):
+            from vllm.distributed.parallel_state import set_custom_all_reduce
+
+            set_custom_all_reduce(not vllm_config.parallel_config.disable_custom_all_reduce)
             init_distributed_environment(world_size=world_size, rank=rank)
             logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
 

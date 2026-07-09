@@ -87,6 +87,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.paged_kv import (
     is_hunyuan_image3_paged_kv_cache_required,
 )
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
+from vllm_omni.profiler import profile_range
 
 logger = logging.getLogger(__name__)
 
@@ -1081,31 +1082,32 @@ class ImageKVCacheManager:
         value: torch.Tensor,
         cached_prompt_lens: torch.Tensor,
     ) -> None:
-        bs, _, num_kv_heads, head_dim = key.shape
+        with profile_range("hy3.prompt_kv.store"):
+            bs, _, num_kv_heads, head_dim = key.shape
 
-        self.image_kv_cache_lens = cached_prompt_lens
-        self._paged_prompt_kv.clear_current()
-        if self._paged_prompt_kv.enabled:
-            try:
-                self._paged_prompt_kv.capture_prefix(
-                    key,
-                    value,
-                    cached_prompt_lens,
-                    reserve_current_tokens=int(self.image_token_len or 0),
-                )
-                self.image_kv_cache_map = None
-            except Exception:
-                self._paged_prompt_kv.record_error()
-                raise
-        else:
-            max_cached_prompt_len = int(cached_prompt_lens.max().item())
-            cached_key = key.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
-            cached_value = value.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
-            for b in range(bs):
-                cached_prompt_len = int(cached_prompt_lens[b].item())
-                cached_key[b, :cached_prompt_len] = key[b, :cached_prompt_len]
-                cached_value[b, :cached_prompt_len] = value[b, :cached_prompt_len]
-            self.image_kv_cache_map = (cached_key, cached_value)
+            self.image_kv_cache_lens = cached_prompt_lens
+            self._paged_prompt_kv.clear_current()
+            if self._paged_prompt_kv.enabled:
+                try:
+                    self._paged_prompt_kv.capture_prefix(
+                        key,
+                        value,
+                        cached_prompt_lens,
+                        reserve_current_tokens=int(self.image_token_len or 0),
+                    )
+                    self.image_kv_cache_map = None
+                except Exception:
+                    self._paged_prompt_kv.record_error()
+                    raise
+            else:
+                max_cached_prompt_len = int(cached_prompt_lens.max().item())
+                cached_key = key.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
+                cached_value = value.new_zeros(bs, max_cached_prompt_len, num_kv_heads, head_dim)
+                for b in range(bs):
+                    cached_prompt_len = int(cached_prompt_lens[b].item())
+                    cached_key[b, :cached_prompt_len] = key[b, :cached_prompt_len]
+                    cached_value[b, :cached_prompt_len] = value[b, :cached_prompt_len]
+                self.image_kv_cache_map = (cached_key, cached_value)
 
     def _cache_prompt_kv(
         self,
@@ -1166,14 +1168,15 @@ class ImageKVCacheManager:
                 raise self._paged_prompt_kv_error("current positions do not immediately follow cached prompt KV")
 
         try:
-            return self._paged_prompt_kv.run_paged_attention(
-                query,
-                key,
-                value,
-                seq_len=seq_len,
-                softmax_scale=self.scaling,
-                attention_mask=attention_mask,
-            )
+            with profile_range("hy3.prompt_kv.paged_reuse_attention"):
+                return self._paged_prompt_kv.run_paged_attention(
+                    query,
+                    key,
+                    value,
+                    seq_len=seq_len,
+                    softmax_scale=self.scaling,
+                    attention_mask=attention_mask,
+                )
         except Exception:
             self._paged_prompt_kv.record_error()
             raise
@@ -1203,15 +1206,16 @@ class ImageKVCacheManager:
         self.image_kv_cache_lens = cached_prompt_lens
         self.image_kv_cache_map = None
         try:
-            return self._paged_prompt_kv.run_first_step_paged_attention(
-                query,
-                key,
-                value,
-                cached_prompt_lens,
-                seq_len=seq_len,
-                softmax_scale=self.scaling,
-                attention_mask=attention_mask,
-            )
+            with profile_range("hy3.prompt_kv.paged_first_step_attention"):
+                return self._paged_prompt_kv.run_first_step_paged_attention(
+                    query,
+                    key,
+                    value,
+                    cached_prompt_lens,
+                    seq_len=seq_len,
+                    softmax_scale=self.scaling,
+                    attention_mask=attention_mask,
+                )
         except Exception:
             self._paged_prompt_kv.record_error()
             raise
@@ -1254,8 +1258,9 @@ class ImageKVCacheManager:
                 assert torch.all(position_ids[:, 0] == self.image_kv_cache_lens.to(position_ids.device)), (
                     "The first current position must immediately follow each sample's cached prompt KV."
                 )
-        new_key = torch.cat([cached_key, key], dim=1)
-        new_value = torch.cat([cached_value, value], dim=1)
+        with profile_range("hy3.prompt_kv.dense_reuse_concat"):
+            new_key = torch.cat([cached_key, key], dim=1)
+            new_value = torch.cat([cached_value, value], dim=1)
         return new_key.contiguous(), new_value.contiguous()
 
     def _build_neg_ar_kv(
@@ -1986,7 +1991,8 @@ class HunYuanAttention(nn.Module):
     ) -> torch.Tensor:
         bsz, q_len, hidden_size = hidden_states.size()
         hidden_states = hidden_states.reshape(-1, hidden_size)
-        qkv, _ = self.qkv_proj(hidden_states)
+        with profile_range("hy3.attention.qkv_proj"):
+            qkv, _ = self.qkv_proj(hidden_states)
         qkv = qkv.reshape(bsz, q_len, -1)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -2008,13 +2014,16 @@ class HunYuanAttention(nn.Module):
             k = self.key_layernorm(k.view(-1, self.num_kv_heads, self.head_dim).contiguous())
         # for image_generation
         if kwargs.get("mode", "gen_text") == "gen_image":
-            attn_output = self.image_attn(q, k, v, attention_mask=attention_mask, **kwargs)
+            with profile_range("hy3.attention.image_attn"):
+                attn_output = self.image_attn(q, k, v, attention_mask=attention_mask, **kwargs)
         else:
-            attn_output = self.attn(q, k, v)
+            with profile_range("hy3.attention.text_attn"):
+                attn_output = self.attn(q, k, v)
         # For o_proj
         # image_attn may return a non-contiguous tensor; reshape is safe here.
         attn_output = attn_output.reshape(q.shape[0], -1)
-        output, _ = self.o_proj(attn_output)
+        with profile_range("hy3.attention.o_proj"):
+            output, _ = self.o_proj(attn_output)
         output = output.reshape(bsz, q_len, -1)
         return output, None, past_key_value
 
@@ -2235,6 +2244,7 @@ class HunyuanImagePostprocessor(nn.Module):
 
 
 class HunyuanImage3Model(nn.Module):
+    _layerwise_offload_blocks_attrs = ["layers"]
     _cache_dit_adapter_config = CacheDiTAdapterConfig(
         block_forward_patterns={
             "layers": ForwardPattern.Pattern_4,
@@ -2729,26 +2739,28 @@ class HunyuanImage3Model(nn.Module):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = decoder_layer(
-                positions=None,
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_values,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                custom_pos_emb=custom_pos_emb,
-                mode=mode,
-                first_step=first_step,
-                query_lens=query_lens,
-                seq_lens=seq_lens,
-                num_image_tokens=num_image_tokens,
-                gen_timestep_scatter_index=gen_timestep_scatter_index,
-                shard_image_size=shard_image_size,
-                shard_padding_size=shard_padding_size,
-                uncond_cfg_prefill=uncond_cfg_prefill,
-                full_attn_spans=full_attn_spans,
-            )
+            step_tag = "first" if first_step else "later"
+            with profile_range(f"hy3.transformer.layer.{layer_idx}.{step_tag}"):
+                layer_outputs = decoder_layer(
+                    positions=None,
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    custom_pos_emb=custom_pos_emb,
+                    mode=mode,
+                    first_step=first_step,
+                    query_lens=query_lens,
+                    seq_lens=seq_lens,
+                    num_image_tokens=num_image_tokens,
+                    gen_timestep_scatter_index=gen_timestep_scatter_index,
+                    shard_image_size=shard_image_size,
+                    shard_padding_size=shard_padding_size,
+                    uncond_cfg_prefill=uncond_cfg_prefill,
+                    full_attn_spans=full_attn_spans,
+                )
 
             hidden_states = layer_outputs[0]
 
