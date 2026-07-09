@@ -116,6 +116,11 @@ def _ceil_div(a: int, b: int) -> int:
 def _tensor_identity_key(tensor: torch.Tensor | None) -> tuple[Any, ...] | None:
     if tensor is None:
         return None
+    try:
+        version = int(tensor._version)
+    except RuntimeError:
+        # Inference-mode tensors do not expose a version counter.
+        version = 0
     return (
         id(tensor),
         tensor.data_ptr(),
@@ -123,7 +128,7 @@ def _tensor_identity_key(tensor: torch.Tensor | None) -> tuple[Any, ...] | None:
         tuple(tensor.stride()),
         str(tensor.dtype),
         str(tensor.device),
-        int(getattr(tensor, "_version", 0)),
+        version,
     )
 
 
@@ -211,6 +216,7 @@ class HunyuanPagedAttentionInputs:
     max_seq_len: int
     prefix_blocks: int
     current_blocks: int
+    block_rows: tuple[tuple[int, ...], ...] = ()
 
 
 class HunyuanFlashInferPagedKVRunner:
@@ -530,16 +536,17 @@ class HunyuanPromptKVPagePool:
 
             if lens.dim() != 1 or lens.numel() != key.shape[0]:
                 raise ValueError("lens must be 1D and match the key/value batch size.")
-            if torch.any(lens <= 0):
+            lens_cpu = lens.detach().to(device="cpu", dtype=torch.long)
+            lens_values = [int(v) for v in lens_cpu.tolist()]
+            if any(row_len <= 0 for row_len in lens_values):
                 raise ValueError("Hunyuan paged KV prefix lens must be positive.")
-            if torch.any(lens > key.shape[1]):
+            if any(row_len > key.shape[1] for row_len in lens_values):
                 raise ValueError("Hunyuan paged KV prefix lens exceeds key/value length.")
 
             row_refs: list[HunyuanPromptKVRowRef] = []
             next_block = self._persistent_blocks
             total_new_blocks = 0
-            for row in range(key.shape[0]):
-                row_len = int(lens[row].item())
+            for row_len in lens_values:
                 num_blocks = _ceil_div(row_len, self.page_size)
                 block_ids = tuple(range(next_block, next_block + num_blocks))
                 next_block += num_blocks
@@ -555,8 +562,8 @@ class HunyuanPromptKVPagePool:
 
             self._ensure_capacity(next_block + reserve_blocks)
             for row, row_ref in enumerate(row_refs):
-                positions = torch.arange(row_ref.lens, dtype=torch.long, device=key.device)
-                slots = compute_slot_mapping(row_ref.block_ids, positions, self.page_size).to(device=key.device)
+                start_slot = int(row_ref.block_ids[0]) * self.page_size
+                slots = torch.arange(start_slot, start_slot + row_ref.lens, dtype=torch.long, device=key.device)
                 self._write_paged_kv_slots(key[row, : row_ref.lens], value[row, : row_ref.lens], slots)
 
             self._persistent_blocks = next_block
@@ -1071,6 +1078,7 @@ class HunyuanPromptKVPagePool:
         )
         return HunyuanPagedAttentionInputs(
             block_table=block_table,
+            block_rows=tuple(tuple(row) for row in block_rows),
             query_start_loc=query_start_loc,
             seq_lens=seq_lens_tensor,
             kv_indptr=kv_indptr_tensor,
@@ -1104,13 +1112,13 @@ class HunyuanPromptKVPagePool:
 
         batch = self._current_batch
         assert batch is not None
+        if len(inputs.block_rows) != len(batch.row_refs):
+            raise AssertionError("paged reuse inputs must include one block row per batch row.")
         q_len = key.shape[1]
         with profile_range("hy3.paged_kv.reuse_write_current"):
             for row, row_ref in enumerate(batch.row_refs):
                 positions = torch.arange(row_ref.lens, row_ref.lens + q_len, dtype=torch.long, device=key.device)
-                slots = compute_slot_mapping(inputs.block_table[row].tolist(), positions, self.page_size).to(
-                    device=key.device
-                )
+                slots = compute_slot_mapping(inputs.block_rows[row], positions, self.page_size).to(device=key.device)
                 self._write_paged_kv_slots(key[row], value[row], slots)
 
         with profile_range("hy3.paged_kv.reuse_run_attention"):

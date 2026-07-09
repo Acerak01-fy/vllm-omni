@@ -5,6 +5,7 @@ HunyuanImage-3.0-Instruct unified end-to-end inference script.
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
@@ -414,7 +415,10 @@ def main():
             omni_outputs = omni.generate(
                 prompts=formatted_prompts,
                 sampling_params_list=params_list,
-                py_generator=True,
+                # The Python generator closes Omni when exhausted. Keep the
+                # engine alive in profiling mode so stop_profile can collect
+                # worker traces before shutdown.
+                py_generator=not profiler_enabled,
                 use_tqdm=False,
             )
             for req_output in omni_outputs:
@@ -448,11 +452,22 @@ def main():
                         print(f"\n[Output] Saved image to {save_path}")
                     img_idx += 1
     finally:
-        if profiler_enabled:
+        if profiler_enabled and not getattr(omni, "_shutdown_called", False):
+            active_exc = sys.exc_info()[0]
+            stop_error = None
             print("\n[Profiler] Stopping profiler and collecting results...")
-            profile_results = omni.stop_profile()
-            print("[Profiler] Results:")
-            print(json.dumps(profile_results, indent=2, sort_keys=True, default=str))
+            try:
+                profile_results = omni.stop_profile()
+                print("[Profiler] Results:")
+                print(json.dumps(profile_results, indent=2, sort_keys=True, default=str))
+            except Exception as exc:
+                stop_error = exc
+                if active_exc is not None:
+                    print(f"[Profiler] Failed to stop profiler while handling another error: {exc!r}")
+            finally:
+                omni.close()
+            if stop_error is not None and active_exc is None:
+                raise stop_error
 
     if args.print_paged_kv_stats and last_paged_kv_stats is not None:
         print("\n[PagedKVStats]")

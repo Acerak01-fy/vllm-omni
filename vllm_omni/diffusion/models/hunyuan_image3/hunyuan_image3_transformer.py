@@ -1341,18 +1341,10 @@ class ImageKVCacheManager:
                 shard_image_size,
                 kwargs.get("gen_timestep_scatter_index"),
             )
-            paged_attn_output = self._run_first_step_paged_prompt_kv_attention(
-                query,
-                key,
-                value,
-                cached_prompt_lens,
-                seq_len,
-                attention_mask,
-                full_attn_spans,
-            )
-            if paged_attn_output is not None:
-                return paged_attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
-            deferred_prompt_cache = (key, value, cached_prompt_lens)
+            if self._paged_prompt_kv.enabled:
+                self._store_prompt_kv(key, value, cached_prompt_lens)
+            else:
+                deferred_prompt_cache = (key, value, cached_prompt_lens)
             if self.sp_size > 1:
                 local_prompt_len = seq_len - shard_image_size
                 join_query_len = query.shape[1] - shard_image_size
