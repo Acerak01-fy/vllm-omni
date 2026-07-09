@@ -34,6 +34,10 @@ _RESHAPE_AND_CACHE_FLASH_LOAD_ERROR: Exception | None = None
 _FLASHINFER_SEGMENT_PACKBITS: Any | None = None
 _FLASHINFER_SEGMENT_PACKBITS_LOAD_ERROR: Exception | None = None
 _PACKED_CUSTOM_MASK_CACHE_MAX_ENTRIES = 4
+_MASK_NONE_OR_EMPTY = "none_or_empty"
+_MASK_INPUT_ALL_KEEP = "input_all_keep"
+_MASK_EFFECTIVE_ALL_KEEP = "effective_all_keep"
+_MASK_CUSTOM = "custom"
 
 
 def _load_reshape_and_cache_flash() -> Any:
@@ -219,6 +223,12 @@ class HunyuanPagedAttentionInputs:
     block_rows: tuple[tuple[int, ...], ...] = ()
 
 
+@dataclass(frozen=True)
+class _CustomMaskBuildResult:
+    mask: torch.Tensor | None
+    reason: str
+
+
 class HunyuanFlashInferPagedKVRunner:
     """FlashInfer paged prefill runner for Hunyuan custom-mask reuse."""
 
@@ -375,6 +385,13 @@ class HunyuanPromptKVPagePool:
             "paged_attention_calls": 0,
             "paged_attention_custom_mask_calls": 0,
             "paged_attention_errors": 0,
+            "paged_mask_none_or_empty_skips": 0,
+            "paged_mask_input_all_keep_skips": 0,
+            "paged_mask_effective_all_keep_skips": 0,
+            "paged_mask_custom_builds": 0,
+            "paged_mask_packed_cache_hits": 0,
+            "paged_mask_packed_cache_misses": 0,
+            "paged_mask_packbits_calls": 0,
             "paged_prefix_blocks": 0,
             "paged_current_blocks": 0,
             "paged_profile_page_write_ms": 0.0,
@@ -607,19 +624,19 @@ class HunyuanPromptKVPagePool:
         return bool(torch.all(attention_mask != 0).item())
 
     @classmethod
-    def build_custom_attention_mask(
+    def _build_custom_attention_mask_result(
         cls,
         attention_mask: torch.Tensor | None,
         *,
         row_refs: list[HunyuanPromptKVRowRef],
         q_len: int,
         seq_len: int,
-    ) -> torch.Tensor | None:
+    ) -> _CustomMaskBuildResult:
         if attention_mask is None or attention_mask.numel() == 0:
-            return None
-        if cls.attention_mask_is_all_keep(attention_mask):
-            return None
+            return _CustomMaskBuildResult(None, _MASK_NONE_OR_EMPTY)
         if attention_mask.dtype != torch.bool:
+            if cls.attention_mask_is_all_keep(attention_mask):
+                return _CustomMaskBuildResult(None, _MASK_INPUT_ALL_KEEP)
             raise ValueError(
                 f"Hunyuan Image3 paged KV attention only supports boolean custom masks, got {attention_mask.dtype}."
             )
@@ -656,24 +673,41 @@ class HunyuanPromptKVPagePool:
             mask_parts.append(torch.cat([prefix_mask, current_mask], dim=1).contiguous().reshape(-1))
 
         packed = torch.cat(mask_parts, dim=0)
-        if bool(torch.all(packed).item()):
-            return None
-        return packed.contiguous()
+        with profile_range("hy3.paged_kv.custom_mask.effective_all_keep"):
+            if bool(torch.all(packed).item()):
+                return _CustomMaskBuildResult(None, _MASK_EFFECTIVE_ALL_KEEP)
+        return _CustomMaskBuildResult(packed.contiguous(), _MASK_CUSTOM)
 
     @classmethod
-    def build_full_attention_mask(
+    def build_custom_attention_mask(
+        cls,
+        attention_mask: torch.Tensor | None,
+        *,
+        row_refs: list[HunyuanPromptKVRowRef],
+        q_len: int,
+        seq_len: int,
+    ) -> torch.Tensor | None:
+        return cls._build_custom_attention_mask_result(
+            attention_mask,
+            row_refs=row_refs,
+            q_len=q_len,
+            seq_len=seq_len,
+        ).mask
+
+    @classmethod
+    def _build_full_attention_mask_result(
         cls,
         attention_mask: torch.Tensor | None,
         *,
         batch_size: int,
         q_len: int,
         seq_len: int,
-    ) -> torch.Tensor | None:
+    ) -> _CustomMaskBuildResult:
         if attention_mask is None or attention_mask.numel() == 0:
-            return None
-        if cls.attention_mask_is_all_keep(attention_mask):
-            return None
+            return _CustomMaskBuildResult(None, _MASK_NONE_OR_EMPTY)
         if attention_mask.dtype != torch.bool:
+            if cls.attention_mask_is_all_keep(attention_mask):
+                return _CustomMaskBuildResult(None, _MASK_INPUT_ALL_KEEP)
             raise ValueError(
                 f"Hunyuan Image3 paged KV attention only supports boolean custom masks, got {attention_mask.dtype}."
             )
@@ -695,9 +729,26 @@ class HunyuanPromptKVPagePool:
             ) from exc
 
         packed = mask.contiguous().reshape(-1)
-        if bool(torch.all(packed).item()):
-            return None
-        return packed.contiguous()
+        with profile_range("hy3.paged_kv.full_mask.effective_all_keep"):
+            if bool(torch.all(packed).item()):
+                return _CustomMaskBuildResult(None, _MASK_EFFECTIVE_ALL_KEEP)
+        return _CustomMaskBuildResult(packed.contiguous(), _MASK_CUSTOM)
+
+    @classmethod
+    def build_full_attention_mask(
+        cls,
+        attention_mask: torch.Tensor | None,
+        *,
+        batch_size: int,
+        q_len: int,
+        seq_len: int,
+    ) -> torch.Tensor | None:
+        return cls._build_full_attention_mask_result(
+            attention_mask,
+            batch_size=batch_size,
+            q_len=q_len,
+            seq_len=seq_len,
+        ).mask
 
     @staticmethod
     def _build_mask_pack_indptr(
@@ -735,6 +786,26 @@ class HunyuanPromptKVPagePool:
         while len(cls._packed_custom_mask_cache) > _PACKED_CUSTOM_MASK_CACHE_MAX_ENTRIES:
             cls._packed_custom_mask_cache.popitem(last=False)
 
+    def _record_custom_mask_result(self, result: _CustomMaskBuildResult) -> None:
+        if result.reason == _MASK_NONE_OR_EMPTY:
+            self.stats["paged_mask_none_or_empty_skips"] += 1
+        elif result.reason == _MASK_INPUT_ALL_KEEP:
+            self.stats["paged_mask_input_all_keep_skips"] += 1
+        elif result.reason == _MASK_EFFECTIVE_ALL_KEEP:
+            self.stats["paged_mask_effective_all_keep_skips"] += 1
+        elif result.reason == _MASK_CUSTOM:
+            self.stats["paged_mask_custom_builds"] += 1
+
+    def _lookup_packed_custom_mask_with_stats(self, cache_key: tuple[Any, ...] | None) -> torch.Tensor | None:
+        cached = self._lookup_packed_custom_mask(cache_key)
+        if cache_key is None:
+            return cached
+        if cached is None:
+            self.stats["paged_mask_packed_cache_misses"] += 1
+        else:
+            self.stats["paged_mask_packed_cache_hits"] += 1
+        return cached
+
     def _pack_custom_mask(
         self,
         custom_mask: torch.Tensor | None,
@@ -746,8 +817,10 @@ class HunyuanPromptKVPagePool:
             return None
         cached = self._lookup_packed_custom_mask(cache_key)
         if cached is not None:
+            self.stats["paged_mask_packed_cache_hits"] += 1
             return cached
 
+        self.stats["paged_mask_packbits_calls"] += 1
         profile_start = _profile_start(custom_mask)
         try:
             segment_packbits = _load_flashinfer_segment_packbits()
@@ -911,18 +984,24 @@ class HunyuanPromptKVPagePool:
             int(q_len),
             int(key_len),
         )
-        packed_custom_mask = self._lookup_packed_custom_mask(mask_cache_key)
+        packed_custom_mask = (
+            self._lookup_packed_custom_mask_with_stats(mask_cache_key)
+            if attention_mask is not None and attention_mask.numel() != 0
+            else None
+        )
         custom_mask: torch.Tensor | None = None
         if packed_custom_mask is None:
             profile_start = _profile_start(key)
             try:
                 with profile_range("hy3.paged_kv.first_step_mask_build"):
-                    custom_mask = self.build_full_attention_mask(
+                    mask_result = self._build_full_attention_mask_result(
                         attention_mask,
                         batch_size=batch_size,
                         q_len=int(q_len),
                         seq_len=int(key_len),
                     )
+                    custom_mask = mask_result.mask
+                    self._record_custom_mask_result(mask_result)
             finally:
                 _profile_finish(self.stats, "paged_profile_mask_build_ms", profile_start, key)
             if custom_mask is not None:
@@ -1037,18 +1116,24 @@ class HunyuanPromptKVPagePool:
             int(q_len),
             int(seq_len),
         )
-        packed_custom_mask = self._lookup_packed_custom_mask(mask_cache_key)
+        packed_custom_mask = (
+            self._lookup_packed_custom_mask_with_stats(mask_cache_key)
+            if attention_mask is not None and attention_mask.numel() != 0
+            else None
+        )
         custom_mask: torch.Tensor | None = None
         if packed_custom_mask is None:
             profile_start = _profile_start(key)
             try:
                 with profile_range("hy3.paged_kv.reuse_mask_build"):
-                    custom_mask = self.build_custom_attention_mask(
+                    mask_result = self._build_custom_attention_mask_result(
                         attention_mask,
                         row_refs=batch.row_refs,
                         q_len=int(q_len),
                         seq_len=int(seq_len),
                     )
+                    custom_mask = mask_result.mask
+                    self._record_custom_mask_result(mask_result)
             finally:
                 _profile_finish(self.stats, "paged_profile_mask_build_ms", profile_start, key)
             if custom_mask is not None:

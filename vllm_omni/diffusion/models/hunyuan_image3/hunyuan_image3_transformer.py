@@ -1151,9 +1151,9 @@ class ImageKVCacheManager:
             raise self._paged_prompt_kv_error("sequence parallel is unsupported")
         if self._paged_prompt_kv.current_batch is None or self.image_kv_cache_lens is None:
             raise self._paged_prompt_kv_error("missing paged prompt KV state")
-        mask_all_keep = HunyuanPromptKVPagePool.attention_mask_is_all_keep(attention_mask)
-        if not mask_all_keep and attention_mask is not None and attention_mask.dtype != torch.bool:
-            raise self._paged_prompt_kv_error("non-boolean custom attention masks are unsupported")
+        if attention_mask is not None and attention_mask.dtype != torch.bool:
+            if not HunyuanPromptKVPagePool.attention_mask_is_all_keep(attention_mask):
+                raise self._paged_prompt_kv_error("non-boolean custom attention masks are unsupported")
         if full_attn_spans is not None and attention_mask is None and any(full_attn_spans):
             raise self._paged_prompt_kv_error("full_attn_spans require an explicit all-keep attention mask")
 
@@ -1195,9 +1195,9 @@ class ImageKVCacheManager:
             return None
         if self.sp_size > 1:
             raise self._paged_prompt_kv_error("sequence parallel is unsupported")
-        mask_all_keep = HunyuanPromptKVPagePool.attention_mask_is_all_keep(attention_mask)
-        if not mask_all_keep and attention_mask is not None and attention_mask.dtype != torch.bool:
-            raise self._paged_prompt_kv_error("non-boolean custom attention masks are unsupported")
+        if attention_mask is not None and attention_mask.dtype != torch.bool:
+            if not HunyuanPromptKVPagePool.attention_mask_is_all_keep(attention_mask):
+                raise self._paged_prompt_kv_error("non-boolean custom attention masks are unsupported")
         if full_attn_spans is not None and attention_mask is None and any(full_attn_spans):
             raise self._paged_prompt_kv_error("full_attn_spans require an explicit attention mask")
         if key.shape[1] != seq_len:
@@ -2324,6 +2324,13 @@ class HunyuanImage3Model(nn.Module):
             "paged_attention_calls",
             "paged_attention_custom_mask_calls",
             "paged_attention_errors",
+            "paged_mask_none_or_empty_skips",
+            "paged_mask_input_all_keep_skips",
+            "paged_mask_effective_all_keep_skips",
+            "paged_mask_custom_builds",
+            "paged_mask_packed_cache_hits",
+            "paged_mask_packed_cache_misses",
+            "paged_mask_packbits_calls",
             "paged_prefix_blocks",
             "paged_current_blocks",
         ):

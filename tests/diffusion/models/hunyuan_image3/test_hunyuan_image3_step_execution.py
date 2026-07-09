@@ -525,6 +525,61 @@ def test_paged_prompt_kv_custom_mask_drops_dense_prefix_padding():
     assert page_pool.get_stats()["paged_kv_num_blocks"] == reserved_num_blocks
 
 
+def test_paged_prompt_kv_effective_all_keep_mask_uses_fast_attention_inputs():
+    HunyuanPromptKVPagePool._packed_custom_mask_cache.clear()
+    page_pool = HunyuanPromptKVPagePool(page_size=2, enabled=True, required=True)
+    key = torch.arange(2 * 5 * 2 * 3, dtype=torch.float32).reshape(2, 5, 2, 3)
+    value = key + 0.5
+    lens = torch.tensor([3, 5], dtype=torch.long)
+    page_pool.capture_prefix(key, value, lens, reserve_current_tokens=2)
+
+    q_len = 2
+    dense_prefix_len = int(lens.max().item())
+    seq_len = dense_prefix_len + q_len
+    attention_mask = torch.ones(2, 1, q_len, seq_len, dtype=torch.bool)
+    attention_mask[0, :, :, 3:5] = False
+
+    current_key = torch.zeros(2, q_len, 2, 3)
+    inputs = page_pool._build_attention_inputs(current_key, seq_len, attention_mask)
+
+    assert inputs.custom_mask is None
+    assert inputs.packed_custom_mask is None
+    stats = page_pool.get_stats()
+    assert stats["paged_mask_effective_all_keep_skips"] == 1
+    assert stats["paged_mask_custom_builds"] == 0
+    assert stats["paged_mask_packed_cache_misses"] == 1
+    HunyuanPromptKVPagePool._packed_custom_mask_cache.clear()
+
+
+def test_paged_prompt_kv_packed_mask_cache_stats_are_reported():
+    HunyuanPromptKVPagePool._packed_custom_mask_cache.clear()
+    page_pool = HunyuanPromptKVPagePool(page_size=2, enabled=True, required=True)
+    key = torch.arange(1 * 3 * 1 * 1, dtype=torch.float32).reshape(1, 3, 1, 1)
+    page_pool.capture_prefix(key, key, torch.tensor([3], dtype=torch.long), reserve_current_tokens=2)
+
+    current_key = torch.zeros(1, 2, 1, 1)
+    attention_mask = torch.ones(1, 1, 2, 5, dtype=torch.bool)
+    attention_mask[0, 0, 1, 0] = False
+
+    inputs = page_pool._build_attention_inputs(current_key, seq_len=5, attention_mask=attention_mask)
+    assert inputs.custom_mask is not None
+    assert inputs.packed_custom_mask is None
+    assert inputs.plan_cache_key is not None
+    mask_cache_key = inputs.plan_cache_key[-1]
+    fake_packed = torch.tensor([0x7F], dtype=torch.uint8)
+    HunyuanPromptKVPagePool._store_packed_custom_mask(mask_cache_key, fake_packed)
+
+    cached_inputs = page_pool._build_attention_inputs(current_key, seq_len=5, attention_mask=attention_mask)
+
+    assert cached_inputs.custom_mask is None
+    assert cached_inputs.packed_custom_mask is fake_packed
+    stats = page_pool.get_stats()
+    assert stats["paged_mask_custom_builds"] == 1
+    assert stats["paged_mask_packed_cache_misses"] == 1
+    assert stats["paged_mask_packed_cache_hits"] == 1
+    HunyuanPromptKVPagePool._packed_custom_mask_cache.clear()
+
+
 def test_paged_prompt_kv_custom_mask_dispatches_flashinfer_runner():
     page_pool = HunyuanPromptKVPagePool(page_size=2, enabled=True, required=True)
     key = torch.tensor([[[[1.0]], [[2.0]], [[3.0]]]])
