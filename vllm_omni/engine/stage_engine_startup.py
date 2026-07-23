@@ -1347,7 +1347,7 @@ def launch_headless_diffusion_replicas(
         stage_id,
     )
 
-    metadata = stage_init_utils.extract_stage_metadata(stage_cfg)
+    metadata = stage_init_utils.extract_legacy_stage_metadata(stage_cfg)
     if omni_conn_cfg:
         inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
     # Headless single-stage launch must still infer cross-stage TP topology

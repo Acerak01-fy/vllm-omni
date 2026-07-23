@@ -25,6 +25,8 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
+from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
@@ -346,8 +348,8 @@ class StageMetadata:
     replica_id: int = 0
 
 
-def extract_stage_metadata(stage_config: Any) -> StageMetadata:
-    """Pure data extraction from a stage_config object."""
+def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
+    """Extract metadata from the legacy stage config used by today's runtime."""
     stage_id: int = stage_config.stage_id
     stage_type: Literal["llm", "diffusion"] = _get_attr_or_item(stage_config, "stage_type", "llm")
     engine_args = stage_config.engine_args
@@ -429,6 +431,60 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
         prompt_expand_func=prompt_expand_func,
+    )
+
+
+def _resolve_omni_metadata_hook(path: str | None) -> Callable | None:
+    if not path:
+        return None
+    module_path, function_name = path.rsplit(".", 1)
+    return getattr(importlib.import_module(module_path), function_name)
+
+
+def extract_stage_metadata(
+    omni_config: VllmOmniConfig,
+    stage_id: int,
+) -> StageMetadata:
+    """Project one typed stage config into metadata for a future cutover."""
+    stage_config = omni_config.stage_by_id(stage_id)
+    stage_type: Literal["llm", "diffusion"] = "diffusion" if stage_config.stage_type == StageType.DIFFUSION else "llm"
+    sampling_params_cls = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
+    sampling_params: OmniSamplingParams = sampling_params_cls(
+        **(stage_config.model_config.default_sampling_params or {})
+    )
+    custom_process_input_func = _resolve_omni_metadata_hook(stage_config.custom_process_input_func)
+
+    if stage_type == "diffusion":
+        return StageMetadata(
+            stage_id=stage_config.stage_id,
+            stage_type="diffusion",
+            engine_output_type=None,
+            is_comprehension=False,
+            requires_multimodal_data=False,
+            engine_input_source=stage_config.input_sources,
+            final_output=stage_config.final_output,
+            final_output_type=stage_config.final_output_type,
+            default_sampling_params=sampling_params,
+            custom_process_input_func=custom_process_input_func,
+            model_stage=stage_config.model_stage,
+            runtime_cfg=stage_config.runtime_config,
+            cfg_kv_collect_func=_resolve_omni_metadata_hook(stage_config.cfg_kv_collect_func),
+        )
+
+    return StageMetadata(
+        stage_id=stage_config.stage_id,
+        stage_type="llm",
+        engine_output_type=stage_config.engine_output_type,
+        is_comprehension=stage_config.is_comprehension,
+        requires_multimodal_data=stage_config.requires_multimodal_data,
+        engine_input_source=stage_config.input_sources,
+        final_output=stage_config.final_output,
+        final_output_type=stage_config.final_output_type,
+        default_sampling_params=sampling_params,
+        custom_process_input_func=custom_process_input_func,
+        model_stage=stage_config.model_stage,
+        runtime_cfg=stage_config.runtime_config,
+        prompt_expand_func=_resolve_omni_metadata_hook(stage_config.prompt_expand_func),
     )
 
 

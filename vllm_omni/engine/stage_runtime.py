@@ -51,7 +51,7 @@ from vllm_omni.engine.stage_init_utils import (
     build_llm_stage_output_processor,
     build_vllm_config,
     compute_replica_layout,
-    extract_stage_metadata,
+    extract_legacy_stage_metadata,
     get_stage_connector_spec,
     inject_kv_stage_info,
     inject_omni_kv_connector_config,
@@ -340,7 +340,7 @@ class StageRuntime:
         stage_plans: list[LogicalStageInitPlan] = []
 
         for stage_idx, stage_cfg in enumerate(self._stage_configs):
-            base_metadata = extract_stage_metadata(stage_cfg)
+            base_metadata = extract_legacy_stage_metadata(stage_cfg)
             stage_id = int(base_metadata.stage_id)
             if stage_id != stage_idx:
                 raise ValueError(
@@ -392,7 +392,7 @@ class StageRuntime:
                 if stage_idx in replica_devices_map:
                     replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
 
-                replica_metadata = extract_stage_metadata(replica_cfg)
+                replica_metadata = extract_legacy_stage_metadata(replica_cfg)
                 replica_metadata.replica_id = replica_id
                 if launch_mode == "remote" and replica_metadata.stage_type != "diffusion":
                     replica_metadata.runtime_cfg = None
@@ -866,7 +866,7 @@ class DistStageRuntime(StageRuntime):
             raise ValueError(f"Remote stage {plan.metadata.stage_id} registered without stage config")
 
         metadata = (
-            extract_stage_metadata(OmegaConf.create(registered_stage_cfg))
+            extract_legacy_stage_metadata(OmegaConf.create(registered_stage_cfg))
             if plan.metadata.stage_type == "diffusion"
             else copy.deepcopy(plan.metadata)
         )
