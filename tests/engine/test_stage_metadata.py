@@ -16,6 +16,7 @@ from vllm_omni.config.stage_config import (
 from vllm_omni.engine.stage_init_utils import (
     extract_legacy_stage_metadata,
     extract_stage_metadata,
+    extract_stage_metadata_from_omni_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -43,6 +44,7 @@ def _metadata_inputs() -> tuple[PipelineConfig, DeployConfig]:
                 input_sources=(0,),
                 engine_output_type="audio_tokens",
                 custom_process_input_func="operator.sub",
+                sync_process_input_func="operator.floordiv",
             ),
             StagePipelineConfig(
                 stage_id=2,
@@ -112,7 +114,7 @@ def test_extract_stage_metadata_matches_legacy_projection():
         "cfg_kv_collect_func",
     )
     for stage_id, legacy_config in enumerate(legacy_configs):
-        structured = extract_stage_metadata(omni_config, stage_id)
+        structured = extract_stage_metadata_from_omni_config(omni_config, stage_id)
         legacy = extract_legacy_stage_metadata(legacy_config)
 
         assert {field: getattr(structured, field) for field in parity_fields} == {
@@ -123,9 +125,9 @@ def test_extract_stage_metadata_matches_legacy_projection():
         for runtime_field in ("devices", "num_replicas", "env"):
             assert getattr(structured.runtime_cfg, runtime_field) == getattr(legacy.runtime_cfg, runtime_field)
 
-    thinker = extract_stage_metadata(omni_config, 0)
-    talker = extract_stage_metadata(omni_config, 1)
-    diffusion = extract_stage_metadata(omni_config, 2)
+    thinker = extract_stage_metadata_from_omni_config(omni_config, 0)
+    talker = extract_stage_metadata_from_omni_config(omni_config, 1)
+    diffusion = extract_stage_metadata_from_omni_config(omni_config, 2)
 
     assert isinstance(thinker.default_sampling_params, SamplingParams)
     assert thinker.default_sampling_params.temperature == 0.25
@@ -134,7 +136,7 @@ def test_extract_stage_metadata_matches_legacy_projection():
 
     assert isinstance(talker.default_sampling_params, SamplingParams)
     assert talker.default_sampling_params.temperature == 0.75
-    assert talker.custom_process_input_func is operator.sub
+    assert talker.custom_process_input_func is operator.floordiv
 
     assert isinstance(diffusion.default_sampling_params, OmniDiffusionSamplingParams)
     assert diffusion.default_sampling_params.seed == 7
@@ -142,7 +144,21 @@ def test_extract_stage_metadata_matches_legacy_projection():
     assert diffusion.cfg_kv_collect_func is operator.concat
 
 
-def test_extract_stage_metadata_rejects_unknown_stage():
+def test_extract_stage_metadata_preserves_legacy_one_argument_api():
+    pipeline, deploy = _metadata_inputs()
+    legacy_config = merge_pipeline_deploy(
+        pipeline,
+        deploy,
+    )[0].to_omegaconf()
+
+    metadata = extract_stage_metadata(legacy_config)
+
+    assert metadata.stage_id == 0
+    assert metadata.model_stage == "thinker"
+    assert metadata.custom_process_input_func is operator.add
+
+
+def test_extract_stage_metadata_from_omni_config_rejects_unknown_stage():
     pipeline, deploy = _metadata_inputs()
     omni_config = VllmOmniConfig.from_pipeline_config(
         pipeline,
@@ -150,4 +166,4 @@ def test_extract_stage_metadata_rejects_unknown_stage():
     )
 
     with pytest.raises(KeyError, match="no stage 99"):
-        extract_stage_metadata(omni_config, 99)
+        extract_stage_metadata_from_omni_config(omni_config, 99)

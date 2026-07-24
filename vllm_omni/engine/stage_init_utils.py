@@ -434,6 +434,11 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     )
 
 
+def extract_stage_metadata(stage_config: Any) -> StageMetadata:
+    """Preserve the legacy one-argument API for external callers."""
+    return extract_legacy_stage_metadata(stage_config)
+
+
 def _resolve_omni_metadata_hook(path: str | None) -> Callable | None:
     if not path:
         return None
@@ -441,7 +446,7 @@ def _resolve_omni_metadata_hook(path: str | None) -> Callable | None:
     return getattr(importlib.import_module(module_path), function_name)
 
 
-def extract_stage_metadata(
+def extract_stage_metadata_from_omni_config(
     omni_config: VllmOmniConfig,
     stage_id: int,
 ) -> StageMetadata:
