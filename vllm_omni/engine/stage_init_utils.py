@@ -25,7 +25,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
-from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.omni_config import BaseVllmOmniStageConfig
 from vllm_omni.config.stage_config import StageType
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
@@ -349,7 +349,11 @@ class StageMetadata:
 
 
 def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
-    """Extract metadata from the legacy stage config used by today's runtime."""
+    """Extract metadata through the active production legacy path.
+
+    Keep production callers on this path until RFC #4021 migrates the
+    engine-argument and stage-init consumers together.
+    """
     stage_id: int = stage_config.stage_id
     stage_type: Literal["llm", "diffusion"] = _get_attr_or_item(stage_config, "stage_type", "llm")
     engine_args = stage_config.engine_args
@@ -446,12 +450,15 @@ def _resolve_omni_metadata_hook(path: str | None) -> Callable | None:
     return getattr(importlib.import_module(module_path), function_name)
 
 
-def extract_stage_metadata_from_omni_config(
-    omni_config: VllmOmniConfig,
-    stage_id: int,
+def extract_stage_metadata_from_omni_stage_config(
+    stage_config: BaseVllmOmniStageConfig,
 ) -> StageMetadata:
-    """Project one typed stage config into metadata for a future cutover."""
-    stage_config = omni_config.stage_by_id(stage_id)
+    """Project one typed stage config into metadata for a future cutover.
+
+    This projection is not used by production startup yet. Current replica
+    layout, engine-argument, remote-diffusion, and platform setup paths still
+    require the legacy StageConfig/OmegaConf shape.
+    """
     stage_type: Literal["llm", "diffusion"] = "diffusion" if stage_config.stage_type == StageType.DIFFUSION else "llm"
     sampling_params_cls = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
     sampling_params: OmniSamplingParams = sampling_params_cls(

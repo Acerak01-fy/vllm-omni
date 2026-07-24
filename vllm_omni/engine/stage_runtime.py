@@ -339,6 +339,10 @@ class StageRuntime:
         """Build startup plans for every logical stage and replica."""
         stage_plans: list[LogicalStageInitPlan] = []
 
+        # RFC #4021 transition boundary: stage planning still relies on legacy
+        # StageConfig.runtime and StageConfig.engine_args for replica and engine
+        # setup. Keep metadata extraction on the legacy path until the
+        # coordinated stage-init cutover.
         for stage_idx, stage_cfg in enumerate(self._stage_configs):
             base_metadata = extract_legacy_stage_metadata(stage_cfg)
             stage_id = int(base_metadata.stage_id)
@@ -865,6 +869,8 @@ class DistStageRuntime(StageRuntime):
         if registered_stage_cfg is None:
             raise ValueError(f"Remote stage {plan.metadata.stage_id} registered without stage config")
 
+        # Remote diffusion registration still transports the legacy mapping
+        # shape. Reconstruct and project that shape until its RFC #4021 cutover.
         metadata = (
             extract_legacy_stage_metadata(OmegaConf.create(registered_stage_cfg))
             if plan.metadata.stage_type == "diffusion"

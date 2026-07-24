@@ -1347,6 +1347,9 @@ def launch_headless_diffusion_replicas(
         stage_id,
     )
 
+    # Headless diffusion startup and its downstream helpers still consume the
+    # legacy StageConfig shape; switch this with the coordinated RFC #4021
+    # stage-init cutover.
     metadata = stage_init_utils.extract_legacy_stage_metadata(stage_cfg)
     if omni_conn_cfg:
         inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)

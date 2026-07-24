@@ -16,7 +16,7 @@ from vllm_omni.config.stage_config import (
 from vllm_omni.engine.stage_init_utils import (
     extract_legacy_stage_metadata,
     extract_stage_metadata,
-    extract_stage_metadata_from_omni_config,
+    extract_stage_metadata_from_omni_stage_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -113,21 +113,23 @@ def test_extract_stage_metadata_matches_legacy_projection():
         "prompt_expand_func",
         "cfg_kv_collect_func",
     )
-    for stage_id, legacy_config in enumerate(legacy_configs):
-        structured = extract_stage_metadata_from_omni_config(omni_config, stage_id)
+    for legacy_config in legacy_configs:
+        stage_id = legacy_config.stage_id
+        omni_stage_config = omni_config.stage_by_id(stage_id)
+        structured = extract_stage_metadata_from_omni_stage_config(omni_stage_config)
         legacy = extract_legacy_stage_metadata(legacy_config)
 
         assert {field: getattr(structured, field) for field in parity_fields} == {
             field: getattr(legacy, field) for field in parity_fields
         }
         assert type(structured.default_sampling_params) is type(legacy.default_sampling_params)
-        assert structured.runtime_cfg is omni_config.stage_by_id(stage_id).runtime_config
+        assert structured.runtime_cfg is omni_stage_config.runtime_config
         for runtime_field in ("devices", "num_replicas", "env"):
             assert getattr(structured.runtime_cfg, runtime_field) == getattr(legacy.runtime_cfg, runtime_field)
 
-    thinker = extract_stage_metadata_from_omni_config(omni_config, 0)
-    talker = extract_stage_metadata_from_omni_config(omni_config, 1)
-    diffusion = extract_stage_metadata_from_omni_config(omni_config, 2)
+    thinker = extract_stage_metadata_from_omni_stage_config(omni_config.stage_by_id(0))
+    talker = extract_stage_metadata_from_omni_stage_config(omni_config.stage_by_id(1))
+    diffusion = extract_stage_metadata_from_omni_stage_config(omni_config.stage_by_id(2))
 
     assert isinstance(thinker.default_sampling_params, SamplingParams)
     assert thinker.default_sampling_params.temperature == 0.25
@@ -156,14 +158,3 @@ def test_extract_stage_metadata_preserves_legacy_one_argument_api():
     assert metadata.stage_id == 0
     assert metadata.model_stage == "thinker"
     assert metadata.custom_process_input_func is operator.add
-
-
-def test_extract_stage_metadata_from_omni_config_rejects_unknown_stage():
-    pipeline, deploy = _metadata_inputs()
-    omni_config = VllmOmniConfig.from_pipeline_config(
-        pipeline,
-        user_deploy_config=deploy,
-    )
-
-    with pytest.raises(KeyError, match="no stage 99"):
-        extract_stage_metadata_from_omni_config(omni_config, 99)
