@@ -497,7 +497,7 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
     )
     monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
     monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
-    monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
+    monkeypatch.setattr(runtime_mod, "build_legacy_engine_args_dict", lambda *_, **__: {})
     monkeypatch.setattr(
         runtime_mod,
         "build_vllm_config",

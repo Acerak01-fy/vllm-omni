@@ -820,7 +820,7 @@ def run_headless(args: TrackingNamespace) -> None:
         launch_headless_llm_replicas,
     )
     from vllm_omni.engine.stage_init_utils import (
-        build_engine_args_dict,
+        build_legacy_engine_args_dict,
         build_vllm_config,
         get_stage_connector_spec,
         inject_omni_kv_connector_config,
@@ -924,7 +924,10 @@ def run_headless(args: TrackingNamespace) -> None:
     # CUDA_VISIBLE_DEVICES; when ``--omni-dp-size-local > 1`` we additionally
     # bracket each replica's spawn below with setup_stage_devices so they
     # don't all stack on cuda:0 (see ``per_replica_devices`` above).
-    engine_args_dict = build_engine_args_dict(
+    # Headless startup still receives the legacy OmegaConf stage shape. Keep
+    # this consumer explicit until the RFC #4021 stage-init cutover threads
+    # structured stage configs through the launch plan.
+    engine_args_dict = build_legacy_engine_args_dict(
         stage_cfg,
         model,
         stage_connector_spec=stage_connector_spec,

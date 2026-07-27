@@ -47,7 +47,7 @@ from vllm_omni.engine.stage_init_utils import (
     ReplicaInitPlan,
     _inject_inferred_kv_tp_topology,
     acquire_device_locks,
-    build_engine_args_dict,
+    build_legacy_engine_args_dict,
     build_llm_stage_output_processor,
     build_vllm_config,
     compute_replica_layout,
@@ -370,7 +370,10 @@ class StageRuntime:
             executor_class = None
             engine_args_dict = None
             if base_metadata.stage_type != "diffusion":
-                engine_args_dict = build_engine_args_dict(
+                # Engine-argument projection remains on the same legacy stage
+                # object as replica planning until the coordinated RFC #4021
+                # stage-init cutover.
+                engine_args_dict = build_legacy_engine_args_dict(
                     stage_cfg,
                     self._model,
                     stage_connector_spec=stage_connector_spec,

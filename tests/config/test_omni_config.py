@@ -39,7 +39,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
-from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -364,8 +364,10 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
     assert {f.name for f in fields(VllmOmniGenerationStageConfig)} == public_fields
 
 
-def test_runtime_config_fields_match_rfc_runtime_scope():
+def test_runtime_config_fields_match_structured_runtime_scope():
     assert {f.name for f in fields(OmniStageRuntimeConfig)} == {
+        "distributed_executor_backend",
+        "worker_cls",
         "devices",
         "num_replicas",
         "env",
@@ -376,8 +378,16 @@ def test_runtime_config_fields_match_rfc_runtime_scope():
     }
 
 
-def test_sub_config_fields_match_rfc_scopes():
+def test_sub_config_fields_match_structured_scopes():
     assert {f.name for f in fields(OmniStageModelConfig)} == {
+        "model",
+        "model_arch",
+        "trust_remote_code",
+        "dtype",
+        "attention_backend",
+        "moe_backend",
+        "hf_overrides",
+        "limit_mm_per_prompt",
         "active_stream_window",
         "enable_sleep_mode",
         "default_sampling_params",
@@ -387,6 +397,7 @@ def test_sub_config_fields_match_rfc_scopes():
         "task_type",
         "codec_frame_rate_hz",
         "enforce_eager",
+        "max_cudagraph_capture_size",
         "enable_flashinfer_autotune",
         "compilation_config",
         "enable_multithread_weight_load",
@@ -399,12 +410,15 @@ def test_sub_config_fields_match_rfc_scopes():
         "tokenizer_subdir",
     }
     assert {f.name for f in fields(OmniStageLoadConfig)} == {
+        "tokenizer",
+        "skip_tokenizer_init",
         "load_format",
         "tokenizer_mode",
         "config_format",
         "skip_mm_profiling",
     }
     assert {f.name for f in fields(OmniStageCacheConfig)} == {
+        "kv_cache_memory_bytes",
         "gpu_memory_utilization",
         "enable_prefix_caching",
         "disable_hybrid_kv_cache_manager",
@@ -418,6 +432,8 @@ def test_sub_config_fields_match_rfc_scopes():
         "async_scheduling",
     }
     assert {f.name for f in fields(OmniStageConnectorConfig)} == {
+        "async_chunk",
+        "omni_kv_config",
         "stage_connector",
         "output_connectors",
         "input_connectors",
@@ -809,7 +825,7 @@ def test_from_pipeline_config_matches_build_engine_args_dict_behavior_for_repres
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy(pipeline))[0]
     omega_stage = legacy_stage.to_omegaconf()
-    legacy_engine_args = build_engine_args_dict(
+    legacy_engine_args = build_legacy_engine_args_dict(
         omega_stage,
         model="/tmp/qwen3-tts",
         stage_connector_spec={"name": "SharedMemoryConnector", "extra": {}},
@@ -904,6 +920,8 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
 
 
 def test_diffusion_config_field_classification_covers_current_fields():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
     classified_fields = (
         omni_config_module._DIFFUSION_SHARED_CONFIG_FIELDS
         | omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
@@ -911,6 +929,9 @@ def test_diffusion_config_field_classification_covers_current_fields():
     )
 
     assert classified_fields == {f.name for f in fields(omni_config_module._DiffusionConfigProjection)}
+    assert {f.name for f in fields(OmniDiffusionConfig)} <= (
+        classified_fields | omni_config_module._DIFFUSION_MOVED_SHARED_FIELDS
+    )
     assert {
         "enable_prompt_embed_cache",
         "prompt_embed_cache_size",
