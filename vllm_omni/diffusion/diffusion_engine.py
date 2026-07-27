@@ -46,6 +46,7 @@ from vllm_omni.diffusion.registry import (
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
+from vllm_omni.diffusion.stage_kv.interface import validate_stage_kv_worker_init_result
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -220,6 +221,17 @@ class DiffusionEngine:
         else:
             self.scheduler = RequestScheduler()
         self.scheduler.initialize(od_config)
+        self._initialize_stage_kv_workers()
+
+    def _initialize_stage_kv_workers(self) -> None:
+        provider = getattr(self.scheduler, "get_stage_kv_worker_init_config", None)
+        if provider is None:
+            return
+        config = provider()
+        if config is None:
+            return
+        result = self.executor.initialize_stage_kv(config)
+        validate_stage_kv_worker_init_result(config, result)
 
     def _init_runtime_state(self) -> None:
         self.main_loop: asyncio.AbstractEventLoop | None = None

@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any, TypedDict
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.stage_kv.interface import StageKVMetadata
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -177,6 +178,8 @@ class DiffusionSchedulerOutput:
     num_waiting_reqs: int
     # next request to background-prefetch KV
     kv_prefetch_job: KVPrefetchJob | None = None
+    # New Scheduler-owned paged allocations to install on Workers.
+    stage_kv_metadata: dict[str, StageKVMetadata] = field(default_factory=dict)
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:

@@ -7,6 +7,12 @@ from typing import TYPE_CHECKING, Any
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.stage_kv.interface import (
+    StageKVWorkerInitConfig,
+    StageKVWorkerInitResult,
+    validate_stage_kv_worker_init_config,
+    validate_stage_kv_worker_init_result,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -88,6 +94,19 @@ class DiffusionExecutor(ABC):
     def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute step-mode work from a scheduler output."""
         pass
+
+    def initialize_stage_kv(self, config: StageKVWorkerInitConfig) -> StageKVWorkerInitResult:
+        """Broadcast the Stage KV bootstrap contract to every Worker."""
+
+        validate_stage_kv_worker_init_config(config)
+        responses = self.collective_rpc("initialize_stage_kv", args=(config,))
+        if not isinstance(responses, list) or len(responses) != 1:
+            raise RuntimeError(
+                f"Stage KV initialization expected one rank-0 response envelope, got {type(responses).__name__}"
+            )
+        result = responses[0]
+        validate_stage_kv_worker_init_result(config, result)
+        return result
 
     @abstractmethod
     def collective_rpc(

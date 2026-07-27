@@ -47,6 +47,11 @@ from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
+from vllm_omni.diffusion.stage_kv.interface import (
+    StageKVMetadata,
+    StageKVWorkerInitConfig,
+    StageKVWorkerInitResult,
+)
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
@@ -410,11 +415,18 @@ class DiffusionWorker:
         else:
             profiler.stop()
 
+    def initialize_stage_kv(self, config: StageKVWorkerInitConfig) -> StageKVWorkerInitResult:
+        """Initialize the ModelRunner-side Stage KV contract."""
+
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner.initialize_stage_kv(config)
+
     def execute_model(
         self,
         req: OmniDiffusionRequest,
         od_config: OmniDiffusionConfig,
         kv_prefetch_job: KVPrefetchJob | None = None,
+        stage_kv_metadata: StageKVMetadata | None = None,
     ) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
@@ -428,7 +440,11 @@ class DiffusionWorker:
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
-            output = self.model_runner.execute_model(req, kv_prefetch_job=kv_prefetch_job)
+            output = self.model_runner.execute_model(
+                req,
+                kv_prefetch_job=kv_prefetch_job,
+                stage_kv_metadata=stage_kv_metadata,
+            )
         if profiler:
             profiler.step()
         return output
@@ -1142,6 +1158,7 @@ class WorkerWrapperBase:
         req: OmniDiffusionRequest,
         od_config: OmniDiffusionConfig,
         kv_prefetch_job: KVPrefetchJob | None = None,
+        stage_kv_metadata: StageKVMetadata | None = None,
     ) -> DiffusionOutput:
         """
         Execute a forward pass.
@@ -1154,7 +1171,10 @@ class WorkerWrapperBase:
         Returns:
             DiffusionOutput with generated results
         """
-        return self.worker.execute_model(req, od_config, kv_prefetch_job=kv_prefetch_job)
+        kwargs: dict[str, Any] = {"kv_prefetch_job": kv_prefetch_job}
+        if stage_kv_metadata is not None:
+            kwargs["stage_kv_metadata"] = stage_kv_metadata
+        return self.worker.execute_model(req, od_config, **kwargs)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""
