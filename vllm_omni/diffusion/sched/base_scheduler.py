@@ -73,8 +73,11 @@ class BaseScheduler(ABC):
         """Return the optional Worker bootstrap contract for this Scheduler.
 
         Dense schedulers intentionally inherit the no-op default. A paged
-        Scheduler must override this method and return the exact native
-        ``KVCacheConfig`` used by its own ``KVCacheManager``.
+        Scheduler must override this method after deriving a native
+        ``KVCacheConfig`` from its canonical Stage KV cache spec, and return
+        the same config used by its own ``KVCacheManager``. Request planning
+        requirements remain Scheduler-owned and are not part of this Worker
+        bootstrap contract.
         """
 
         return None

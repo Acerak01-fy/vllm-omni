@@ -58,7 +58,7 @@ def test_model_runner_requires_metadata_only_for_paged_new_requests() -> None:
     runner.install_stage_kv_metadata(new_request_ids=[], metadata_by_request={})
 
 
-def test_request_executor_forwards_only_request_local_metadata() -> None:
+def test_request_executor_keeps_prepared_layout_and_allocation_metadata_separate() -> None:
     executor = object.__new__(MultiprocDiffusionExecutor)
     executor.od_config = SimpleNamespace()
     executor._ensure_open = lambda: None
@@ -69,20 +69,27 @@ def test_request_executor_forwards_only_request_local_metadata() -> None:
         return DiffusionOutput(output=None)
 
     executor.collective_rpc = collective_rpc
-    req = SimpleNamespace(request_id="req-0")
+    prepared_layout = object()
+    allocation_metadata = make_metadata()
+    req = SimpleNamespace(request_id="req-0", prepared_layout=prepared_layout)
     scheduler_output = SimpleNamespace(
         scheduled_new_reqs=[SimpleNamespace(request_id="req-0", req=req)],
         kv_prefetch_job=None,
-        stage_kv_metadata={"req-0": make_metadata()},
+        stage_kv_metadata={"req-0": allocation_metadata},
     )
 
     result = executor.execute_request(scheduler_output)
 
     assert result.request_ids == ["req-0"]
+    rpc_req = calls[0][1][0]
+    rpc_metadata = calls[0][1][3]
+    assert rpc_req is req
+    assert rpc_req.prepared_layout is prepared_layout
+    assert rpc_metadata is allocation_metadata
     assert calls == [
         (
             "execute_model",
-            (req, executor.od_config, None, scheduler_output.stage_kv_metadata["req-0"]),
+            (req, executor.od_config, None, allocation_metadata),
             0,
             True,
         )

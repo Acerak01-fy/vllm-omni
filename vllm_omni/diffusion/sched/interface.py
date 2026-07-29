@@ -178,7 +178,9 @@ class DiffusionSchedulerOutput:
     num_waiting_reqs: int
     # next request to background-prefetch KV
     kv_prefetch_job: KVPrefetchJob | None = None
-    # New Scheduler-owned paged allocations to install on Workers.
+    # New Scheduler-owned paged allocation results to install on Workers.
+    # Planner requirements remain in SchedulerRequestState; model-owned
+    # prepared_layout remains attached to each NewRequestData.req.
     stage_kv_metadata: dict[str, StageKVMetadata] = field(default_factory=dict)
 
     @cached_property

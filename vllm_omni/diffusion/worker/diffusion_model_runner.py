@@ -157,7 +157,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         return getattr(self.pipeline, "device", None)
 
     def initialize_stage_kv(self, config: StageKVWorkerInitConfig) -> StageKVWorkerInitResult:
-        """Validate and retain the paged-KV contract without allocating pages."""
+        """Validate and retain the paged-KV contract without allocating pages.
+
+        The config describes Scheduler-owned allocations only. Model planning
+        requirements never enter the generic Worker storage path.
+        """
 
         validate_stage_kv_worker_init_config(config)
         current_config = getattr(self, "stage_kv_init_config", None)
@@ -180,7 +184,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Validate new-request metadata before model execution.
 
         PR-W0 deliberately performs no physical installation. PR-W1 extends
-        this hook with native vLLM Worker ``BlockTables`` updates.
+        this hook with native vLLM Worker ``BlockTables`` updates. This hook
+        consumes only Scheduler allocation results; any model-owned
+        ``request.prepared_layout`` remains on the request for a model adapter
+        or consumer to interpret.
         """
 
         expected_request_ids = set(new_request_ids)
