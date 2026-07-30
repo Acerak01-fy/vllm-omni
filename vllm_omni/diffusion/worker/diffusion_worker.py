@@ -427,6 +427,7 @@ class DiffusionWorker:
         od_config: OmniDiffusionConfig,
         kv_prefetch_job: KVPrefetchJob | None = None,
         stage_kv_metadata: StageKVMetadata | None = None,
+        stage_kv_expected_layout_digest: str | None = None,
     ) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
@@ -444,6 +445,7 @@ class DiffusionWorker:
                 req,
                 kv_prefetch_job=kv_prefetch_job,
                 stage_kv_metadata=stage_kv_metadata,
+                stage_kv_expected_layout_digest=stage_kv_expected_layout_digest,
             )
         if profiler:
             profiler.step()
@@ -1159,6 +1161,7 @@ class WorkerWrapperBase:
         od_config: OmniDiffusionConfig,
         kv_prefetch_job: KVPrefetchJob | None = None,
         stage_kv_metadata: StageKVMetadata | None = None,
+        stage_kv_expected_layout_digest: str | None = None,
     ) -> DiffusionOutput:
         """
         Execute a forward pass.
@@ -1174,6 +1177,9 @@ class WorkerWrapperBase:
         kwargs: dict[str, Any] = {"kv_prefetch_job": kv_prefetch_job}
         if stage_kv_metadata is not None:
             kwargs["stage_kv_metadata"] = stage_kv_metadata
+            kwargs["stage_kv_expected_layout_digest"] = stage_kv_expected_layout_digest
+        elif stage_kv_expected_layout_digest is not None:
+            raise ValueError("Stage KV expected layout digest requires allocation metadata")
         return self.worker.execute_model(req, od_config, **kwargs)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:

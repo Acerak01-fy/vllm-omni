@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.diffusion.stage_kv.test_interface import make_init_config, make_metadata
+from tests.diffusion.stage_kv.test_interface import REQUEST_LAYOUT_DIGEST, make_init_config, make_metadata
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
@@ -13,6 +13,7 @@ from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionEx
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput
 from vllm_omni.diffusion.stage_kv.interface import StageKVWorkerInitResult
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker, WorkerWrapperBase
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
@@ -39,23 +40,92 @@ def test_model_runner_initialization_is_validation_only_and_idempotent() -> None
 def test_model_runner_requires_metadata_only_for_paged_new_requests() -> None:
     runner = make_runner()
 
-    runner.install_stage_kv_metadata(new_request_ids=["dense"], metadata_by_request={})
+    runner.install_stage_kv_metadata(
+        new_request_ids=["dense"],
+        metadata_by_request={},
+        expected_layout_digests_by_request={},
+    )
     with pytest.raises(RuntimeError, match="before paged Worker initialization"):
         runner.install_stage_kv_metadata(
             new_request_ids=["dense"],
             metadata_by_request={"dense": make_metadata(request_id="dense")},
+            expected_layout_digests_by_request={"dense": "request-layout-v1"},
         )
 
     runner.initialize_stage_kv(make_init_config())
     with pytest.raises(RuntimeError, match="missing=\\['req-0'\\]"):
-        runner.install_stage_kv_metadata(new_request_ids=["req-0"], metadata_by_request={})
+        runner.install_stage_kv_metadata(
+            new_request_ids=["req-0"],
+            metadata_by_request={},
+            expected_layout_digests_by_request={},
+        )
+    with pytest.raises(RuntimeError, match="expected layout digests.*missing=\\['req-0'\\]"):
+        runner.install_stage_kv_metadata(
+            new_request_ids=["req-0"],
+            metadata_by_request={"req-0": make_metadata()},
+            expected_layout_digests_by_request={},
+        )
 
     runner.install_stage_kv_metadata(
         new_request_ids=["req-0"],
         metadata_by_request={"req-0": make_metadata()},
+        expected_layout_digests_by_request={"req-0": REQUEST_LAYOUT_DIGEST},
     )
     # A cached step carries no new-request allocation metadata.
-    runner.install_stage_kv_metadata(new_request_ids=[], metadata_by_request={})
+    runner.install_stage_kv_metadata(
+        new_request_ids=[],
+        metadata_by_request={},
+        expected_layout_digests_by_request={},
+    )
+
+
+def test_model_runner_rejects_stale_request_layout_before_forward() -> None:
+    runner = make_runner()
+    runner.initialize_stage_kv(make_init_config())
+
+    with pytest.raises(ValueError, match="expected request layout digest"):
+        runner.execute_model(
+            SimpleNamespace(request_id="req-0"),
+            stage_kv_metadata=make_metadata(),
+            stage_kv_expected_layout_digest="current-request-layout",
+        )
+
+
+def test_worker_rpc_preserves_independent_expected_layout_digest() -> None:
+    metadata = make_metadata()
+    expected_layout_digest = "current-request-layout"
+    calls = []
+
+    class ModelRunner:
+        def execute_model(self, req, **kwargs):
+            calls.append((req, kwargs))
+            return DiffusionOutput(output=None)
+
+    worker = object.__new__(DiffusionWorker)
+    worker.model_runner = ModelRunner()
+    worker.lora_manager = None
+    wrapper = object.__new__(WorkerWrapperBase)
+    wrapper.worker = worker
+    req = SimpleNamespace(request_id="req-0")
+
+    result = wrapper.execute_model(
+        req,
+        SimpleNamespace(),
+        stage_kv_metadata=metadata,
+        stage_kv_expected_layout_digest=expected_layout_digest,
+    )
+
+    assert isinstance(result, DiffusionOutput)
+    assert calls == [
+        (
+            req,
+            {
+                "kv_prefetch_job": None,
+                "stage_kv_metadata": metadata,
+                "stage_kv_expected_layout_digest": expected_layout_digest,
+            },
+        )
+    ]
 
 
 def test_request_executor_keeps_prepared_layout_and_allocation_metadata_separate() -> None:
@@ -71,11 +141,13 @@ def test_request_executor_keeps_prepared_layout_and_allocation_metadata_separate
     executor.collective_rpc = collective_rpc
     prepared_layout = object()
     allocation_metadata = make_metadata()
+    current_request_layout_digest = "current-request-layout"
     req = SimpleNamespace(request_id="req-0", prepared_layout=prepared_layout)
     scheduler_output = SimpleNamespace(
         scheduled_new_reqs=[SimpleNamespace(request_id="req-0", req=req)],
         kv_prefetch_job=None,
         stage_kv_metadata={"req-0": allocation_metadata},
+        stage_kv_expected_layout_digests={"req-0": current_request_layout_digest},
     )
 
     result = executor.execute_request(scheduler_output)
@@ -83,13 +155,21 @@ def test_request_executor_keeps_prepared_layout_and_allocation_metadata_separate
     assert result.request_ids == ["req-0"]
     rpc_req = calls[0][1][0]
     rpc_metadata = calls[0][1][3]
+    rpc_expected_digest = calls[0][1][4]
     assert rpc_req is req
     assert rpc_req.prepared_layout is prepared_layout
     assert rpc_metadata is allocation_metadata
+    assert rpc_expected_digest == current_request_layout_digest
     assert calls == [
         (
             "execute_model",
-            (req, executor.od_config, None, allocation_metadata),
+            (
+                req,
+                executor.od_config,
+                None,
+                allocation_metadata,
+                current_request_layout_digest,
+            ),
             0,
             True,
         )
@@ -119,6 +199,56 @@ def test_executor_initialization_uses_all_worker_control_rpc() -> None:
     assert calls == [("initialize_stage_kv", (config,), None, False)]
 
 
+def test_request_executor_does_not_trust_digest_from_metadata() -> None:
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor.od_config = SimpleNamespace()
+    executor._ensure_open = lambda: None
+    calls = []
+
+    def collective_rpc(method, *, args, unique_reply_rank, exec_all_ranks):
+        calls.append((method, args, unique_reply_rank, exec_all_ranks))
+
+    executor.collective_rpc = collective_rpc
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                request_id="req-0",
+                req=SimpleNamespace(request_id="req-0"),
+            )
+        ],
+        kv_prefetch_job=None,
+        stage_kv_metadata={"req-0": make_metadata()},
+        stage_kv_expected_layout_digests={},
+    )
+
+    result = executor.execute_request(scheduler_output)
+
+    assert result.request_ids == ["req-0"]
+    assert calls == []
+    assert "allocation metadata and expected layout digest must be provided together" in (
+        result.runner_outputs[0].result.error
+    )
+
+
+def test_executor_initialization_rejects_worker_result_mismatch() -> None:
+    config = make_init_config()
+    mismatched = StageKVWorkerInitResult(
+        cache_mode=config.cache_mode,
+        cache_layout_fingerprint=config.cache_layout_fingerprint,
+        num_blocks=config.kv_cache_config.num_blocks + 1,
+        physical_layout=config.physical_layout,
+    )
+
+    class Executor:
+        def collective_rpc(
+            self, method, timeout=None, args=(), kwargs=None, unique_reply_rank=None, exec_all_ranks=False
+        ):
+            return [mismatched]
+
+    with pytest.raises(ValueError, match="num_blocks mismatch"):
+        DiffusionExecutor.initialize_stage_kv(Executor(), config)
+
+
 def test_dense_request_executor_keeps_legacy_rpc_shape() -> None:
     executor = object.__new__(MultiprocDiffusionExecutor)
     executor.od_config = SimpleNamespace()
@@ -135,6 +265,7 @@ def test_dense_request_executor_keeps_legacy_rpc_shape() -> None:
         scheduled_new_reqs=[SimpleNamespace(request_id="dense", req=req)],
         kv_prefetch_job=None,
         stage_kv_metadata={},
+        stage_kv_expected_layout_digests={},
     )
 
     executor.execute_request(scheduler_output)
@@ -144,6 +275,7 @@ def test_dense_request_executor_keeps_legacy_rpc_shape() -> None:
 
 def test_batch_and_step_paths_install_scheduler_metadata_before_forward() -> None:
     metadata = make_metadata()
+    current_request_layout_digest = "current-request-layout"
     scheduler_output = DiffusionSchedulerOutput(
         step_id=0,
         scheduled_new_reqs=[
@@ -157,6 +289,7 @@ def test_batch_and_step_paths_install_scheduler_metadata_before_forward() -> Non
         num_running_reqs=1,
         num_waiting_reqs=0,
         stage_kv_metadata={"req-0": metadata},
+        stage_kv_expected_layout_digests={"req-0": current_request_layout_digest},
     )
     calls = []
 
@@ -164,8 +297,20 @@ def test_batch_and_step_paths_install_scheduler_metadata_before_forward() -> Non
         pipeline = object()
         od_config = SimpleNamespace()
 
-        def install_stage_kv_metadata(self, *, new_request_ids, metadata_by_request):
-            calls.append((new_request_ids, metadata_by_request))
+        def install_stage_kv_metadata(
+            self,
+            *,
+            new_request_ids,
+            metadata_by_request,
+            expected_layout_digests_by_request,
+        ):
+            calls.append(
+                (
+                    new_request_ids,
+                    metadata_by_request,
+                    expected_layout_digests_by_request,
+                )
+            )
 
         def _execute_request_list(self, *args, **kwargs):
             return "batch-output"
@@ -179,8 +324,16 @@ def test_batch_and_step_paths_install_scheduler_metadata_before_forward() -> Non
         DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
 
     assert calls == [
-        (["req-0"], {"req-0": metadata}),
-        (["req-0"], {"req-0": metadata}),
+        (
+            ["req-0"],
+            {"req-0": metadata},
+            {"req-0": current_request_layout_digest},
+        ),
+        (
+            ["req-0"],
+            {"req-0": metadata},
+            {"req-0": current_request_layout_digest},
+        ),
     ]
 
 

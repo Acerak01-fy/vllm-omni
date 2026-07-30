@@ -309,6 +309,8 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
         finished_req_ids=set(),
         scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
         scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        stage_kv_metadata={},
+        stage_kv_expected_layout_digests={},
     )
 
     first = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
@@ -318,6 +320,8 @@ def test_execute_stepwise_streaming_returns_chunks_at_boundaries(monkeypatch):
         finished_req_ids=set(),
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(request_ids=["req"]),
+        stage_kv_metadata={},
+        stage_kv_expected_layout_digests={},
     )
     second = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
     assert second.get_request_output("req").result == chunks[0]
@@ -349,6 +353,8 @@ def test_execute_stepwise_streaming_decodes_final_only_pipeline(monkeypatch):
         finished_req_ids=set(),
         scheduled_new_reqs=[SimpleNamespace(request_id="req", req=req)],
         scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+        stage_kv_metadata={},
+        stage_kv_expected_layout_digests={},
     )
 
     output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output).get_request_output("req")
@@ -500,7 +506,11 @@ def _make_scheduler_output(num_reqs: int):
     reqs = [_make_request() for _ in range(num_reqs)]
     for i, req in enumerate(reqs):
         req.request_id = f"req-{i}"
-    return SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req=req) for req in reqs])
+    return SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req=req) for req in reqs],
+        stage_kv_metadata={},
+        stage_kv_expected_layout_digests={},
+    )
 
 
 @pytest.mark.core_model

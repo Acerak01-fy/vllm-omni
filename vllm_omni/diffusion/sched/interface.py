@@ -182,6 +182,10 @@ class DiffusionSchedulerOutput:
     # Planner requirements remain in SchedulerRequestState; model-owned
     # prepared_layout remains attached to each NewRequestData.req.
     stage_kv_metadata: dict[str, StageKVMetadata] = field(default_factory=dict)
+    # Current request-layout identities from
+    # SchedulerRequestState.stage_kv_requirement. Paged schedulers must not
+    # derive these independently trusted values from StageKVMetadata.
+    stage_kv_expected_layout_digests: dict[str, str] = field(default_factory=dict)
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:

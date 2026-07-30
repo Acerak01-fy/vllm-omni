@@ -40,12 +40,17 @@ BLOCK_KV_TOKEN_HEAD_DIM_V1 = StageKVPhysicalLayout(
 
 @dataclass(frozen=True)
 class StageKVBranchMetadata:
-    """Scheduler allocation for one request-local execution branch."""
+    """Scheduler allocation for one request-local execution branch.
+
+    ``seq_len`` is copied from the Planner requirement and is the block-count
+    allocation basis. It may exceed ``stable_len + current_len``.
+    """
 
     branch_id: int
     block_ids: tuple[tuple[int, ...], ...]
     stable_len: int
     current_len: int
+    seq_len: int
 
     def __post_init__(self) -> None:
         if self.branch_id < 0:
@@ -56,10 +61,13 @@ class StageKVBranchMetadata:
             raise ValueError(f"stable_len must be non-negative, got {self.stable_len}")
         if self.current_len <= 0:
             raise ValueError(f"current_len must be positive, got {self.current_len}")
-
-    @property
-    def resident_len(self) -> int:
-        return self.stable_len + self.current_len
+        if self.seq_len <= 0:
+            raise ValueError(f"seq_len must be positive, got {self.seq_len}")
+        if self.stable_len + self.current_len > self.seq_len:
+            raise ValueError(
+                "stable_len + current_len must not exceed seq_len: "
+                f"stable_len={self.stable_len}, current_len={self.current_len}, seq_len={self.seq_len}"
+            )
 
 
 @dataclass(frozen=True)
@@ -166,10 +174,10 @@ def validate_stage_kv_worker_init_config(config: StageKVWorkerInitConfig) -> Non
         spec = group.kv_cache_spec
         if spec.block_size <= 0 or spec.num_kv_heads <= 0 or spec.head_size <= 0:
             raise ValueError(f"invalid FullAttentionSpec geometry for layers {group.layer_names!r}")
-        if spec.head_size_v != spec.head_size:
+        head_size_v = getattr(spec, "head_size_v", spec.head_size)
+        if head_size_v != spec.head_size:
             raise ValueError(
-                "BLOCK_KV_TOKEN_HEAD_DIM_V1 requires equal K/V head sizes, "
-                f"got K={spec.head_size}, V={spec.head_size_v}"
+                f"BLOCK_KV_TOKEN_HEAD_DIM_V1 requires equal K/V head sizes, got K={spec.head_size}, V={head_size_v}"
             )
         for layer_name in group.layer_names:
             if not layer_name:
@@ -185,10 +193,33 @@ def validate_stage_kv_worker_init_config(config: StageKVWorkerInitConfig) -> Non
             raise ValueError(f"KV cache tensor size must be positive, got {tensor.size}")
         if not tensor.shared_by:
             raise ValueError("every KV cache tensor must be shared by at least one layer")
+        page_sizes: set[int] = set()
         for layer_name in tensor.shared_by:
             if layer_name not in specs_by_layer:
                 raise ValueError(f"KV cache tensor references unknown layer {layer_name!r}")
+            page_sizes.add(specs_by_layer[layer_name].page_size_bytes)
             tensor_layers.append(layer_name)
+
+        if len(page_sizes) != 1:
+            raise ValueError(
+                "BLOCK_KV_TOKEN_HEAD_DIM_V1 cannot share one tensor across "
+                f"layers with different page sizes: {tensor.shared_by!r}"
+            )
+        expected_size = kv_cache_config.num_blocks * page_sizes.pop()
+        if tensor.size != expected_size:
+            raise ValueError(
+                "BLOCK_KV_TOKEN_HEAD_DIM_V1 tensor size mismatch for "
+                f"{tensor.shared_by!r}: expected {expected_size}, got {tensor.size}"
+            )
+        if tensor.offset != 0:
+            raise ValueError(
+                f"BLOCK_KV_TOKEN_HEAD_DIM_V1 requires zero tensor offset, got {tensor.offset} for {tensor.shared_by!r}"
+            )
+        if tensor.block_stride != 0:
+            raise ValueError(
+                "BLOCK_KV_TOKEN_HEAD_DIM_V1 requires unpacked tensors "
+                f"(block_stride=0), got {tensor.block_stride} for {tensor.shared_by!r}"
+            )
 
     if sorted(tensor_layers) != sorted(group_layers):
         raise ValueError("KV cache tensors must cover every grouped layer exactly once")
@@ -224,15 +255,22 @@ def validate_stage_kv_metadata(
     *,
     config: StageKVWorkerInitConfig,
     request_id: str,
+    expected_request_layout_digest: str,
 ) -> None:
-    """Validate one allocation before it reaches model forward."""
+    """Validate one allocation against the current request before forward."""
 
     if not isinstance(config, StageKVWorkerInitConfig):
         raise TypeError("config must be StageKVWorkerInitConfig")
     if not isinstance(metadata, StageKVMetadata):
         raise TypeError("metadata must be StageKVMetadata")
+    if not expected_request_layout_digest:
+        raise ValueError("expected_request_layout_digest must be non-empty")
     if metadata.request_id != request_id:
         raise ValueError(f"Stage KV metadata request mismatch: expected={request_id!r}, got={metadata.request_id!r}")
+    if metadata.request_layout_digest != expected_request_layout_digest:
+        raise ValueError(
+            f"Stage KV metadata for request {request_id!r} does not match the expected request layout digest"
+        )
     if metadata.cache_layout_fingerprint != config.cache_layout_fingerprint:
         raise ValueError(f"Stage KV metadata for request {request_id!r} has an incompatible layout fingerprint")
 
@@ -244,13 +282,14 @@ def validate_stage_kv_metadata(
             )
         for group_idx, (block_ids, group) in enumerate(zip(branch.block_ids, groups, strict=True)):
             block_size = group.kv_cache_spec.block_size
-            expected_num_blocks = (branch.resident_len + block_size - 1) // block_size
+            expected_num_blocks = (branch.seq_len + block_size - 1) // block_size
             if len(block_ids) != expected_num_blocks:
                 raise ValueError(
                     f"Stage KV branch {branch.branch_id} group {group_idx} has "
                     f"{len(block_ids)} blocks; expected {expected_num_blocks}"
                 )
-            if any(block_id < 0 or block_id >= config.kv_cache_config.num_blocks for block_id in block_ids):
+            if any(not 0 < block_id < config.kv_cache_config.num_blocks for block_id in block_ids):
                 raise ValueError(
-                    f"Stage KV branch {branch.branch_id} group {group_idx} contains an out-of-range block id"
+                    f"Stage KV branch {branch.branch_id} group {group_idx} contains a reserved or out-of-range "
+                    f"block id; expected 0 < block_id < {config.kv_cache_config.num_blocks}"
                 )

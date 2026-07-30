@@ -328,9 +328,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             req = new_req.req
             try:
                 args: tuple = (req, self.od_config, scheduler_output.kv_prefetch_job)
-                stage_kv_metadata = getattr(scheduler_output, "stage_kv_metadata", {}).get(new_req.request_id)
+                stage_kv_metadata = scheduler_output.stage_kv_metadata.get(new_req.request_id)
+                expected_layout_digest = scheduler_output.stage_kv_expected_layout_digests.get(new_req.request_id)
+                if (stage_kv_metadata is None) != (expected_layout_digest is None):
+                    raise RuntimeError(
+                        f"Incomplete Stage KV request data for request {new_req.request_id!r}: "
+                        "allocation metadata and expected layout digest must be provided together"
+                    )
                 if stage_kv_metadata is not None:
-                    args += (stage_kv_metadata,)
+                    args += (stage_kv_metadata, expected_layout_digest)
                 result = self.collective_rpc(
                     "execute_model",
                     args=args,

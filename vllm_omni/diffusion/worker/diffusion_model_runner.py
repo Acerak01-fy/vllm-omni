@@ -180,30 +180,40 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         *,
         new_request_ids: list[str],
         metadata_by_request: dict[str, StageKVMetadata],
+        expected_layout_digests_by_request: dict[str, str],
     ) -> None:
         """Validate new-request metadata before model execution.
 
         PR-W0 deliberately performs no physical installation. PR-W1 extends
-        this hook with native vLLM Worker ``BlockTables`` updates. This hook
-        consumes only Scheduler allocation results; any model-owned
-        ``request.prepared_layout`` remains on the request for a model adapter
-        or consumer to interpret.
+        this hook with native vLLM Worker ``BlockTables`` updates. Allocation
+        metadata is checked against the current Planner-derived layout digest;
+        the full requirement remains Scheduler-owned and model-owned
+        ``request.prepared_layout`` remains on the request.
         """
 
         expected_request_ids = set(new_request_ids)
         metadata_request_ids = set(metadata_by_request)
+        digest_request_ids = set(expected_layout_digests_by_request)
         stage_kv_init_config = getattr(self, "stage_kv_init_config", None)
         if stage_kv_init_config is None:
-            if metadata_request_ids:
-                raise RuntimeError("Received Stage KV metadata before paged Worker initialization")
+            if metadata_request_ids or digest_request_ids:
+                raise RuntimeError("Received Stage KV request data before paged Worker initialization")
             return
 
-        missing = expected_request_ids - metadata_request_ids
-        unexpected = metadata_request_ids - expected_request_ids
-        if missing or unexpected:
+        missing_metadata = expected_request_ids - metadata_request_ids
+        unexpected_metadata = metadata_request_ids - expected_request_ids
+        if missing_metadata or unexpected_metadata:
             raise RuntimeError(
                 "Stage KV metadata does not match newly scheduled requests: "
-                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+                f"missing={sorted(missing_metadata)}, unexpected={sorted(unexpected_metadata)}"
+            )
+
+        missing_digests = expected_request_ids - digest_request_ids
+        unexpected_digests = digest_request_ids - expected_request_ids
+        if missing_digests or unexpected_digests:
+            raise RuntimeError(
+                "Stage KV expected layout digests do not match newly scheduled requests: "
+                f"missing={sorted(missing_digests)}, unexpected={sorted(unexpected_digests)}"
             )
 
         for request_id in new_request_ids:
@@ -211,6 +221,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 metadata_by_request[request_id],
                 config=stage_kv_init_config,
                 request_id=request_id,
+                expected_request_layout_digest=expected_layout_digests_by_request[request_id],
             )
 
     def _compile_transformer(self, attr_name: str) -> None:
@@ -606,6 +617,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         req: OmniDiffusionRequest,
         kv_prefetch_job: KVPrefetchJob | None = None,
         stage_kv_metadata: StageKVMetadata | None = None,
+        stage_kv_expected_layout_digest: str | None = None,
     ) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
@@ -625,6 +637,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.install_stage_kv_metadata(
             new_request_ids=[req.request_id],
             metadata_by_request={} if stage_kv_metadata is None else {req.request_id: stage_kv_metadata},
+            expected_layout_digests_by_request=(
+                {} if stage_kv_expected_layout_digest is None else {req.request_id: stage_kv_expected_layout_digest}
+            ),
         )
         runner_output = self._execute_request_list(
             [req],
@@ -651,7 +666,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """
         self.install_stage_kv_metadata(
             new_request_ids=[new_req.req.request_id for new_req in scheduler_output.scheduled_new_reqs],
-            metadata_by_request=getattr(scheduler_output, "stage_kv_metadata", {}),
+            metadata_by_request=scheduler_output.stage_kv_metadata,
+            expected_layout_digests_by_request=scheduler_output.stage_kv_expected_layout_digests,
         )
         reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
         return self._execute_request_list(
@@ -762,7 +778,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         self.install_stage_kv_metadata(
             new_request_ids=[new_req.req.request_id for new_req in scheduler_output.scheduled_new_reqs],
-            metadata_by_request=getattr(scheduler_output, "stage_kv_metadata", {}),
+            metadata_by_request=scheduler_output.stage_kv_metadata,
+            expected_layout_digests_by_request=scheduler_output.stage_kv_expected_layout_digests,
         )
         if not self._supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
