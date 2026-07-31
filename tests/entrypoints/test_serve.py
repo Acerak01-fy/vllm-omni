@@ -334,7 +334,7 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={})
     mocker.patch(
-        "vllm_omni.engine.stage_init_utils.build_legacy_engine_args_dict",
+        "vllm_omni.engine.stage_init_utils.build_engine_args_dict",
         return_value={},
     )
     mocker.patch(

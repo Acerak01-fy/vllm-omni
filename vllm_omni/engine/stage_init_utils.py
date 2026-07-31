@@ -866,9 +866,6 @@ def _finalize_engine_args_dict(
     has_sampling_extra_args: bool,
 ) -> dict[str, Any]:
     """Apply representation-independent engine adapter behavior."""
-    if engine_args_dict.get("tensor_parallel_size") is None:
-        engine_args_dict.pop("tensor_parallel_size", None)
-
     pipeline_model_root = model
     model = engine_args_dict.pop("model", None) or model
     stage_defines_tokenizer = (
@@ -960,16 +957,14 @@ def build_legacy_engine_args_dict(
     stage_connector_spec: dict[str, Any] | None = None,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
-    """Build engine args through the active production legacy path."""
-    engine_args = stage_config.engine_args
-    # HACK (Alex) Tensor parallel size should not be passed as None;
-    # remove it if this is the case so that we fall back to default
-    # creation from vLLM's engine args.
-    # NOTE: This will be fixed more generically in ongoing work for engine arg filtering.
-    if "tensor_parallel_size" in engine_args and engine_args["tensor_parallel_size"] is None:
-        del engine_args["tensor_parallel_size"]
+    """Implement engine-argument building for the legacy stage representation."""
+    engine_args_dict = _to_dict(stage_config.engine_args)
+    # Legacy configs can materialize an omitted optional TP size as None.
+    # Remove it from the detached adapter dict so the backend default applies
+    # without mutating stage_config.engine_args.
+    if engine_args_dict.get("tensor_parallel_size") is None:
+        engine_args_dict.pop("tensor_parallel_size", None)
 
-    engine_args_dict = _to_dict(engine_args)
     default_sp = _to_dict(_get_attr_or_item(stage_config, "default_sampling_params", {}))
     return _finalize_engine_args_dict(
         engine_args_dict,
@@ -988,7 +983,12 @@ def build_engine_args_dict(
     stage_connector_spec: dict[str, Any] | None = None,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
-    """Preserve the legacy engine-argument API for external callers."""
+    """Build engine arguments through the stable production entry point.
+
+    Production inputs still use the legacy stage representation. Keep that
+    compatibility choice behind this function so callers do not bind directly
+    to a representation-specific implementation.
+    """
     return build_legacy_engine_args_dict(
         stage_config,
         model,
@@ -1006,8 +1006,9 @@ def build_engine_args_dict_from_omni_stage_config(
     """Project one typed stage config into backend engine arguments.
 
     This projection is prepared for the RFC #4021 stage-init cutover. Current
-    production startup remains on ``build_legacy_engine_args_dict`` while
-    strategy and startup-plan inputs still use the legacy representation.
+    production startup reaches the legacy implementation through
+    ``build_engine_args_dict`` while strategy and startup-plan inputs still
+    use the legacy representation.
     """
     engine_args_dict = _project_omni_stage_engine_args(stage_config)
     _apply_rocm_attention_backend(engine_args_dict, stage_config.stage_type)
@@ -1035,7 +1036,7 @@ def build_vllm_config(
         (vllm_config, executor_class)
     """
     if engine_args_dict is None:
-        engine_args_dict = build_legacy_engine_args_dict(
+        engine_args_dict = build_engine_args_dict(
             stage_config,
             model,
             stage_connector_spec=stage_connector_spec,
@@ -1358,7 +1359,7 @@ def build_diffusion_config(
 ) -> Any:
     """Build diffusion config for a stage."""
 
-    engine_args_dict = build_legacy_engine_args_dict(stage_cfg, model)
+    engine_args_dict = build_engine_args_dict(stage_cfg, model)
     od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
 
     num_devices_per_stage = od_config.parallel_config.world_size

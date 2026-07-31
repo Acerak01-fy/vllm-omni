@@ -598,7 +598,7 @@ class TestSingleStageInitialization:
         )
         monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
         monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
-        monkeypatch.setattr(runtime_mod, "build_legacy_engine_args_dict", lambda *_, **__: {})
+        monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
         monkeypatch.setattr(runtime_mod, "build_vllm_config", lambda *_, **__: (SimpleNamespace(), object))
         try:
             stage_plans = runtime._build_logical_stage_init_plans(None, [1, 1], {})
@@ -698,7 +698,7 @@ class TestSingleStageInitialization:
         )
         monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
         monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
-        monkeypatch.setattr(runtime_mod, "build_legacy_engine_args_dict", lambda *_, **__: {})
+        monkeypatch.setattr(runtime_mod, "build_engine_args_dict", lambda *_, **__: {})
         monkeypatch.setattr(
             runtime_mod,
             "build_vllm_config",
@@ -1034,7 +1034,7 @@ class TestSingleStageReplicaInitialization:
         os.environ[device_env_var] = "0"
         runtime._init_visible_devices_baseline = "0"
 
-        mocker.patch.object(runtime_mod, "build_legacy_engine_args_dict", return_value={})
+        mocker.patch.object(runtime_mod, "build_engine_args_dict", return_value={})
         mocker.patch.object(runtime_mod, "acquire_device_locks", return_value=[])
         mocker.patch.object(runtime_mod, "release_device_locks")
         mock_launch = mocker.patch.object(runtime_mod, "launch_stage_replica", side_effect=_fake_launch)

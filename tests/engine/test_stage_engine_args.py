@@ -257,6 +257,23 @@ def test_build_engine_args_dict_preserves_legacy_api(tmp_path):
     assert compatibility_args == explicitly_legacy_args
 
 
+def test_legacy_engine_args_drop_none_tp_without_mutating_stage_config():
+    stage_config = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"tensor_parallel_size": None},
+        default_sampling_params={},
+    )
+
+    engine_args = build_legacy_engine_args_dict(
+        stage_config,
+        model="test-model",
+    )
+
+    assert "tensor_parallel_size" not in engine_args
+    assert stage_config.engine_args == {"tensor_parallel_size": None}
+
+
 def test_typed_engine_args_own_rocm_attention_default(monkeypatch, tmp_path):
     from vllm_omni import platforms
 
