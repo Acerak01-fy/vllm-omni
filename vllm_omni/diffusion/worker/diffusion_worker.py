@@ -51,6 +51,7 @@ from vllm_omni.diffusion.stage_kv.interface import (
     StageKVMetadata,
     StageKVWorkerInitConfig,
     StageKVWorkerInitResult,
+    validate_stage_kv_worker_init_result,
 )
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
@@ -419,7 +420,9 @@ class DiffusionWorker:
         """Initialize the ModelRunner-side Stage KV contract."""
 
         assert self.model_runner is not None, "Model runner not initialized"
-        return self.model_runner.initialize_stage_kv(config)
+        result = self.model_runner.initialize_stage_kv(config)
+        validate_stage_kv_worker_init_result(config, result)
+        return result
 
     def execute_model(
         self,

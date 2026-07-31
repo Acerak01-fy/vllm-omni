@@ -123,6 +123,52 @@ def test_init_accepts_custom_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
     assert engine.scheduler is custom_scheduler
 
 
+def test_stage_kv_bootstrap_failure_closes_scheduler_and_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+    od_config = SimpleNamespace(
+        custom_pipeline_args=None,
+        model_class_name="StageKVBootstrapFailurePipeline",
+        streaming_output=False,
+    )
+    stage_kv_config = object()
+    bootstrap_error = RuntimeError("Stage KV bootstrap failed")
+    custom_scheduler = SimpleNamespace(
+        initialize=Mock(),
+        get_stage_kv_worker_init_config=Mock(return_value=stage_kv_config),
+        close=Mock(),
+    )
+    fake_executor = SimpleNamespace(
+        initialize_stage_kv=Mock(side_effect=bootstrap_error),
+        shutdown=Mock(),
+    )
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+        lambda *args, **kwargs: Mock(return_value=fake_executor),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.supports_request_batch",
+        lambda *args, **kwargs: False,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        DiffusionEngine(od_config, scheduler=custom_scheduler)
+
+    assert exc_info.value is bootstrap_error
+    custom_scheduler.initialize.assert_called_once_with(od_config)
+    custom_scheduler.get_stage_kv_worker_init_config.assert_called_once_with()
+    fake_executor.initialize_stage_kv.assert_called_once_with(stage_kv_config)
+    custom_scheduler.close.assert_called_once_with()
+    fake_executor.shutdown.assert_called_once_with()
+
+
 @pytest.mark.asyncio
 async def test_step_compatibility_wrapper_returns_final_batch() -> None:
     engine = _make_engine()

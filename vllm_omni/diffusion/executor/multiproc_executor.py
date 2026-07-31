@@ -324,17 +324,31 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._ensure_open()
         runner_outputs: list[RunnerOutput] = []
 
+        scheduled_request_ids = {new_req.request_id for new_req in scheduler_output.scheduled_new_reqs}
+        metadata_request_ids = set(scheduler_output.stage_kv_metadata)
+        digest_request_ids = set(scheduler_output.stage_kv_expected_layout_digests)
+        if metadata_request_ids or digest_request_ids:
+            missing_metadata = scheduled_request_ids - metadata_request_ids
+            unexpected_metadata = metadata_request_ids - scheduled_request_ids
+            if missing_metadata or unexpected_metadata:
+                raise RuntimeError(
+                    "Stage KV metadata does not match newly scheduled requests: "
+                    f"missing={sorted(missing_metadata)}, unexpected={sorted(unexpected_metadata)}"
+                )
+            missing_digests = scheduled_request_ids - digest_request_ids
+            unexpected_digests = digest_request_ids - scheduled_request_ids
+            if missing_digests or unexpected_digests:
+                raise RuntimeError(
+                    "Stage KV expected layout digests do not match newly scheduled requests: "
+                    f"missing={sorted(missing_digests)}, unexpected={sorted(unexpected_digests)}"
+                )
+
         for new_req in scheduler_output.scheduled_new_reqs:
             req = new_req.req
             try:
                 args: tuple = (req, self.od_config, scheduler_output.kv_prefetch_job)
                 stage_kv_metadata = scheduler_output.stage_kv_metadata.get(new_req.request_id)
                 expected_layout_digest = scheduler_output.stage_kv_expected_layout_digests.get(new_req.request_id)
-                if (stage_kv_metadata is None) != (expected_layout_digest is None):
-                    raise RuntimeError(
-                        f"Incomplete Stage KV request data for request {new_req.request_id!r}: "
-                        "allocation metadata and expected layout digest must be provided together"
-                    )
                 if stage_kv_metadata is not None:
                     args += (stage_kv_metadata, expected_layout_digest)
                 result = self.collective_rpc(

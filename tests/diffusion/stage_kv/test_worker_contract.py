@@ -128,6 +128,23 @@ def test_worker_rpc_preserves_independent_expected_layout_digest() -> None:
     ]
 
 
+def test_nonzero_worker_rejects_divergent_stage_kv_init_result() -> None:
+    config = make_init_config()
+    divergent_result = StageKVWorkerInitResult(
+        cache_mode=config.cache_mode,
+        cache_layout_fingerprint=config.cache_layout_fingerprint,
+        num_blocks=config.kv_cache_config.num_blocks + 1,
+        physical_layout=config.physical_layout,
+    )
+
+    worker = object.__new__(DiffusionWorker)
+    worker.rank = 1
+    worker.model_runner = SimpleNamespace(initialize_stage_kv=lambda received: divergent_result)
+
+    with pytest.raises(ValueError, match="num_blocks mismatch"):
+        worker.initialize_stage_kv(config)
+
+
 def test_request_executor_keeps_prepared_layout_and_allocation_metadata_separate() -> None:
     executor = object.__new__(MultiprocDiffusionExecutor)
     executor.od_config = SimpleNamespace()
@@ -221,13 +238,50 @@ def test_request_executor_does_not_trust_digest_from_metadata() -> None:
         stage_kv_expected_layout_digests={},
     )
 
-    result = executor.execute_request(scheduler_output)
+    with pytest.raises(RuntimeError, match="expected layout digests.*missing=\\['req-0'\\]"):
+        executor.execute_request(scheduler_output)
 
-    assert result.request_ids == ["req-0"]
     assert calls == []
-    assert "allocation metadata and expected layout digest must be provided together" in (
-        result.runner_outputs[0].result.error
+
+
+@pytest.mark.parametrize(
+    ("mapping_name", "stale_value", "error_match"),
+    [
+        ("stage_kv_metadata", make_metadata(request_id="stale"), "metadata"),
+        ("stage_kv_expected_layout_digests", REQUEST_LAYOUT_DIGEST, "expected layout digests"),
+    ],
+)
+def test_request_executor_rejects_extra_stage_kv_keys_before_rpc(
+    mapping_name: str,
+    stale_value: object,
+    error_match: str,
+) -> None:
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor.od_config = SimpleNamespace()
+    executor._ensure_open = lambda: None
+    calls = []
+
+    def collective_rpc(method, *, args, unique_reply_rank, exec_all_ranks):
+        calls.append((method, args, unique_reply_rank, exec_all_ranks))
+
+    executor.collective_rpc = collective_rpc
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                request_id="req-0",
+                req=SimpleNamespace(request_id="req-0"),
+            )
+        ],
+        kv_prefetch_job=None,
+        stage_kv_metadata={"req-0": make_metadata()},
+        stage_kv_expected_layout_digests={"req-0": REQUEST_LAYOUT_DIGEST},
     )
+    getattr(scheduler_output, mapping_name)["stale"] = stale_value
+
+    with pytest.raises(RuntimeError, match=rf"{error_match}.*unexpected=\['stale'\]"):
+        executor.execute_request(scheduler_output)
+
+    assert calls == []
 
 
 def test_executor_initialization_rejects_worker_result_mismatch() -> None:
