@@ -382,6 +382,7 @@ def test_sub_config_fields_match_structured_scopes():
     assert {f.name for f in fields(OmniStageModelConfig)} == {
         "model",
         "model_arch",
+        "logits_processors",
         "trust_remote_code",
         "dtype",
         "attention_backend",
@@ -934,6 +935,7 @@ def test_diffusion_config_field_classification_covers_current_fields():
     )
     assert {
         "enable_prompt_embed_cache",
+        "enable_session_state_manager",
         "prompt_embed_cache_size",
         "diffusion_kv_cache_dtype",
     } <= omni_config_module._DIFFUSION_ONLY_CONFIG_FIELDS

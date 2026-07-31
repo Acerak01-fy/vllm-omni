@@ -812,6 +812,10 @@ def _project_omni_stage_engine_args(
             )
         )
 
+    # The legacy builder always emits this key, including for pipelines such
+    # as Audex that intentionally defer architecture discovery to HF config.
+    engine_args["model_arch"] = copy.deepcopy(stage_config.model_config.model_arch)
+
     topology = stage_config.stage_pipeline_config
     topology_engine_args = {
         "model_stage": stage_config.model_stage,
@@ -820,6 +824,7 @@ def _project_omni_stage_engine_args(
         "hf_config_name": stage_config.hf_config_name,
         "engine_output_type": stage_config.engine_output_type,
         "custom_process_next_stage_input_func": stage_config.custom_process_next_stage_input_func,
+        "retains_state_across_chunks": topology.retains_state_across_chunks,
         "model_subdir": topology.model_subdir,
         "tokenizer_subdir": topology.tokenizer_subdir,
     }

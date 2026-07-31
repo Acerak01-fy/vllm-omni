@@ -57,6 +57,7 @@ class _QuantizationEngineOverrides(TypedDict, total=False):
 class _ModelEngineOverrides(TypedDict, total=False):
     model: str
     model_arch: str
+    logits_processors: list[str | type]
     trust_remote_code: bool
     dtype: Any
     attention_backend: Any
@@ -278,6 +279,7 @@ class OmniStageModelConfig:
 
     model: str | None = None
     model_arch: str | None = None
+    logits_processors: list[str | type] | None = None
     trust_remote_code: bool = False
     dtype: Any = "auto"
     attention_backend: Any = None
@@ -505,6 +507,7 @@ class _DiffusionConfigProjection:
     enable_cache_dit_summary: bool = False
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = Field(default=32, ge=1)
+    enable_session_state_manager: bool = False
     diffusion_load_format: str = "default"
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -1204,11 +1207,8 @@ def _build_model_config(
     default_sampling_params = _stage_sampling_params(stage_deploy, topology)
     kwargs = _config_kwargs(engine)
     kwargs["model"] = _first_defined(kwargs.get("model"), model)
-    kwargs["model_arch"] = _first_defined(
-        kwargs.get("model_arch"),
-        topology.model_arch,
-        pipeline.model_arch,
-    )
+    if "model_arch" not in kwargs:
+        kwargs["model_arch"] = topology.model_arch or pipeline.model_arch or None
     if "trust_remote_code" not in kwargs and deploy.trust_remote_code is not None:
         kwargs["trust_remote_code"] = _copy_value(deploy.trust_remote_code)
     if "dtype" not in kwargs and deploy.dtype is not None:

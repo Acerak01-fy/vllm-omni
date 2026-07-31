@@ -38,10 +38,13 @@ _DIFFUSION_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniDiffusi
 
 
 @pytest.fixture(autouse=True)
-def _stable_engine_arg_environment(monkeypatch):
+def _stable_engine_arg_environment(monkeypatch, tmp_path):
     from vllm_omni import platforms
 
     monkeypatch.delenv("VLLM_USE_FLASHINFER_MOE_FP16", raising=False)
+    xcodec_model = tmp_path / "xcodec-model"
+    xcodec_model.mkdir()
+    monkeypatch.setenv("XCODEC1_PATH", str(xcodec_model))
     platform = platforms.current_omni_platform
     monkeypatch.setattr(platform, "device_name", "cpu", raising=False)
     monkeypatch.setattr(platform, "device_type", "cpu", raising=False)
@@ -78,6 +81,7 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
                 model_arch="Qwen3OmniMoeForConditionalGeneration",
                 model_subdir="ar-model",
                 tokenizer_subdir="ar-tokenizer",
+                retains_state_across_chunks=True,
                 async_chunk_process_next_stage_input_func="operator.add",
             ),
             StagePipelineConfig(
@@ -114,6 +118,7 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
                     "attention_backend": "FLASHINFER",
                     "hf_overrides": {"rope_scaling": {"factor": 2}},
                     "limit_mm_per_prompt": {"audio": 1},
+                    "logits_processors": ["test.custom.LogitsProcessor"],
                     "kv_cache_memory_bytes": 1024,
                     "omni_kv_config": {"need_send_cache": True},
                     "max_cudagraph_capture_size": 0,
@@ -135,6 +140,7 @@ def _engine_arg_inputs(tmp_path: Path) -> tuple[PipelineConfig, DeployConfig, st
                 engine_extras={
                     "model": str(diffusion_model),
                     "engine_backend": "test.diffusion.Engine",
+                    "enable_session_state_manager": True,
                 },
             ),
         ],
@@ -201,6 +207,8 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
     assert thinker_args["tensor_parallel_size"] == 2
     assert thinker_args["hf_overrides"] == {"rope_scaling": {"factor": 2}}
     assert thinker_args["limit_mm_per_prompt"] == {"audio": 1}
+    assert thinker_args["logits_processors"] == ["test.custom.LogitsProcessor"]
+    assert thinker_args["retains_state_across_chunks"] is True
     assert thinker_args["kv_cache_memory_bytes"] == 1024
     assert thinker_args["max_cudagraph_capture_size"] == 0
 
@@ -229,6 +237,7 @@ def test_typed_diffusion_engine_args_use_structured_diffusion_config(tmp_path):
     assert typed_args["model_arch"] == legacy_args["model_arch"] == "TypedDiffusionPipeline"
     assert typed_args["model_class_name"] == legacy_args["model_class_name"] == "TypedDiffusionPipeline"
     assert typed_args["engine_backend"] == legacy_args["engine_backend"] == "test.diffusion.Engine"
+    assert typed_args["enable_session_state_manager"] is legacy_args["enable_session_state_manager"] is True
     assert typed_args["parallel_config"]["tensor_parallel_size"] == 2
     assert typed_args["parallel_config"]["vae_parallel_mode"] == "spatial_shard_height"
     assert isinstance(typed_args["diffusion_attention_config"], AttentionConfig)
