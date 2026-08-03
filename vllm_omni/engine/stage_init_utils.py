@@ -825,8 +825,6 @@ def _project_omni_stage_engine_args(
         "engine_output_type": stage_config.engine_output_type,
         "custom_process_next_stage_input_func": stage_config.custom_process_next_stage_input_func,
         "retains_state_across_chunks": topology.retains_state_across_chunks,
-        "model_subdir": topology.model_subdir,
-        "tokenizer_subdir": topology.tokenizer_subdir,
     }
     engine_args.update(
         {name: copy.deepcopy(value) for name, value in topology_engine_args.items() if value is not None}

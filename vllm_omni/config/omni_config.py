@@ -46,6 +46,18 @@ _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str |
 
 _PIPELINE_DEPLOY_CLI_FIELDS = PIPELINE_WIDE_ENGINE_FIELDS
 
+_NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
+    {
+        "async_chunk",
+        "model",
+        "omni",
+        "output_modalities",
+        "stage_configs_path",
+        "stage_id",
+        "tokenizer",
+    }
+)
+
 _QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any] | None
 
 
@@ -57,6 +69,12 @@ class _QuantizationEngineOverrides(TypedDict, total=False):
 class _ModelEngineOverrides(TypedDict, total=False):
     model: str
     model_arch: str
+    model_subdir: str
+    tokenizer_subdir: str
+    revision: str
+    tokenizer_revision: str
+    code_revision: str
+    seed: int
     logits_processors: list[str | type]
     trust_remote_code: bool
     dtype: Any
@@ -82,6 +100,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
 
 class _LoadEngineOverrides(TypedDict, total=False):
     tokenizer: str
+    download_dir: str
     skip_tokenizer_init: bool
     load_format: str
     tokenizer_mode: str
@@ -236,6 +255,7 @@ def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dic
     for key, value in runtime_overrides.items():
         if key in global_stage_fields or f"stage_{stage_id}_{key}" in cli_overrides:
             result[key] = _copy_value(value)
+    _validate_stage_cli_override_ownership(stage_id, result)
     return result
 
 
@@ -280,6 +300,10 @@ class OmniStageModelConfig:
 
     model: str | None = None
     model_arch: str | None = None
+    revision: str | None = None
+    tokenizer_revision: str | None = None
+    code_revision: str | None = None
+    seed: int | None = None
     logits_processors: list[str | type] | None = None
     trust_remote_code: bool = False
     dtype: Any = "auto"
@@ -314,6 +338,7 @@ class OmniStageLoadConfig:
     """Per-stage loading behavior and resolved tokenizer input."""
 
     tokenizer: str | None = None
+    download_dir: str | None = None
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     tokenizer_mode: str = "auto"
@@ -330,9 +355,10 @@ class OmniStageCacheConfig:
     """
 
     kv_cache_memory_bytes: int | None = Field(default=None, ge=0)
-    gpu_memory_utilization: float = Field(default=0.90, gt=0.0, le=1.0)
-    enable_prefix_caching: bool = False
-    disable_hybrid_kv_cache_manager: bool = False
+    # None preserves backend-owned defaults; explicit values still project.
+    gpu_memory_utilization: float | None = Field(default=None, gt=0.0, le=1.0)
+    enable_prefix_caching: bool | None = None
+    disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = Field(default=None, ge=0.0)
 
 
@@ -340,14 +366,18 @@ class OmniStageCacheConfig:
 class OmniStageSchedulerConfig:
     """Per-stage request scheduling behavior."""
 
-    max_num_seqs: int = Field(default=128, ge=1)
+    max_num_seqs: int | None = Field(default=None, ge=1)
     max_num_batched_tokens: int | None = Field(default=None, ge=1)
     max_model_len: int | None = Field(default=None, ge=-1)
-    enable_chunked_prefill: bool = False
-    async_scheduling: bool = True
+    enable_chunked_prefill: bool | None = None
+    async_scheduling: bool | None = None
 
     def __post_init__(self) -> None:
-        if self.max_num_batched_tokens is not None and self.max_num_batched_tokens < self.max_num_seqs:
+        if (
+            self.max_num_batched_tokens is not None
+            and self.max_num_seqs is not None
+            and self.max_num_batched_tokens < self.max_num_seqs
+        ):
             raise ValueError(
                 f"max_num_batched_tokens ({self.max_num_batched_tokens}) must be >= max_num_seqs ({self.max_num_seqs})"
             )
@@ -788,18 +818,47 @@ _CONNECTOR_ENGINE_FIELDS = frozenset(_ConnectorEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
 _PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_ParallelConfigEngineOverrides.__annotations__)
 _PARALLEL_ENGINE_FIELDS = _PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
+_STAGE_ENGINE_FIELDS = (
+    _QUANTIZATION_ENGINE_FIELDS
+    | _MODEL_ENGINE_FIELDS
+    | _LOAD_ENGINE_FIELDS
+    | _CACHE_ENGINE_FIELDS
+    | _SCHEDULER_ENGINE_FIELDS
+    | _CONNECTOR_ENGINE_FIELDS
+    | _RUNTIME_ENGINE_FIELDS
+    | _PARALLEL_ENGINE_FIELDS
+    | _DIFFUSION_STAGE_ENGINE_FIELDS
+)
+
+
+def _validate_stage_cli_override_ownership(
+    stage_id: int,
+    overrides: Mapping[str, Any],
+) -> None:
+    unowned_fields = set(overrides) - _STAGE_ENGINE_FIELDS
+    if unowned_fields:
+        names = ", ".join(sorted(unowned_fields))
+        raise ValueError(
+            f"Stage {stage_id} has explicit CLI engine argument(s) with no structured config owner: {names}"
+        )
 
 
 def _global_stage_cli_fields() -> frozenset[str]:
     # Lazy import avoids vllm_omni.config -> omni_config -> engine.arg_utils ->
     # vllm_omni.config during package-level config imports.
-    from vllm_omni.engine.arg_utils import OmniEngineArgs
+    from vllm_omni.engine.arg_utils import OmniEngineArgs, orchestrator_field_names
 
-    return (
+    candidates = (
         frozenset(f.name for f in fields(OmniEngineArgs))
         | frozenset(_STAGE_DEPLOY_ENGINE_FIELDS)
         | frozenset(_PIPELINE_DEPLOY_CLI_FIELDS)
-    ) - {"model", "tokenizer", "stage_id", "stage_configs_path", "async_chunk"}
+    )
+    externally_consumed = (
+        _NON_STAGE_ENGINE_CLI_FIELDS
+        | frozenset(f.name for f in fields(VllmOmniOrchestratorConfig))
+        | (orchestrator_field_names() - _STAGE_ENGINE_FIELDS)
+    )
+    return candidates - externally_consumed
 
 
 def _mapping_or_empty(value: Any) -> Mapping[str, Any]:
@@ -825,9 +884,14 @@ def _stage_engine_overrides(stage_deploy: StageDeployConfig | None) -> dict[str,
 
 def _stage_engine_values(
     stage_deploy: StageDeployConfig | None,
+    topology: StagePipelineConfig,
     stage_cli_overrides: Mapping[str, Any] | None = None,
 ) -> _StageEngineValues:
     engine = _stage_engine_overrides(stage_deploy)
+    # Preserve legacy ordering: topology-owned KV roles override deploy
+    # extras, while an explicit CLI override remains highest priority.
+    if topology.omni_kv_config:
+        engine["omni_kv_config"] = _copy_value(topology.omni_kv_config)
     if stage_cli_overrides:
         engine.update(_copy_value(stage_cli_overrides))
     return _StageEngineValues(
@@ -941,9 +1005,10 @@ class BaseVllmOmniStageConfig:
 
     @property
     def scheduler_cls(self) -> str | None:
+        async_scheduling = self.scheduler_config.async_scheduling
         return self.stage_pipeline_config.scheduler_cls or _resolve_scheduler_path(
             self.stage_pipeline_config.execution_type,
-            self.scheduler_config.async_scheduling,
+            True if async_scheduling is None else async_scheduling,
         )
 
     @property
@@ -1035,10 +1100,13 @@ def _build_common_stage_config_kwargs(
                 engine.cache,
                 topology.execution_type,
             ),
-            "scheduler_config": _build_scheduler_config(deploy, engine.scheduler),
+            "scheduler_config": _build_scheduler_config(
+                deploy,
+                engine.scheduler,
+                topology.execution_type,
+            ),
             "connector_config": _build_connector_config(
                 deploy,
-                topology,
                 stage_deploy,
                 engine.connector,
             ),
@@ -1250,8 +1318,7 @@ def _build_cache_config(
     if "enable_prefix_caching" not in kwargs and deploy.enable_prefix_caching is not None:
         kwargs["enable_prefix_caching"] = _copy_value(deploy.enable_prefix_caching)
     if "disable_hybrid_kv_cache_manager" not in kwargs and execution_type == StageExecutionType.LLM_GENERATION:
-        # Resolve the generation-stage override before the typed adapter emits
-        # the cache config's explicit False default.
+        # Match the generation-stage override applied by legacy finalization.
         kwargs["disable_hybrid_kv_cache_manager"] = True
     return OmniStageCacheConfig(**kwargs)
 
@@ -1259,28 +1326,26 @@ def _build_cache_config(
 def _build_scheduler_config(
     deploy: DeployConfig,
     engine: _SchedulerEngineOverrides,
+    execution_type: StageExecutionType,
 ) -> OmniStageSchedulerConfig:
     kwargs = _config_kwargs(engine)
     if "enable_chunked_prefill" not in kwargs and deploy.enable_chunked_prefill is not None:
         kwargs["enable_chunked_prefill"] = _copy_value(deploy.enable_chunked_prefill)
+    if "async_scheduling" not in kwargs and execution_type == StageExecutionType.LLM_AR:
+        kwargs["async_scheduling"] = True
     return OmniStageSchedulerConfig(**kwargs)
 
 
 def _build_connector_config(
     deploy: DeployConfig,
-    topology: StagePipelineConfig,
     stage_deploy: StageDeployConfig | None,
     engine: _ConnectorEngineOverrides,
 ) -> OmniStageConnectorConfig:
     output_connectors = stage_deploy.output_connectors if stage_deploy is not None else None
     input_connectors = stage_deploy.input_connectors if stage_deploy is not None else None
-    omni_kv_config = _first_defined(
-        engine.get("omni_kv_config"),
-        topology.omni_kv_config,
-    )
     return OmniStageConnectorConfig(
         async_chunk=bool(deploy.async_chunk),
-        omni_kv_config=omni_kv_config,
+        omni_kv_config=_copy_value(engine.get("omni_kv_config")),
         output_connectors=_copy_value(output_connectors) if output_connectors else None,
         input_connectors=_copy_value(input_connectors) if input_connectors else None,
     )
@@ -1414,6 +1479,7 @@ class VllmOmniConfig:
                 deploy_by_id.get(topology.stage_id),
                 _stage_engine_values(
                     deploy_by_id.get(topology.stage_id),
+                    topology,
                     _stage_cli_overrides(topology.stage_id, cli_overrides),
                 ),
                 model=model,

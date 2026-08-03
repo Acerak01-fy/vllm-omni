@@ -108,10 +108,16 @@ def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(mod
         assert omni_stage.model_config.enforce_eager == engine_args.get("enforce_eager", False)
         assert omni_stage.load_config.load_format == engine_args.get("load_format", "auto")
         assert omni_stage.load_config.tokenizer_mode == engine_args.get("tokenizer_mode", "auto")
-        assert omni_stage.cache_config.gpu_memory_utilization == engine_args.get("gpu_memory_utilization", 0.90)
-        assert omni_stage.scheduler_config.max_num_seqs == engine_args.get("max_num_seqs", 128)
+        assert omni_stage.cache_config.gpu_memory_utilization == engine_args.get("gpu_memory_utilization")
+        assert omni_stage.cache_config.enable_prefix_caching == engine_args.get("enable_prefix_caching")
+        expected_disable_hybrid = engine_args.get("disable_hybrid_kv_cache_manager")
+        if omni_stage.stage_pipeline_config.execution_type == StageExecutionType.LLM_GENERATION:
+            expected_disable_hybrid = True if expected_disable_hybrid is None else expected_disable_hybrid
+        assert omni_stage.cache_config.disable_hybrid_kv_cache_manager == expected_disable_hybrid
+        assert omni_stage.scheduler_config.max_num_seqs == engine_args.get("max_num_seqs")
         assert omni_stage.scheduler_config.max_num_batched_tokens == engine_args.get("max_num_batched_tokens")
-        assert omni_stage.scheduler_config.async_scheduling == engine_args.get("async_scheduling", True)
+        assert omni_stage.scheduler_config.enable_chunked_prefill == engine_args.get("enable_chunked_prefill")
+        assert omni_stage.scheduler_config.async_scheduling == engine_args.get("async_scheduling")
         legacy_parallel_config = engine_args.get("parallel_config") or {}
         assert omni_stage.parallel_config.tensor_parallel_size == legacy_parallel_config.get(
             "tensor_parallel_size",
@@ -180,6 +186,28 @@ def test_from_pipeline_config_applies_cli_overrides_without_stage_config_runtime
     assert stage0.scheduler_config.max_num_seqs == 7
     assert stage1.parallel_config.tensor_parallel_size == 2
     assert stage1.runtime_config.num_gpus == stage1.parallel_config.world_size
+
+
+@pytest.mark.parametrize(
+    "cli_overrides",
+    [
+        {"enable_lora": True},
+        {"stage_0_enable_lora": True},
+    ],
+    ids=["global", "stage-scoped"],
+)
+def test_from_pipeline_config_rejects_explicit_unowned_engine_cli_fields(cli_overrides):
+    with pytest.raises(ValueError, match=r"no structured config owner: enable_lora"):
+        _from_pipeline_key("qwen3_tts", cli_overrides=cli_overrides)
+
+
+def test_stage_cli_field_selection_never_returns_unowned_values():
+    for name in omni_config_module._global_stage_cli_fields():
+        try:
+            selected = omni_config_module._stage_cli_overrides(0, {name: True})
+        except ValueError:
+            continue
+        assert set(selected) <= omni_config_module._STAGE_ENGINE_FIELDS
 
 
 def test_runtime_num_gpus_is_derived_from_parallel_world_size():
@@ -382,6 +410,10 @@ def test_sub_config_fields_match_structured_scopes():
     assert {f.name for f in fields(OmniStageModelConfig)} == {
         "model",
         "model_arch",
+        "revision",
+        "tokenizer_revision",
+        "code_revision",
+        "seed",
         "logits_processors",
         "trust_remote_code",
         "dtype",
@@ -412,6 +444,7 @@ def test_sub_config_fields_match_structured_scopes():
     }
     assert {f.name for f in fields(OmniStageLoadConfig)} == {
         "tokenizer",
+        "download_dir",
         "skip_tokenizer_init",
         "load_format",
         "tokenizer_mode",
