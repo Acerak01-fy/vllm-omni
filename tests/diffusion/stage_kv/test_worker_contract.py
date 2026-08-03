@@ -327,6 +327,97 @@ def test_dense_request_executor_keeps_legacy_rpc_shape() -> None:
     assert calls[0][1] == (req, executor.od_config, None)
 
 
+def test_dense_dlo_requests_keep_dp_multi_concurrency_fast_path() -> None:
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor.od_config = SimpleNamespace(
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=True,
+    )
+    executor._ensure_open = lambda: None
+    calls = []
+
+    def collective_rpc(method, *, args, unique_reply_rank, exec_all_ranks):
+        calls.append((method, args, unique_reply_rank, exec_all_ranks))
+        return [DiffusionOutput(output=None), DiffusionOutput(output=None)]
+
+    executor.collective_rpc = collective_rpc
+    reqs = [
+        SimpleNamespace(
+            request_id=f"dense-{index}",
+            sampling_params=SimpleNamespace(num_inference_steps=2),
+        )
+        for index in range(2)
+    ]
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(request_id=req.request_id, req=req) for req in reqs],
+        kv_prefetch_job=None,
+        stage_kv_metadata={},
+        stage_kv_expected_layout_digests={},
+    )
+
+    result = executor.execute_request(scheduler_output)
+
+    assert result.request_ids == ["dense-0", "dense-1"]
+    assert calls == [
+        (
+            "execute_model",
+            (reqs, executor.od_config, None),
+            None,
+            True,
+        )
+    ]
+
+
+def test_stage_kv_dlo_requests_fall_back_to_per_request_rpc() -> None:
+    executor = object.__new__(MultiprocDiffusionExecutor)
+    executor.od_config = SimpleNamespace(
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=True,
+    )
+    executor._ensure_open = lambda: None
+    calls = []
+
+    def collective_rpc(method, *, args, unique_reply_rank, exec_all_ranks):
+        calls.append((method, args, unique_reply_rank, exec_all_ranks))
+        return DiffusionOutput(output=None)
+
+    executor.collective_rpc = collective_rpc
+    reqs = [
+        SimpleNamespace(
+            request_id=f"req-{index}",
+            sampling_params=SimpleNamespace(num_inference_steps=2),
+        )
+        for index in range(2)
+    ]
+    metadata_by_request = {req.request_id: make_metadata(request_id=req.request_id) for req in reqs}
+    digests_by_request = {req.request_id: REQUEST_LAYOUT_DIGEST for req in reqs}
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(request_id=req.request_id, req=req) for req in reqs],
+        kv_prefetch_job=None,
+        stage_kv_metadata=metadata_by_request,
+        stage_kv_expected_layout_digests=digests_by_request,
+    )
+
+    result = executor.execute_request(scheduler_output)
+
+    assert result.request_ids == ["req-0", "req-1"]
+    assert calls == [
+        (
+            "execute_model",
+            (
+                req,
+                executor.od_config,
+                None,
+                metadata_by_request[req.request_id],
+                digests_by_request[req.request_id],
+            ),
+            0,
+            True,
+        )
+        for req in reqs
+    ]
+
+
 def test_batch_and_step_paths_install_scheduler_metadata_before_forward() -> None:
     metadata = make_metadata()
     current_request_layout_digest = "current-request-layout"
