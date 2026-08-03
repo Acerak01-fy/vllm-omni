@@ -457,6 +457,7 @@ def test_sub_config_fields_match_structured_scopes():
         "ulysses_mode",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
+        "text_encoder_tp_size",
         "vae_parallel_mode",
         "use_hsdp",
         "mask_sp_padding",
