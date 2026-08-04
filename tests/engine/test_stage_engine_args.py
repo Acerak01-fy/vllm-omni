@@ -3,11 +3,11 @@ from __future__ import annotations
 import copy
 import sys
 import types
-from collections.abc import Mapping
-from dataclasses import MISSING, fields, replace
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
+from pydantic.fields import FieldInfo
 
 from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
@@ -34,22 +34,25 @@ from vllm_omni.engine.stage_init_utils import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
+
+
+def _effective_backend_values(config_cls: type, engine_args: dict) -> dict[str, object]:
+    backend_fields = fields(config_cls)
+    backend_field_names = {backend_field.name for backend_field in backend_fields}
+    backend_config = config_cls(
+        **{name: copy.deepcopy(value) for name, value in engine_args.items() if name in backend_field_names}
+    )
+    effective_values: dict[str, object] = {}
+    for backend_field in backend_fields:
+        value = getattr(backend_config, backend_field.name)
+        if isinstance(value, FieldInfo):
+            value = value.get_default(call_default_factory=True)
+        effective_values[backend_field.name] = value
+    return effective_values
+
+
 _LLM_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniEngineArgs))
 _DIFFUSION_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniDiffusionConfig))
-_LLM_BACKEND_DEFAULTS = {field.name: field.default for field in fields(OmniEngineArgs) if field.default is not MISSING}
-_DIFFUSION_BACKEND_DEFAULTS = {
-    field.name: field.default for field in fields(OmniDiffusionConfig) if field.default is not MISSING
-}
-_BACKEND_DEFERRED_DEFAULT_FIELDS = frozenset(
-    {
-        "gpu_memory_utilization",
-        "enable_prefix_caching",
-        "disable_hybrid_kv_cache_manager",
-        "max_num_seqs",
-        "enable_chunked_prefill",
-        "async_scheduling",
-    }
-)
 
 
 @pytest.fixture(autouse=True)
@@ -64,6 +67,11 @@ def _stable_engine_arg_environment(monkeypatch, tmp_path):
     monkeypatch.setattr(platform, "device_name", "cpu", raising=False)
     monkeypatch.setattr(platform, "device_type", "cpu", raising=False)
     monkeypatch.setattr(platform, "is_rocm", lambda: False)
+    monkeypatch.setattr(
+        OmniDiffusionConfig,
+        "_resolve_master_port",
+        lambda config: config.master_port or 29500,
+    )
 
     def _resolve_test_worker(engine_args):
         worker_type = engine_args.get("worker_type")
@@ -487,39 +495,16 @@ def test_typed_engine_args_match_current_registry_backend_semantics(model_type):
         )
         if legacy_stage.stage_type == StageType.DIFFUSION:
             backend_fields = _DIFFUSION_BACKEND_FIELDS
-            backend_defaults = _DIFFUSION_BACKEND_DEFAULTS
+            backend_config_cls = OmniDiffusionConfig
         else:
             backend_fields = _LLM_BACKEND_FIELDS
-            backend_defaults = _LLM_BACKEND_DEFAULTS
+            backend_config_cls = OmniEngineArgs
 
         missing_fields = (legacy_args.keys() & backend_fields) - typed_args.keys()
         assert not missing_fields, f"{model_type} stage {stage_id} lost backend fields: {sorted(missing_fields)}"
 
-        comparable_fields = (legacy_args.keys() & backend_fields) - {
-            "cache_config",
-            "parallel_config",
-        }
-        assert {name: typed_args[name] for name in comparable_fields} == {
-            name: legacy_args[name] for name in comparable_fields
-        }
-
-        deferred_default_fields = backend_fields & _BACKEND_DEFERRED_DEFAULT_FIELDS
-        legacy_effective_defaults = {
-            name: legacy_args.get(name, backend_defaults[name]) for name in deferred_default_fields
-        }
-        typed_effective_defaults = {
-            name: typed_args.get(name, backend_defaults[name]) for name in deferred_default_fields
-        }
-        assert typed_effective_defaults == legacy_effective_defaults, (
-            f"{model_type} stage {stage_id} changed backend-owned defaults"
+        legacy_effective_args = _effective_backend_values(backend_config_cls, legacy_args)
+        typed_effective_args = _effective_backend_values(backend_config_cls, typed_args)
+        assert typed_effective_args == legacy_effective_args, (
+            f"{model_type} stage {stage_id} changed effective backend arguments"
         )
-
-        legacy_parallel = legacy_args.get("parallel_config")
-        if isinstance(legacy_parallel, Mapping):
-            typed_parallel = typed_args["parallel_config"]
-            assert {name: typed_parallel[name] for name in legacy_parallel} == dict(legacy_parallel)
-
-        legacy_cache = legacy_args.get("cache_config")
-        typed_cache = typed_args.get("cache_config")
-        if isinstance(legacy_cache, Mapping) and typed_cache is not None:
-            assert {name: getattr(typed_cache, name) for name in legacy_cache} == dict(legacy_cache)

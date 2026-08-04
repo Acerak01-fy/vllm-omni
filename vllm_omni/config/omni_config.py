@@ -58,6 +58,17 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
     }
 )
 
+# Legacy deploy files can still carry StageConfig metadata in engine_extras.
+# Those values are not backend engine inputs, and the additive typed path keeps
+# sourcing their effective values from the immutable pipeline topology.
+_LEGACY_STAGE_METADATA_EXTRA_FIELDS = frozenset(
+    {
+        "final_output",
+        "final_output_type",
+        "is_comprehension",
+    }
+)
+
 _QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any] | None
 
 
@@ -255,7 +266,6 @@ def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dic
     for key, value in runtime_overrides.items():
         if key in global_stage_fields or f"stage_{stage_id}_{key}" in cli_overrides:
             result[key] = _copy_value(value)
-    _validate_stage_cli_override_ownership(stage_id, result)
     return result
 
 
@@ -818,7 +828,7 @@ _CONNECTOR_ENGINE_FIELDS = frozenset(_ConnectorEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
 _PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_ParallelConfigEngineOverrides.__annotations__)
 _PARALLEL_ENGINE_FIELDS = _PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
-_STAGE_ENGINE_FIELDS = (
+_COMMON_STAGE_ENGINE_FIELDS = (
     _QUANTIZATION_ENGINE_FIELDS
     | _MODEL_ENGINE_FIELDS
     | _LOAD_ENGINE_FIELDS
@@ -826,20 +836,54 @@ _STAGE_ENGINE_FIELDS = (
     | _SCHEDULER_ENGINE_FIELDS
     | _CONNECTOR_ENGINE_FIELDS
     | _RUNTIME_ENGINE_FIELDS
-    | _PARALLEL_ENGINE_FIELDS
+)
+_LLM_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(f.name for f in fields(OmniStageParallelConfig)) - {"world_size"}
+_DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(f.name for f in fields(OmniStageDiffusionParallelConfig)) - {
+    "world_size"
+}
+_LLM_STAGE_ENGINE_FIELDS = _COMMON_STAGE_ENGINE_FIELDS | _LLM_PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
+_DIFFUSION_OWNED_STAGE_ENGINE_FIELDS = (
+    _COMMON_STAGE_ENGINE_FIELDS
+    | _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS
     | _DIFFUSION_STAGE_ENGINE_FIELDS
+    | {"parallel_config"}
 )
 
+# This all-stage union is used only to discover global CLI candidates. Stage
+# validation must use the execution-type-specific sets below.
+_STAGE_ENGINE_FIELDS = _LLM_STAGE_ENGINE_FIELDS | _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS
+_STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE = {
+    StageExecutionType.LLM_AR: _LLM_STAGE_ENGINE_FIELDS,
+    StageExecutionType.LLM_GENERATION: _LLM_STAGE_ENGINE_FIELDS,
+    StageExecutionType.DIFFUSION: _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS,
+}
+_PARALLEL_CONFIG_ENGINE_FIELDS_BY_EXECUTION_TYPE = {
+    StageExecutionType.LLM_AR: _LLM_PARALLEL_CONFIG_ENGINE_FIELDS,
+    StageExecutionType.LLM_GENERATION: _LLM_PARALLEL_CONFIG_ENGINE_FIELDS,
+    StageExecutionType.DIFFUSION: _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS,
+}
 
-def _validate_stage_cli_override_ownership(
+
+def _validate_stage_engine_override_ownership(
     stage_id: int,
+    execution_type: StageExecutionType,
     overrides: Mapping[str, Any],
 ) -> None:
-    unowned_fields = set(overrides) - _STAGE_ENGINE_FIELDS
+    try:
+        owner_fields = _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
+        parallel_owner_fields = _PARALLEL_CONFIG_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported stage execution type: {execution_type!r}") from exc
+
+    unowned_fields = set(overrides) - owner_fields
+    parallel_config = overrides.get("parallel_config")
+    if isinstance(parallel_config, Mapping):
+        unowned_fields.update(f"parallel_config.{name}" for name in set(parallel_config) - parallel_owner_fields)
     if unowned_fields:
         names = ", ".join(sorted(unowned_fields))
         raise ValueError(
-            f"Stage {stage_id} has explicit CLI engine argument(s) with no structured config owner: {names}"
+            f"Stage {stage_id} ({execution_type.value}) has explicit engine argument(s) "
+            f"with no structured config owner: {names}"
         )
 
 
@@ -878,7 +922,13 @@ def _stage_engine_overrides(stage_deploy: StageDeployConfig | None) -> dict[str,
         value = getattr(stage_deploy, name)
         if value is not None:
             overrides[name] = _copy_value(value)
-    overrides.update(_copy_value(stage_deploy.engine_extras))
+    overrides.update(
+        {
+            name: _copy_value(value)
+            for name, value in stage_deploy.engine_extras.items()
+            if name not in _LEGACY_STAGE_METADATA_EXTRA_FIELDS
+        }
+    )
     return overrides
 
 
@@ -894,6 +944,11 @@ def _stage_engine_values(
         engine["omni_kv_config"] = _copy_value(topology.omni_kv_config)
     if stage_cli_overrides:
         engine.update(_copy_value(stage_cli_overrides))
+    _validate_stage_engine_override_ownership(
+        topology.stage_id,
+        topology.execution_type,
+        engine,
+    )
     return _StageEngineValues(
         quantization=cast(
             _QuantizationEngineOverrides,

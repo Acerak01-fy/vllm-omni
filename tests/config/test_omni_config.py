@@ -201,13 +201,49 @@ def test_from_pipeline_config_rejects_explicit_unowned_engine_cli_fields(cli_ove
         _from_pipeline_key("qwen3_tts", cli_overrides=cli_overrides)
 
 
-def test_stage_cli_field_selection_never_returns_unowned_values():
-    for name in omni_config_module._global_stage_cli_fields():
-        try:
-            selected = omni_config_module._stage_cli_overrides(0, {name: True})
-        except ValueError:
-            continue
-        assert set(selected) <= omni_config_module._STAGE_ENGINE_FIELDS
+@pytest.mark.parametrize(
+    ("engine_extras", "unowned_field"),
+    [
+        ({"enable_lora": True}, "enable_lora"),
+        ({"parallel_config": {"cfg_parallel_size": 2}}, "parallel_config.cfg_parallel_size"),
+    ],
+    ids=["top-level", "nested-parallel-config"],
+)
+def test_from_pipeline_config_rejects_unowned_deploy_engine_extras(engine_extras, unowned_field):
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, engine_extras=engine_extras)])
+
+    with pytest.raises(ValueError, match=rf"no structured config owner: {unowned_field}"):
+        VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+
+@pytest.mark.parametrize(
+    ("cli_overrides", "stage_id"),
+    [
+        ({"kv_cache_dtype": "fp8"}, 0),
+        ({"stage_0_kv_cache_dtype": "fp8"}, 0),
+        ({"stage_1_kv_cache_dtype": "fp8"}, 1),
+    ],
+    ids=["global", "ar-stage", "generation-stage"],
+)
+def test_from_pipeline_config_rejects_diffusion_only_cli_fields_for_llm_stages(cli_overrides, stage_id):
+    with pytest.raises(ValueError, match=rf"Stage {stage_id} .*no structured config owner: kv_cache_dtype"):
+        _from_pipeline_key("qwen3_tts", cli_overrides=cli_overrides)
+
+
+def test_from_pipeline_config_accepts_diffusion_only_cli_fields_for_diffusion_stage():
+    stage = _from_pipeline_key(
+        "dreamzero",
+        deploy_config_path="dreamzero_tp1_cfg2",
+        cli_overrides={"kv_cache_dtype": "fp8"},
+    ).stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.diffusion_config.diffusion_kv_cache_dtype == "fp8"
+
+
+def test_stage_cli_field_selection_defers_ownership_validation_until_sources_are_merged():
+    assert omni_config_module._stage_cli_overrides(0, {"enable_lora": True}) == {"enable_lora": True}
 
 
 def test_runtime_num_gpus_is_derived_from_parallel_world_size():
