@@ -8,8 +8,15 @@ from pathlib import Path
 
 import pytest
 from pydantic.fields import FieldInfo
+from vllm.config import CompilationConfig as VllmCompilationConfig
+from vllm.config import ProfilerConfig as VllmProfilerConfig
+from vllm.config.quantization import QuantizationConfigArgs
+from vllm.engine.arg_utils import EngineArgs
 
-from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.omni_config import (
+    _LLM_STAGE_ENGINE_FIELDS,
+    VllmOmniConfig,
+)
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
     DeployConfig,
@@ -53,6 +60,30 @@ def _effective_backend_values(config_cls: type, engine_args: dict) -> dict[str, 
 
 _LLM_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniEngineArgs))
 _DIFFUSION_BACKEND_FIELDS = frozenset(field.name for field in fields(OmniDiffusionConfig))
+_OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS = frozenset(
+    {
+        "active_stream_window",
+        "codec_frame_rate_hz",
+        "custom_voice_dir",
+        "devices",
+        "disable_autocast",
+        "enable_multithread_weight_load",
+        "env",
+        "has_sampling_extra_args",
+        "log_level",
+        "log_stats",
+        "model_arch",
+        "model_subdir",
+        "num_gpus",
+        "num_replicas",
+        "num_weight_load_threads",
+        "omni_kv_config",
+        "parallel_config",
+        "subtalker_sampling_params",
+        "task_type",
+        "tokenizer_subdir",
+    }
+)
 
 
 @pytest.fixture(autouse=True)
@@ -194,6 +225,49 @@ def _legacy_and_typed_stages(
         cli_overrides=resolved_cli_overrides,
     )
     return legacy_stages, omni_config
+
+
+def test_llm_stage_engine_field_schema_tracks_upstream_engine_args():
+    upstream_engine_fields = frozenset(field.name for field in fields(EngineArgs))
+
+    assert _LLM_STAGE_ENGINE_FIELDS - upstream_engine_fields == _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS
+
+
+@pytest.mark.parametrize("stage_id", [0, 1], ids=["ar", "generation"])
+def test_typed_llm_engine_args_preserve_upstream_config_objects(tmp_path, stage_id):
+    pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+    compilation_config = VllmCompilationConfig(backend="eager")
+    profiler_config = VllmProfilerConfig(profiler="cuda")
+    quantization_config = QuantizationConfigArgs(ignore=["lm_head"])
+    stage_prefix = f"stage_{stage_id}_"
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=copy.deepcopy(deploy),
+        cli_overrides={
+            "model": model,
+            f"{stage_prefix}compilation_config": compilation_config,
+            f"{stage_prefix}profiler_config": profiler_config,
+            f"{stage_prefix}quantization_config": quantization_config,
+        },
+    )
+
+    stage_config = omni_config.stage_by_id(stage_id)
+    typed_args = build_engine_args_dict_from_omni_stage_config(stage_config, model)
+
+    assert isinstance(stage_config.model_config.compilation_config, VllmCompilationConfig)
+    assert isinstance(typed_args["compilation_config"], VllmCompilationConfig)
+    assert typed_args["compilation_config"] is not stage_config.model_config.compilation_config
+    assert typed_args["compilation_config"].backend == "eager"
+
+    assert isinstance(stage_config.runtime_config.profiler_config, VllmProfilerConfig)
+    assert isinstance(typed_args["profiler_config"], VllmProfilerConfig)
+    assert typed_args["profiler_config"] is not stage_config.runtime_config.profiler_config
+    assert typed_args["profiler_config"].profiler == "cuda"
+
+    assert isinstance(stage_config.quantization_config, QuantizationConfigArgs)
+    assert isinstance(typed_args["quantization_config"], QuantizationConfigArgs)
+    assert typed_args["quantization_config"] is not stage_config.quantization_config
+    assert typed_args["quantization_config"].ignore == ["lm_head"]
 
 
 def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
