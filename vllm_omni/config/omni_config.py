@@ -322,6 +322,7 @@ class OmniStageModelConfig:
     hf_overrides: Any = None
     limit_mm_per_prompt: dict[str, Any] | None = None
     active_stream_window: int = Field(default=0, ge=0)
+    duplex_max_sessions: int = Field(default=1, ge=1)
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
@@ -530,6 +531,7 @@ class _DiffusionConfigProjection:
     request_batch_max_wait_ms: float = 0.0
     streaming_output: bool = False
     model_arch: str | None = None
+    task_type: str | None = None
     dtype: Any = "auto"
     trust_remote_code: bool = False
     revision: str | None = None
@@ -562,6 +564,7 @@ class _DiffusionConfigProjection:
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
+    dlo_resident_layers: int = Field(default=0, ge=0)
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
     diffusion_compile_dynamic: bool = Field(default=True, strict=True)
@@ -584,6 +587,7 @@ class _DiffusionConfigProjection:
     step_execution: bool = False
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
+    supports_mixed_reference_inputs: bool = False
     model_paths: dict[str, str] = field(default_factory=dict)
     model_loaded: dict[str, bool] = field(
         default_factory=lambda: {
@@ -761,6 +765,7 @@ _DIFFUSION_SHARED_CONFIG_FIELDS = frozenset(
         "stage_id",
         "model",
         "model_arch",
+        "task_type",
         "dtype",
         "trust_remote_code",
         "revision",
@@ -1147,6 +1152,7 @@ def _build_common_stage_config_kwargs(
                 topology,
                 stage_deploy,
                 engine.model,
+                duplex_max_sessions=(deploy.duplex_session.max_sessions if deploy.session_mode == "duplex" else 1),
                 model=model,
             ),
             "load_config": _build_load_config(topology, engine.load),
@@ -1327,6 +1333,7 @@ def _build_model_config(
     stage_deploy: StageDeployConfig | None,
     engine: _ModelEngineOverrides,
     *,
+    duplex_max_sessions: int,
     model: str | None,
 ) -> OmniStageModelConfig:
     default_sampling_params = _stage_sampling_params(stage_deploy, topology)
@@ -1350,6 +1357,7 @@ def _build_model_config(
         kwargs["tokenizer_subdir"] = topology.tokenizer_subdir
     return OmniStageModelConfig(
         default_sampling_params=default_sampling_params,
+        duplex_max_sessions=duplex_max_sessions,
         **kwargs,
     )
 
