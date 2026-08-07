@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import cached_property
 from typing import Any, TypedDict
 
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.stage_kv.interface import StageKVMetadata
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -139,10 +139,20 @@ class NewRequestData:
 
     request_id: str
     req: OmniDiffusionRequest
+    diffusion_kv_metadata: DiffusionKVMetadata | None = None
 
     @classmethod
-    def from_state(cls, state: SchedulerRequestState) -> NewRequestData:
-        return cls(request_id=state.request_id, req=state.req)
+    def from_state(
+        cls,
+        state: SchedulerRequestState,
+        *,
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None,
+    ) -> NewRequestData:
+        return cls(
+            request_id=state.request_id,
+            req=state.req,
+            diffusion_kv_metadata=diffusion_kv_metadata,
+        )
 
 
 @dataclass
@@ -178,14 +188,6 @@ class DiffusionSchedulerOutput:
     num_waiting_reqs: int
     # next request to background-prefetch KV
     kv_prefetch_job: KVPrefetchJob | None = None
-    # New Scheduler-owned paged allocation results to install on Workers.
-    # Planner requirements remain in SchedulerRequestState; model-owned
-    # prepared_layout remains attached to each NewRequestData.req.
-    stage_kv_metadata: dict[str, StageKVMetadata] = field(default_factory=dict)
-    # Current request-layout identities from
-    # SchedulerRequestState.stage_kv_requirement. Paged schedulers must not
-    # derive these independently trusted values from StageKVMetadata.
-    stage_kv_expected_layout_digests: dict[str, str] = field(default_factory=dict)
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:

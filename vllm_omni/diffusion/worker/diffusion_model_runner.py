@@ -30,6 +30,8 @@ from vllm_omni.diffusion.cache.prompt_embed_cache import (
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsPromptUpdate, supports_prompt_update, supports_step_execution
@@ -37,13 +39,6 @@ from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
-from vllm_omni.diffusion.stage_kv.interface import (
-    StageKVMetadata,
-    StageKVWorkerInitConfig,
-    StageKVWorkerInitResult,
-    validate_stage_kv_metadata,
-    validate_stage_kv_worker_init_config,
-)
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import (
@@ -134,7 +129,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
         self.input_batch: InputBatch | None = None
-        self.stage_kv_init_config: StageKVWorkerInitConfig | None = None
 
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, StepRequestState] = {}
@@ -156,72 +150,22 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def _target_device(self) -> torch.device | None:
         return getattr(self.pipeline, "device", None)
 
-    def initialize_stage_kv(self, config: StageKVWorkerInitConfig) -> StageKVWorkerInitResult:
-        """Validate and retain the paged-KV contract without allocating pages.
-
-        The config describes Scheduler-owned allocations only. Model planning
-        requirements never enter the generic Worker storage path.
-        """
-
-        validate_stage_kv_worker_init_config(config)
-        current_config = getattr(self, "stage_kv_init_config", None)
-        if current_config is not None and current_config != config:
-            raise RuntimeError("DiffusionModelRunner received a conflicting Stage KV initialization")
-        self.stage_kv_init_config = config
-        return StageKVWorkerInitResult(
-            cache_mode=config.cache_mode,
-            cache_layout_fingerprint=config.cache_layout_fingerprint,
-            num_blocks=config.kv_cache_config.num_blocks,
-            physical_layout=config.physical_layout,
-        )
-
-    def install_stage_kv_metadata(
+    def _validate_diffusion_kv_metadata(
         self,
         *,
-        new_request_ids: list[str],
-        metadata_by_request: dict[str, StageKVMetadata],
-        expected_layout_digests_by_request: dict[str, str],
+        request_id: str,
+        metadata: DiffusionKVMetadata | None,
     ) -> None:
-        """Validate new-request metadata before model execution.
+        cache_mode = getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+        if cache_mode is DiffusionKVCacheMode.PAGED_SCHEDULER:
+            if metadata is None:
+                raise ValueError(f"paged_scheduler request {request_id!r} is missing Diffusion KV metadata")
+        elif metadata is not None:
+            raise ValueError(f"{cache_mode.value} request {request_id!r} must not carry Diffusion KV metadata")
 
-        PR-W0 deliberately performs no physical installation. PR-W1 extends
-        this hook with native vLLM Worker ``BlockTables`` updates. Allocation
-        metadata is checked against the current Planner-derived layout digest;
-        the full requirement remains Scheduler-owned and model-owned
-        ``request.prepared_layout`` remains on the request.
-        """
-
-        expected_request_ids = set(new_request_ids)
-        metadata_request_ids = set(metadata_by_request)
-        digest_request_ids = set(expected_layout_digests_by_request)
-        stage_kv_init_config = getattr(self, "stage_kv_init_config", None)
-        if stage_kv_init_config is None:
-            if metadata_request_ids or digest_request_ids:
-                raise RuntimeError("Received Stage KV request data before paged Worker initialization")
-            return
-
-        missing_metadata = expected_request_ids - metadata_request_ids
-        unexpected_metadata = metadata_request_ids - expected_request_ids
-        if missing_metadata or unexpected_metadata:
-            raise RuntimeError(
-                "Stage KV metadata does not match newly scheduled requests: "
-                f"missing={sorted(missing_metadata)}, unexpected={sorted(unexpected_metadata)}"
-            )
-
-        missing_digests = expected_request_ids - digest_request_ids
-        unexpected_digests = digest_request_ids - expected_request_ids
-        if missing_digests or unexpected_digests:
-            raise RuntimeError(
-                "Stage KV expected layout digests do not match newly scheduled requests: "
-                f"missing={sorted(missing_digests)}, unexpected={sorted(unexpected_digests)}"
-            )
-
-        for request_id in new_request_ids:
-            validate_stage_kv_metadata(
-                metadata_by_request[request_id],
-                config=stage_kv_init_config,
-                request_id=request_id,
-                expected_request_layout_digest=expected_layout_digests_by_request[request_id],
+        if metadata is not None and metadata.request_id != request_id:
+            raise ValueError(
+                f"Diffusion KV metadata request mismatch: expected={request_id!r}, got={metadata.request_id!r}"
             )
 
     def _compile_transformer(self, attr_name: str) -> None:
@@ -621,8 +565,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self,
         req: OmniDiffusionRequest,
         kv_prefetch_job: KVPrefetchJob | None = None,
-        stage_kv_metadata: StageKVMetadata | None = None,
-        stage_kv_expected_layout_digest: str | None = None,
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
@@ -639,12 +582,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             not track. For non-HSDP inference, we use torch.inference_mode() for better
             performance.
         """
-        self.install_stage_kv_metadata(
-            new_request_ids=[req.request_id],
-            metadata_by_request={} if stage_kv_metadata is None else {req.request_id: stage_kv_metadata},
-            expected_layout_digests_by_request=(
-                {} if stage_kv_expected_layout_digest is None else {req.request_id: stage_kv_expected_layout_digest}
-            ),
+        self._validate_diffusion_kv_metadata(
+            request_id=req.request_id,
+            metadata=diffusion_kv_metadata,
         )
         runner_output = self._execute_request_list(
             [req],
@@ -669,11 +609,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         per-request setup, and calls ``pipeline.forward(batch)``. The pipeline
         must declare ``supports_request_batch = True``.
         """
-        self.install_stage_kv_metadata(
-            new_request_ids=[new_req.req.request_id for new_req in scheduler_output.scheduled_new_reqs],
-            metadata_by_request=scheduler_output.stage_kv_metadata,
-            expected_layout_digests_by_request=scheduler_output.stage_kv_expected_layout_digests,
-        )
+        for new_req in scheduler_output.scheduled_new_reqs:
+            self._validate_diffusion_kv_metadata(
+                request_id=new_req.request_id,
+                metadata=new_req.diffusion_kv_metadata,
+            )
         reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
         return self._execute_request_list(
             reqs,
@@ -781,11 +721,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
-        self.install_stage_kv_metadata(
-            new_request_ids=[new_req.req.request_id for new_req in scheduler_output.scheduled_new_reqs],
-            metadata_by_request=scheduler_output.stage_kv_metadata,
-            expected_layout_digests_by_request=scheduler_output.stage_kv_expected_layout_digests,
-        )
+        for new_req in scheduler_output.scheduled_new_reqs:
+            self._validate_diffusion_kv_metadata(
+                request_id=new_req.request_id,
+                metadata=new_req.diffusion_kv_metadata,
+            )
         if not self._supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
         # Stepwise mode only supports the basic state-driven denoise path for now.

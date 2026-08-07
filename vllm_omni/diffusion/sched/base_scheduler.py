@@ -6,7 +6,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import fields
-from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
@@ -23,9 +22,6 @@ from vllm_omni.diffusion.sched.interface import (
     StepBatchSamplingParamsKey,
 )
 from vllm_omni.diffusion.worker.utils import RunnerOutput
-
-if TYPE_CHECKING:
-    from vllm_omni.diffusion.stage_kv.interface import StageKVWorkerInitConfig
 
 logger = init_logger(__name__)
 
@@ -68,19 +64,6 @@ class BaseScheduler(ABC):
         omni_kv = getattr(od_config, "omni_kv_config", None) or {}
         self._prefetch_enabled = bool(omni_kv.get("enable_kv_async_prefetch", False))
         self._reset_scheduler_state()
-
-    def get_stage_kv_worker_init_config(self) -> StageKVWorkerInitConfig | None:
-        """Return the optional Worker bootstrap contract for this Scheduler.
-
-        Dense schedulers intentionally inherit the no-op default. A paged
-        Scheduler must override this method after deriving a native
-        ``KVCacheConfig`` from its canonical Stage KV cache spec, and return
-        the same config used by its own ``KVCacheManager``. Request planning
-        requirements remain Scheduler-owned and are not part of this Worker
-        bootstrap contract.
-        """
-
-        return None
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         return self._add_request_with_request_id(request.request_id, request)

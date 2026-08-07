@@ -388,25 +388,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         new_reqs = scheduler_output.scheduled_new_reqs
         runner_outputs: list[RunnerOutput] = []
 
-        scheduled_request_ids = {new_req.request_id for new_req in new_reqs}
-        metadata_request_ids = set(scheduler_output.stage_kv_metadata)
-        digest_request_ids = set(scheduler_output.stage_kv_expected_layout_digests)
-        has_stage_kv_request_data = bool(metadata_request_ids or digest_request_ids)
-        if has_stage_kv_request_data:
-            missing_metadata = scheduled_request_ids - metadata_request_ids
-            unexpected_metadata = metadata_request_ids - scheduled_request_ids
-            if missing_metadata or unexpected_metadata:
-                raise RuntimeError(
-                    "Stage KV metadata does not match newly scheduled requests: "
-                    f"missing={sorted(missing_metadata)}, unexpected={sorted(unexpected_metadata)}"
-                )
-            missing_digests = scheduled_request_ids - digest_request_ids
-            unexpected_digests = digest_request_ids - scheduled_request_ids
-            if missing_digests or unexpected_digests:
-                raise RuntimeError(
-                    "Stage KV expected layout digests do not match newly scheduled requests: "
-                    f"missing={sorted(missing_digests)}, unexpected={sorted(unexpected_digests)}"
-                )
+        has_diffusion_kv_metadata = any(new_req.diffusion_kv_metadata is not None for new_req in new_reqs)
 
         # DP multi-concurrency: when DLO+AllGather is active and multiple
         # requests are scheduled, send ALL requests in one broadcast RPC.
@@ -415,7 +397,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # responses and match by dp_rank.
         if (
             len(new_reqs) > 1
-            and not has_stage_kv_request_data
+            and not has_diffusion_kv_metadata
             and getattr(self.od_config, "enable_distributed_layerwise_offload", False)
             and getattr(self.od_config, "dlo_use_allgather", True)
         ):
@@ -487,10 +469,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             req = new_req.req
             try:
                 args: tuple = (req, self.od_config, scheduler_output.kv_prefetch_job)
-                stage_kv_metadata = scheduler_output.stage_kv_metadata.get(new_req.request_id)
-                expected_layout_digest = scheduler_output.stage_kv_expected_layout_digests.get(new_req.request_id)
-                if stage_kv_metadata is not None:
-                    args += (stage_kv_metadata, expected_layout_digest)
+                if new_req.diffusion_kv_metadata is not None:
+                    args += (new_req.diffusion_kv_metadata,)
                 result = self.collective_rpc(
                     "execute_model",
                     args=args,

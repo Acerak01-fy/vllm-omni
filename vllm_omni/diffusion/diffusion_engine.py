@@ -240,16 +240,6 @@ class DiffusionEngine:
         else:
             self.scheduler = RequestScheduler()
         self.scheduler.initialize(od_config)
-        self._initialize_stage_kv_workers()
-
-    def _initialize_stage_kv_workers(self) -> None:
-        provider = getattr(self.scheduler, "get_stage_kv_worker_init_config", None)
-        if provider is None:
-            return
-        config = provider()
-        if config is None:
-            return
-        self.executor.initialize_stage_kv(config)
 
     def _init_runtime_state(self) -> None:
         # DP multi-concurrency: allow batching dp_size requests so each

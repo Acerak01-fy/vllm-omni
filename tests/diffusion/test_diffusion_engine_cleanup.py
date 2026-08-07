@@ -123,21 +123,18 @@ def test_init_accepts_custom_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
     assert engine.scheduler is custom_scheduler
 
 
-def test_stage_kv_bootstrap_failure_closes_scheduler_and_executor(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_scheduler_initialization_failure_closes_scheduler_and_executor(monkeypatch: pytest.MonkeyPatch) -> None:
     od_config = SimpleNamespace(
         custom_pipeline_args=None,
-        model_class_name="StageKVBootstrapFailurePipeline",
+        model_class_name="SchedulerInitializationFailurePipeline",
         streaming_output=False,
     )
-    stage_kv_config = object()
-    bootstrap_error = RuntimeError("Stage KV bootstrap failed")
+    initialization_error = RuntimeError("Scheduler initialization failed")
     custom_scheduler = SimpleNamespace(
-        initialize=Mock(),
-        get_stage_kv_worker_init_config=Mock(return_value=stage_kv_config),
+        initialize=Mock(side_effect=initialization_error),
         close=Mock(),
     )
     fake_executor = SimpleNamespace(
-        initialize_stage_kv=Mock(side_effect=bootstrap_error),
         shutdown=Mock(),
     )
 
@@ -161,10 +158,8 @@ def test_stage_kv_bootstrap_failure_closes_scheduler_and_executor(monkeypatch: p
     with pytest.raises(RuntimeError) as exc_info:
         DiffusionEngine(od_config, scheduler=custom_scheduler)
 
-    assert exc_info.value is bootstrap_error
+    assert exc_info.value is initialization_error
     custom_scheduler.initialize.assert_called_once_with(od_config)
-    custom_scheduler.get_stage_kv_worker_init_config.assert_called_once_with()
-    fake_executor.initialize_stage_kv.assert_called_once_with(stage_kv_config)
     custom_scheduler.close.assert_called_once_with()
     fake_executor.shutdown.assert_called_once_with()
 
