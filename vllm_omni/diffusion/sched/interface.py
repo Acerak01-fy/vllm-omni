@@ -155,6 +155,25 @@ class NewRequestData:
         )
 
 
+def validate_new_request_data_identity(new_req: NewRequestData) -> None:
+    """Ensure an envelope and its forwarded request describe the same request."""
+    forwarded_request_id = new_req.req.request_id
+    if new_req.request_id != forwarded_request_id:
+        raise ValueError(
+            "Diffusion request identity mismatch: "
+            f"envelope request_id={new_req.request_id!r}, "
+            f"forwarded request_id={forwarded_request_id!r}"
+        )
+
+    metadata = new_req.diffusion_kv_metadata
+    if metadata is not None and metadata.request_id != forwarded_request_id:
+        raise ValueError(
+            "Diffusion request identity mismatch: "
+            f"metadata request_id={metadata.request_id!r}, "
+            f"forwarded request_id={forwarded_request_id!r}"
+        )
+
+
 @dataclass
 class CachedRequestData:
     """Cached diffusion requests that only need their request ids resent."""

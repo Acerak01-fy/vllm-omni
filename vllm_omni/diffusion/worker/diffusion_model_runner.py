@@ -38,7 +38,11 @@ from vllm_omni.diffusion.models.interface import SupportsPromptUpdate, supports_
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, KVPrefetchJob
+from vllm_omni.diffusion.sched.interface import (
+    DiffusionSchedulerOutput,
+    KVPrefetchJob,
+    validate_new_request_data_identity,
+)
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import (
@@ -157,10 +161,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         metadata: DiffusionKVMetadata | None,
     ) -> None:
         cache_mode = getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-        if cache_mode is DiffusionKVCacheMode.PAGED_SCHEDULER:
-            if metadata is None:
-                raise ValueError(f"paged_scheduler request {request_id!r} is missing Diffusion KV metadata")
-        elif metadata is not None:
+        # W0 does not wire the Scheduler allocator or Worker installer yet, so
+        # validate an allocation snapshot when present without requiring one.
+        if cache_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER and metadata is not None:
             raise ValueError(f"{cache_mode.value} request {request_id!r} must not carry Diffusion KV metadata")
 
         if metadata is not None and metadata.request_id != request_id:
@@ -610,8 +613,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         must declare ``supports_request_batch = True``.
         """
         for new_req in scheduler_output.scheduled_new_reqs:
+            validate_new_request_data_identity(new_req)
             self._validate_diffusion_kv_metadata(
-                request_id=new_req.request_id,
+                request_id=new_req.req.request_id,
                 metadata=new_req.diffusion_kv_metadata,
             )
         reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
@@ -722,8 +726,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Execute one step for one scheduled request and return runner output."""
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         for new_req in scheduler_output.scheduled_new_reqs:
+            validate_new_request_data_identity(new_req)
             self._validate_diffusion_kv_metadata(
-                request_id=new_req.request_id,
+                request_id=new_req.req.request_id,
                 metadata=new_req.diffusion_kv_metadata,
             )
         if not self._supports_step_mode():

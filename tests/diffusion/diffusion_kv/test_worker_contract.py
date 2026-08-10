@@ -85,14 +85,19 @@ def test_new_request_data_carries_scheduler_allocation_atomically() -> None:
     assert new_req.diffusion_kv_metadata is metadata
 
 
-def test_paged_request_requires_metadata_before_request_forward() -> None:
+def test_paged_request_without_metadata_reaches_request_forward() -> None:
     runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
-    runner._execute_request_list = Mock()
+    expected_output = DiffusionOutput(output=None)
+    runner._execute_request_list = Mock(
+        return_value=SimpleNamespace(
+            runner_outputs=[SimpleNamespace(result=expected_output)],
+        )
+    )
+    req = SimpleNamespace(request_id="req-0")
 
-    with pytest.raises(ValueError, match="missing Diffusion KV metadata"):
-        runner.execute_model(SimpleNamespace(request_id="req-0"))
+    assert runner.execute_model(req) is expected_output
 
-    runner._execute_request_list.assert_not_called()
+    runner._execute_request_list.assert_called_once()
 
 
 def test_dense_request_rejects_metadata_before_request_forward() -> None:
@@ -121,30 +126,76 @@ def test_paged_request_rejects_mismatched_metadata_identity() -> None:
     runner._execute_request_list.assert_not_called()
 
 
-def test_batch_path_validates_metadata_before_forward() -> None:
+def test_request_rpc_rejects_envelope_request_identity_mismatch() -> None:
+    executor, calls = make_executor()
+    req = SimpleNamespace(request_id="actual-request-id")
+    new_req = NewRequestData(
+        request_id="envelope-id",
+        req=req,
+        diffusion_kv_metadata=make_metadata("envelope-id"),
+    )
+
+    with pytest.raises(ValueError, match="request identity mismatch"):
+        executor.execute_request(make_scheduler_output(new_req))
+
+    assert calls == []
+
+
+def test_batch_path_allows_missing_metadata_before_forward() -> None:
     runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
-    runner._execute_request_list = Mock()
+    expected_output = object()
+    runner._execute_request_list = Mock(return_value=expected_output)
     new_req = NewRequestData(
         request_id="req-0",
         req=SimpleNamespace(request_id="req-0"),
     )
 
-    with pytest.raises(ValueError, match="missing Diffusion KV metadata"):
+    assert runner.execute_model_batch(make_scheduler_output(new_req), runner.od_config) is expected_output
+
+    runner._execute_request_list.assert_called_once()
+
+
+def test_batch_path_rejects_envelope_request_identity_mismatch() -> None:
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner._execute_request_list = Mock()
+    new_req = NewRequestData(
+        request_id="envelope-id",
+        req=SimpleNamespace(request_id="actual-request-id"),
+        diffusion_kv_metadata=make_metadata("envelope-id"),
+    )
+
+    with pytest.raises(ValueError, match="request identity mismatch"):
         runner.execute_model_batch(make_scheduler_output(new_req), runner.od_config)
 
     runner._execute_request_list.assert_not_called()
 
 
-def test_step_path_validates_metadata_before_forward() -> None:
+def test_step_path_allows_missing_metadata_before_step_support_check() -> None:
     runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
     runner.pipeline = object()
-    runner._supports_step_mode = Mock()
+    runner._supports_step_mode = Mock(return_value=False)
     new_req = NewRequestData(
         request_id="req-0",
         req=SimpleNamespace(request_id="req-0"),
     )
 
-    with pytest.raises(ValueError, match="missing Diffusion KV metadata"):
+    with pytest.raises(ValueError, match="does not support step execution"):
+        runner.execute_stepwise(make_scheduler_output(new_req))
+
+    runner._supports_step_mode.assert_called_once()
+
+
+def test_step_path_rejects_envelope_request_identity_mismatch() -> None:
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.pipeline = object()
+    runner._supports_step_mode = Mock()
+    new_req = NewRequestData(
+        request_id="envelope-id",
+        req=SimpleNamespace(request_id="actual-request-id"),
+        diffusion_kv_metadata=make_metadata("envelope-id"),
+    )
+
+    with pytest.raises(ValueError, match="request identity mismatch"):
         runner.execute_stepwise(make_scheduler_output(new_req))
 
     runner._supports_step_mode.assert_not_called()

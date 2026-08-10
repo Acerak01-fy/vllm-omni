@@ -388,6 +388,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         new_reqs = scheduler_output.scheduled_new_reqs
         runner_outputs: list[RunnerOutput] = []
 
+        # Validate every envelope before selecting a dispatch path. In
+        # particular, keep identity errors outside the RPC error wrapper so an
+        # invalid request cannot be forwarded or converted into a worker output.
+        from vllm_omni.diffusion.sched.interface import validate_new_request_data_identity
+
+        for new_req in new_reqs:
+            validate_new_request_data_identity(new_req)
+
         has_diffusion_kv_metadata = any(new_req.diffusion_kv_metadata is not None for new_req in new_reqs)
 
         # DP multi-concurrency: when DLO+AllGather is active and multiple
