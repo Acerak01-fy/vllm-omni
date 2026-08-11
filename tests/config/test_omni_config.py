@@ -8,7 +8,7 @@ from dataclasses import fields
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError, field_validator, model_validator
+from pydantic import ValidationError
 from transformers import Qwen3OmniMoeConfig
 from vllm.config import AttentionConfig as VllmAttentionConfig
 from vllm.config import CacheConfig as VllmCacheConfig
@@ -20,7 +20,6 @@ from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.config.quantization import QuantizationConfigArgs
-from vllm.config.utils import config
 
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config import omni_config as omni_config_module
@@ -577,31 +576,6 @@ def test_matching_stage_field_defaults_reuse_upstream_values():
 
 
 @pytest.mark.parametrize(
-    ("config_cls", "upstream_cls", "reused_fields"),
-    [
-        (OmniStageLoadConfig, VllmLoadConfig, {"download_dir", "load_format"}),
-        (OmniStageCacheConfig, VllmCacheConfig, set()),
-        (OmniStageSchedulerConfig, VllmSchedulerConfig, {"async_scheduling"}),
-        (
-            OmniStageParallelConfig,
-            VllmParallelConfig,
-            {
-                "data_parallel_size",
-                "enable_expert_parallel",
-                "pipeline_parallel_size",
-                "tensor_parallel_size",
-            },
-        ),
-    ],
-)
-def test_stage_sub_configs_reuse_selected_upstream_fields(config_cls, upstream_cls, reused_fields):
-    assert issubclass(config_cls, upstream_cls)
-    assert set(config_cls().__dict__) == {field.name for field in fields(config_cls)}
-    for name in reused_fields:
-        assert config_cls.__dataclass_fields__[name] is upstream_cls.__dataclass_fields__[name]
-
-
-@pytest.mark.parametrize(
     ("config_cls", "vllm_only_field"),
     [
         (OmniStageLoadConfig, "safetensors_load_strategy"),
@@ -613,44 +587,6 @@ def test_stage_sub_configs_reuse_selected_upstream_fields(config_cls, upstream_c
 def test_stage_sub_configs_reject_vllm_only_fields(config_cls, vllm_only_field):
     with pytest.raises(ValidationError):
         config_cls(**{vllm_only_field: None})
-
-
-def test_reused_config_prunes_future_upstream_fields_and_terminal_lifecycle():
-    @config
-    class _TerminalConfig:
-        shared: int = 1
-        overridden: int = 2
-        vllm_only: int = 2
-
-        def __post_init__(self) -> None:
-            raise AssertionError("terminal post-init must not run")
-
-        @field_validator("shared")
-        @classmethod
-        def _normalize_shared(cls, value: int) -> int:
-            return value + 1
-
-        @field_validator("overridden", mode="wrap")
-        @classmethod
-        def _validate_overridden(cls, value, handler):
-            raise AssertionError("validator for an Omni-owned field must not run")
-
-        @model_validator(mode="after")
-        def _validate_terminal_config(self):
-            raise AssertionError("terminal model validator must not run")
-
-    @omni_config_module._reuse_vllm_config(_TerminalConfig, reused_fields=frozenset({"shared"}))
-    class _ProjectedConfig(_TerminalConfig):
-        overridden: int | None = None
-
-    projected = _ProjectedConfig(shared=3)
-
-    assert projected.__dict__ == {"shared": 4, "overridden": None}
-    assert fields(_ProjectedConfig)[0] is fields(_TerminalConfig)[0]
-    with pytest.raises(ValidationError):
-        _ProjectedConfig(vllm_only=4)
-    with pytest.raises(ValidationError):
-        _ProjectedConfig(overridden="not-an-integer")
 
 
 def test_sub_config_fields_match_structured_scopes():

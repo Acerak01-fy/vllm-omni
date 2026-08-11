@@ -11,10 +11,10 @@ later PRs cut consumers over to these classes.
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, ClassVar, Literal, TypeAlias, TypedDict, TypeVar, cast, get_origin
+from typing import Any, Literal, TypeAlias, TypedDict, cast
 
 from pydantic import ConfigDict, Field
 from vllm.config import AttentionConfig as VllmAttentionConfig
@@ -85,98 +85,6 @@ _LEGACY_STAGE_METADATA_EXTRA_FIELDS = frozenset(
 _CompilationConfigType: TypeAlias = Mapping[str, Any] | VllmCompilationConfig | None
 _ProfilerConfigType: TypeAlias = Mapping[str, Any] | VllmProfilerConfig | None
 _QuantizationConfigType: TypeAlias = Mapping[str, Any] | QuantizationConfigArgs | QuantizationConfig | str | None
-
-_ConfigClassT = TypeVar("_ConfigClassT")
-
-
-def _reuse_vllm_config(
-    upstream_config_cls: type[Any],
-    *,
-    reused_fields: frozenset[str],
-) -> Callable[[type[_ConfigClassT]], type[_ConfigClassT]]:
-    """Project selected upstream fields onto an isolated Omni config schema.
-
-    Reused fields retain their upstream dataclass metadata and field validators.
-    Other inherited fields become class variables, while terminal lifecycle
-    hooks and validators that touch Omni-owned fields are replaced before
-    Pydantic builds the subclass schema.
-    """
-    upstream_fields = {
-        name: config_field
-        for name, config_field in upstream_config_cls.__dataclass_fields__.items()
-        if get_origin(config_field.type) is not ClassVar
-    }
-    missing_fields = reused_fields - upstream_fields.keys()
-    if missing_fields:
-        missing = ", ".join(sorted(missing_fields))
-        raise TypeError(f"{upstream_config_cls.__name__} no longer defines reusable fields: {missing}")
-
-    def decorator(config_cls: type[_ConfigClassT]) -> type[_ConfigClassT]:
-        if upstream_config_cls not in config_cls.__bases__:
-            raise TypeError(f"{config_cls.__name__} must directly inherit {upstream_config_cls.__name__}")
-
-        annotations = dict(config_cls.__dict__.get("__annotations__", {}))
-        owned_fields = frozenset(annotations)
-        for name in upstream_fields.keys() - reused_fields - annotations.keys():
-            annotations[name] = ClassVar[Any]
-            setattr(config_cls, name, None)
-        config_cls.__annotations__ = annotations
-
-        decorators = upstream_config_cls.__pydantic_decorators__
-        retained_fields = reused_fields | owned_fields
-        for validator_name, validator in decorators.field_validators.items():
-            validator_fields = set(validator.info.fields)
-            retained_validator_fields = (
-                retained_fields if "*" in validator_fields else validator_fields & retained_fields
-            )
-            if not retained_validator_fields - reused_fields or validator_name in config_cls.__dict__:
-                continue
-            if validator.info.mode == "plain":
-                raise TypeError(f"Cannot isolate plain field validator {upstream_config_cls.__name__}.{validator_name}")
-            if validator.info.mode == "wrap":
-
-                def _ignore_terminal_field_validator(cls: type[Any], value: Any, handler: Callable) -> Any:
-                    return handler(value)
-
-            else:
-
-                def _ignore_terminal_field_validator(cls: type[Any], value: Any) -> Any:
-                    return value
-
-            setattr(config_cls, validator_name, classmethod(_ignore_terminal_field_validator))
-
-        for validator_name, validator in decorators.model_validators.items():
-            if validator_name not in config_cls.__dict__:
-                if validator.info.mode == "wrap":
-
-                    def _ignore_terminal_model_validator(cls: type[Any], value: Any, handler: Callable) -> Any:
-                        return handler(value)
-
-                    replacement: Any = classmethod(_ignore_terminal_model_validator)
-                elif validator.info.mode == "before":
-
-                    def _ignore_terminal_model_validator(cls: type[Any], value: Any) -> Any:
-                        return value
-
-                    replacement = classmethod(_ignore_terminal_model_validator)
-                else:
-
-                    def _ignore_terminal_model_validator(self: _ConfigClassT) -> _ConfigClassT:
-                        return self
-
-                    replacement = _ignore_terminal_model_validator
-                setattr(config_cls, validator_name, replacement)
-
-        if "__post_init__" not in config_cls.__dict__:
-
-            def _skip_terminal_post_init(self: _ConfigClassT) -> None:
-                return None
-
-            config_cls.__post_init__ = _skip_terminal_post_init
-
-        return config(config_cls)
-
-    return decorator
 
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
@@ -454,22 +362,21 @@ class OmniStageModelConfig:
     tokenizer_subdir: str | None = None
 
 
-@_reuse_vllm_config(
-    VllmLoadConfig,
-    reused_fields=frozenset({"download_dir", "load_format"}),
-)
-class OmniStageLoadConfig(VllmLoadConfig):
+@config
+class OmniStageLoadConfig:
     """Selected vLLM loading inputs plus Omni stage tokenizer inputs."""
 
     tokenizer: str | None = VllmModelConfig.tokenizer
+    download_dir: str | None = VllmLoadConfig.download_dir
     skip_tokenizer_init: bool = VllmModelConfig.skip_tokenizer_init
+    load_format: str = VllmLoadConfig.load_format
     tokenizer_mode: str = VllmModelConfig.tokenizer_mode
     config_format: str | None = None
     skip_mm_profiling: bool | None = None
 
 
-@_reuse_vllm_config(VllmCacheConfig, reused_fields=frozenset())
-class OmniStageCacheConfig(VllmCacheConfig):
+@config
+class OmniStageCacheConfig:
     """Per-stage engine cache and memory behavior.
 
     This is separate from ``_DiffusionConfigProjection.cache_config``, which configures
@@ -484,14 +391,15 @@ class OmniStageCacheConfig(VllmCacheConfig):
     mm_processor_cache_gb: float | None = Field(default=None, ge=0.0)
 
 
-@_reuse_vllm_config(VllmSchedulerConfig, reused_fields=frozenset({"async_scheduling"}))
-class OmniStageSchedulerConfig(VllmSchedulerConfig):
+@config
+class OmniStageSchedulerConfig:
     """Per-stage request scheduling behavior."""
 
     max_num_seqs: int | None = Field(default=None, ge=1)
     max_num_batched_tokens: int | None = Field(default=None, ge=1)
     max_model_len: int | None = Field(default=None, ge=-1)
     enable_chunked_prefill: bool | None = None
+    async_scheduling: bool | None = VllmSchedulerConfig.async_scheduling
 
     def __post_init__(self) -> None:
         if (
@@ -535,28 +443,18 @@ class OmniStageRuntimeConfig:
     profiler_config: _ProfilerConfigType = None
 
 
-@_reuse_vllm_config(
-    VllmParallelConfig,
-    reused_fields=frozenset(
-        {
-            "data_parallel_size",
-            "enable_expert_parallel",
-            "pipeline_parallel_size",
-            "tensor_parallel_size",
-        }
-    ),
-)
-class OmniStageParallelConfig(VllmParallelConfig):
+@config
+class OmniStageParallelConfig:
     """Selected common per-stage distributed parallelism inputs."""
 
+    pipeline_parallel_size: int = Field(default=VllmParallelConfig.pipeline_parallel_size, ge=1)
+    data_parallel_size: int = Field(default=VllmParallelConfig.data_parallel_size, ge=1)
+    tensor_parallel_size: int = Field(default=VllmParallelConfig.tensor_parallel_size, ge=1)
+    enable_expert_parallel: bool = VllmParallelConfig.enable_expert_parallel
     world_size: int = Field(default=1, ge=1, init=False)
 
     def __post_init__(self) -> None:
         self.world_size = self.pipeline_parallel_size * self.data_parallel_size * self.tensor_parallel_size
-
-    @property
-    def world_size_across_dp(self) -> int:
-        return self.world_size
 
 
 @config
