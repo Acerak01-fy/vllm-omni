@@ -8,8 +8,12 @@ from pathlib import Path
 
 import pytest
 from pydantic.fields import FieldInfo
+from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
+from vllm.config import LoadConfig as VllmLoadConfig
+from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
+from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.config.quantization import QuantizationConfigArgs
 from vllm.engine.arg_utils import EngineArgs
 
@@ -295,6 +299,13 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
         assert {name: typed_args[name] for name in legacy_args} == legacy_args
 
     thinker_args = typed_args_by_stage[0]
+    inherited_vllm_fields = {
+        field.name
+        for config_cls in (VllmLoadConfig, VllmCacheConfig, VllmSchedulerConfig, VllmParallelConfig)
+        for field in fields(config_cls)
+    }
+    topology_projected_fields = {"scheduler_cls"}
+    assert (inherited_vllm_fields - _LLM_STAGE_ENGINE_FIELDS - topology_projected_fields).isdisjoint(thinker_args)
     assert thinker_args["model"] == str(tmp_path / "stage-model" / "ar-model")
     assert thinker_args["tokenizer"] == str(tmp_path / "stage-model" / "ar-tokenizer")
     assert thinker_args["stage_id"] == 0

@@ -8,19 +8,15 @@ from dataclasses import fields
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError, field_validator, model_validator
+from pydantic import ValidationError
 from transformers import Qwen3OmniMoeConfig
-from vllm.config import AttentionConfig as VllmAttentionConfig
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
-from vllm.config import KernelConfig as VllmKernelConfig
 from vllm.config import LoadConfig as VllmLoadConfig
-from vllm.config import ModelConfig as VllmModelConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.config.quantization import QuantizationConfigArgs
-from vllm.config.utils import config
 
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config import omni_config as omni_config_module
@@ -511,148 +507,6 @@ def test_upstream_config_compatible_fields_keep_prebuilt_config_types():
     assert stage_config.quantization_config is quantization_config
 
 
-def test_matching_stage_field_defaults_reuse_upstream_values():
-    model_config = OmniStageModelConfig()
-    assert {
-        "revision": model_config.revision,
-        "tokenizer_revision": model_config.tokenizer_revision,
-        "code_revision": model_config.code_revision,
-        "logits_processors": model_config.logits_processors,
-        "trust_remote_code": model_config.trust_remote_code,
-        "dtype": model_config.dtype,
-        "attention_backend": model_config.attention_backend,
-        "moe_backend": model_config.moe_backend,
-        "enable_sleep_mode": model_config.enable_sleep_mode,
-        "enforce_eager": model_config.enforce_eager,
-        "max_cudagraph_capture_size": model_config.max_cudagraph_capture_size,
-        "enable_flashinfer_autotune": model_config.enable_flashinfer_autotune,
-    } == {
-        "revision": VllmModelConfig.revision,
-        "tokenizer_revision": VllmModelConfig.tokenizer_revision,
-        "code_revision": VllmModelConfig.code_revision,
-        "logits_processors": VllmModelConfig.logits_processors,
-        "trust_remote_code": VllmModelConfig.trust_remote_code,
-        "dtype": VllmModelConfig.dtype,
-        "attention_backend": VllmAttentionConfig.backend,
-        "moe_backend": VllmKernelConfig.moe_backend,
-        "enable_sleep_mode": VllmModelConfig.enable_sleep_mode,
-        "enforce_eager": VllmModelConfig.enforce_eager,
-        "max_cudagraph_capture_size": VllmCompilationConfig.max_cudagraph_capture_size,
-        "enable_flashinfer_autotune": VllmKernelConfig.enable_flashinfer_autotune,
-    }
-
-    load_config = OmniStageLoadConfig()
-    assert {
-        "tokenizer": load_config.tokenizer,
-        "download_dir": load_config.download_dir,
-        "skip_tokenizer_init": load_config.skip_tokenizer_init,
-        "load_format": load_config.load_format,
-        "tokenizer_mode": load_config.tokenizer_mode,
-    } == {
-        "tokenizer": VllmModelConfig.tokenizer,
-        "download_dir": VllmLoadConfig.download_dir,
-        "skip_tokenizer_init": VllmModelConfig.skip_tokenizer_init,
-        "load_format": VllmLoadConfig.load_format,
-        "tokenizer_mode": VllmModelConfig.tokenizer_mode,
-    }
-
-    cache_config = OmniStageCacheConfig()
-    assert cache_config.kv_cache_memory_bytes == VllmCacheConfig.kv_cache_memory_bytes
-    assert cache_config.disable_hybrid_kv_cache_manager == VllmSchedulerConfig.disable_hybrid_kv_cache_manager
-    assert OmniStageSchedulerConfig().async_scheduling == VllmSchedulerConfig.async_scheduling
-    assert OmniStageRuntimeConfig().distributed_executor_backend == VllmParallelConfig.distributed_executor_backend
-
-    parallel_config = OmniStageParallelConfig()
-    assert {
-        "pipeline_parallel_size": parallel_config.pipeline_parallel_size,
-        "data_parallel_size": parallel_config.data_parallel_size,
-        "tensor_parallel_size": parallel_config.tensor_parallel_size,
-        "enable_expert_parallel": parallel_config.enable_expert_parallel,
-    } == {
-        "pipeline_parallel_size": VllmParallelConfig.pipeline_parallel_size,
-        "data_parallel_size": VllmParallelConfig.data_parallel_size,
-        "tensor_parallel_size": VllmParallelConfig.tensor_parallel_size,
-        "enable_expert_parallel": VllmParallelConfig.enable_expert_parallel,
-    }
-
-
-@pytest.mark.parametrize(
-    ("config_cls", "upstream_cls", "reused_fields"),
-    [
-        (OmniStageLoadConfig, VllmLoadConfig, {"download_dir", "load_format"}),
-        (OmniStageCacheConfig, VllmCacheConfig, set()),
-        (OmniStageSchedulerConfig, VllmSchedulerConfig, {"async_scheduling"}),
-        (
-            OmniStageParallelConfig,
-            VllmParallelConfig,
-            {
-                "data_parallel_size",
-                "enable_expert_parallel",
-                "pipeline_parallel_size",
-                "tensor_parallel_size",
-            },
-        ),
-    ],
-)
-def test_stage_sub_configs_reuse_selected_upstream_fields(config_cls, upstream_cls, reused_fields):
-    assert issubclass(config_cls, upstream_cls)
-    assert set(config_cls().__dict__) == {field.name for field in fields(config_cls)}
-    for name in reused_fields:
-        assert config_cls.__dataclass_fields__[name] is upstream_cls.__dataclass_fields__[name]
-
-
-@pytest.mark.parametrize(
-    ("config_cls", "vllm_only_field"),
-    [
-        (OmniStageLoadConfig, "safetensors_load_strategy"),
-        (OmniStageCacheConfig, "cache_dtype"),
-        (OmniStageSchedulerConfig, "scheduler_reserve_full_isl"),
-        (OmniStageParallelConfig, "eplb_config"),
-    ],
-)
-def test_stage_sub_configs_reject_vllm_only_fields(config_cls, vllm_only_field):
-    with pytest.raises(ValidationError):
-        config_cls(**{vllm_only_field: None})
-
-
-def test_reused_config_prunes_future_upstream_fields_and_terminal_lifecycle():
-    @config
-    class _TerminalConfig:
-        shared: int = 1
-        overridden: int = 2
-        vllm_only: int = 2
-
-        def __post_init__(self) -> None:
-            raise AssertionError("terminal post-init must not run")
-
-        @field_validator("shared")
-        @classmethod
-        def _normalize_shared(cls, value: int) -> int:
-            return value + 1
-
-        @field_validator("overridden", mode="wrap")
-        @classmethod
-        def _validate_overridden(cls, value, handler):
-            raise AssertionError("validator for an Omni-owned field must not run")
-
-        @model_validator(mode="after")
-        def _validate_terminal_config(self):
-            raise AssertionError("terminal model validator must not run")
-
-    @omni_config_module._reuse_vllm_config(_TerminalConfig, reused_fields=frozenset({"shared"}))
-    class _ProjectedConfig(_TerminalConfig):
-        overridden: int | None = None
-
-    projected = _ProjectedConfig(shared=3)
-
-    assert projected.__dict__ == {"shared": 4, "overridden": None}
-    assert fields(_ProjectedConfig)[0] is fields(_TerminalConfig)[0]
-    with pytest.raises(ValidationError):
-        _ProjectedConfig(vllm_only=4)
-    with pytest.raises(ValidationError):
-        _ProjectedConfig(overridden="not-an-integer")
-
-
 def test_sub_config_fields_match_structured_scopes():
     assert {f.name for f in fields(OmniStageModelConfig)} == {
         "model",
@@ -690,28 +544,24 @@ def test_sub_config_fields_match_structured_scopes():
         "model_subdir",
         "tokenizer_subdir",
     }
-    assert {f.name for f in fields(OmniStageLoadConfig)} == {
+    vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
+    assert issubclass(OmniStageLoadConfig, VllmLoadConfig)
+    assert {f.name for f in fields(OmniStageLoadConfig)} == vllm_load_fields | {
         "tokenizer",
-        "download_dir",
         "skip_tokenizer_init",
-        "load_format",
         "tokenizer_mode",
         "config_format",
         "skip_mm_profiling",
     }
-    assert {f.name for f in fields(OmniStageCacheConfig)} == {
-        "kv_cache_memory_bytes",
-        "gpu_memory_utilization",
-        "enable_prefix_caching",
+    assert OmniStageLoadConfig(load_format="PT").load_format == "pt"
+    assert issubclass(OmniStageCacheConfig, VllmCacheConfig)
+    assert {f.name for f in fields(OmniStageCacheConfig)} == {f.name for f in fields(VllmCacheConfig)} | {
         "disable_hybrid_kv_cache_manager",
         "mm_processor_cache_gb",
     }
-    assert {f.name for f in fields(OmniStageSchedulerConfig)} == {
-        "max_num_seqs",
-        "max_num_batched_tokens",
+    assert issubclass(OmniStageSchedulerConfig, VllmSchedulerConfig)
+    assert {f.name for f in fields(OmniStageSchedulerConfig)} == {f.name for f in fields(VllmSchedulerConfig)} | {
         "max_model_len",
-        "enable_chunked_prefill",
-        "async_scheduling",
     }
     assert {f.name for f in fields(OmniStageConnectorConfig)} == {
         "async_chunk",
@@ -720,17 +570,10 @@ def test_sub_config_fields_match_structured_scopes():
         "output_connectors",
         "input_connectors",
     }
-    assert {f.name for f in fields(OmniStageParallelConfig)} == {
-        "pipeline_parallel_size",
-        "data_parallel_size",
-        "tensor_parallel_size",
-        "enable_expert_parallel",
-        "world_size",
-    }
-    assert {f.name for f in fields(OmniStageDiffusionParallelConfig)} == {
-        "pipeline_parallel_size",
-        "data_parallel_size",
-        "tensor_parallel_size",
+    vllm_parallel_fields = {f.name for f in fields(VllmParallelConfig)}
+    assert issubclass(OmniStageParallelConfig, VllmParallelConfig)
+    assert {f.name for f in fields(OmniStageParallelConfig)} == vllm_parallel_fields
+    assert {f.name for f in fields(OmniStageDiffusionParallelConfig)} == vllm_parallel_fields | {
         "sequence_parallel_size",
         "ulysses_degree",
         "ring_degree",
@@ -744,8 +587,6 @@ def test_sub_config_fields_match_structured_scopes():
         "mask_sp_padding",
         "hsdp_shard_size",
         "hsdp_replicate_size",
-        "enable_expert_parallel",
-        "world_size",
     }
 
 
@@ -755,9 +596,10 @@ def test_diffusion_parallel_config_fields_cover_legacy_surface():
     legacy_fields = {f.name for f in fields(DiffusionParallelConfig)}
     structured_fields = {f.name for f in fields(OmniStageDiffusionParallelConfig)}
     expected_upstream_fields = {"mask_sp_padding"}
+    vllm_parallel_fields = {f.name for f in fields(VllmParallelConfig)}
 
     assert legacy_fields | expected_upstream_fields <= structured_fields
-    assert structured_fields - legacy_fields - expected_upstream_fields == {"world_size"}
+    assert structured_fields - legacy_fields - expected_upstream_fields - vllm_parallel_fields == set()
 
 
 def test_diffusion_parallel_config_keeps_current_diffusion_parallel_surface():

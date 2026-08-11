@@ -11,18 +11,15 @@ later PRs cut consumers over to these classes.
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, fields
+from collections.abc import Mapping
+from dataclasses import InitVar, dataclass, field, fields
 from pathlib import Path
-from typing import Any, ClassVar, Literal, TypeAlias, TypedDict, TypeVar, cast, get_origin
+from typing import Any, Literal, TypeAlias, TypedDict, cast
 
 from pydantic import ConfigDict, Field
-from vllm.config import AttentionConfig as VllmAttentionConfig
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
-from vllm.config import KernelConfig as VllmKernelConfig
 from vllm.config import LoadConfig as VllmLoadConfig
-from vllm.config import ModelConfig as VllmModelConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
@@ -85,98 +82,6 @@ _LEGACY_STAGE_METADATA_EXTRA_FIELDS = frozenset(
 _CompilationConfigType: TypeAlias = Mapping[str, Any] | VllmCompilationConfig | None
 _ProfilerConfigType: TypeAlias = Mapping[str, Any] | VllmProfilerConfig | None
 _QuantizationConfigType: TypeAlias = Mapping[str, Any] | QuantizationConfigArgs | QuantizationConfig | str | None
-
-_ConfigClassT = TypeVar("_ConfigClassT")
-
-
-def _reuse_vllm_config(
-    upstream_config_cls: type[Any],
-    *,
-    reused_fields: frozenset[str],
-) -> Callable[[type[_ConfigClassT]], type[_ConfigClassT]]:
-    """Project selected upstream fields onto an isolated Omni config schema.
-
-    Reused fields retain their upstream dataclass metadata and field validators.
-    Other inherited fields become class variables, while terminal lifecycle
-    hooks and validators that touch Omni-owned fields are replaced before
-    Pydantic builds the subclass schema.
-    """
-    upstream_fields = {
-        name: config_field
-        for name, config_field in upstream_config_cls.__dataclass_fields__.items()
-        if get_origin(config_field.type) is not ClassVar
-    }
-    missing_fields = reused_fields - upstream_fields.keys()
-    if missing_fields:
-        missing = ", ".join(sorted(missing_fields))
-        raise TypeError(f"{upstream_config_cls.__name__} no longer defines reusable fields: {missing}")
-
-    def decorator(config_cls: type[_ConfigClassT]) -> type[_ConfigClassT]:
-        if upstream_config_cls not in config_cls.__bases__:
-            raise TypeError(f"{config_cls.__name__} must directly inherit {upstream_config_cls.__name__}")
-
-        annotations = dict(config_cls.__dict__.get("__annotations__", {}))
-        owned_fields = frozenset(annotations)
-        for name in upstream_fields.keys() - reused_fields - annotations.keys():
-            annotations[name] = ClassVar[Any]
-            setattr(config_cls, name, None)
-        config_cls.__annotations__ = annotations
-
-        decorators = upstream_config_cls.__pydantic_decorators__
-        retained_fields = reused_fields | owned_fields
-        for validator_name, validator in decorators.field_validators.items():
-            validator_fields = set(validator.info.fields)
-            retained_validator_fields = (
-                retained_fields if "*" in validator_fields else validator_fields & retained_fields
-            )
-            if not retained_validator_fields - reused_fields or validator_name in config_cls.__dict__:
-                continue
-            if validator.info.mode == "plain":
-                raise TypeError(f"Cannot isolate plain field validator {upstream_config_cls.__name__}.{validator_name}")
-            if validator.info.mode == "wrap":
-
-                def _ignore_terminal_field_validator(cls: type[Any], value: Any, handler: Callable) -> Any:
-                    return handler(value)
-
-            else:
-
-                def _ignore_terminal_field_validator(cls: type[Any], value: Any) -> Any:
-                    return value
-
-            setattr(config_cls, validator_name, classmethod(_ignore_terminal_field_validator))
-
-        for validator_name, validator in decorators.model_validators.items():
-            if validator_name not in config_cls.__dict__:
-                if validator.info.mode == "wrap":
-
-                    def _ignore_terminal_model_validator(cls: type[Any], value: Any, handler: Callable) -> Any:
-                        return handler(value)
-
-                    replacement: Any = classmethod(_ignore_terminal_model_validator)
-                elif validator.info.mode == "before":
-
-                    def _ignore_terminal_model_validator(cls: type[Any], value: Any) -> Any:
-                        return value
-
-                    replacement = classmethod(_ignore_terminal_model_validator)
-                else:
-
-                    def _ignore_terminal_model_validator(self: _ConfigClassT) -> _ConfigClassT:
-                        return self
-
-                    replacement = _ignore_terminal_model_validator
-                setattr(config_cls, validator_name, replacement)
-
-        if "__post_init__" not in config_cls.__dict__:
-
-            def _skip_terminal_post_init(self: _ConfigClassT) -> None:
-                return None
-
-            config_cls.__post_init__ = _skip_terminal_post_init
-
-        return config(config_cls)
-
-    return decorator
 
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
@@ -417,32 +322,29 @@ class OmniStageModelConfig:
 
     model: str | None = None
     model_arch: str | None = None
-    revision: str | None = VllmModelConfig.revision
-    tokenizer_revision: str | None = VllmModelConfig.tokenizer_revision
-    code_revision: str | None = VllmModelConfig.code_revision
+    revision: str | None = None
+    tokenizer_revision: str | None = None
+    code_revision: str | None = None
     seed: int | None = None
-    logits_processors: list[str | type] | None = VllmModelConfig.logits_processors
-    trust_remote_code: bool = VllmModelConfig.trust_remote_code
-    dtype: Any = VllmModelConfig.dtype
-    attention_backend: Any = VllmAttentionConfig.backend
-    moe_backend: str = VllmKernelConfig.moe_backend
+    logits_processors: list[str | type] | None = None
+    trust_remote_code: bool = False
+    dtype: Any = "auto"
+    attention_backend: Any = None
+    moe_backend: str = "auto"
     hf_overrides: Any = None
     limit_mm_per_prompt: dict[str, Any] | None = None
     active_stream_window: int = Field(default=0, ge=0)
     duplex_max_sessions: int = Field(default=1, ge=1)
-    enable_sleep_mode: bool = VllmModelConfig.enable_sleep_mode
+    enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
     custom_voice_dir: str | None = None
     task_type: str | None = None
     codec_frame_rate_hz: float | None = None
-    enforce_eager: bool = VllmModelConfig.enforce_eager
-    max_cudagraph_capture_size: int | None = Field(
-        default=VllmCompilationConfig.max_cudagraph_capture_size,
-        ge=0,
-    )
-    enable_flashinfer_autotune: bool | None = VllmKernelConfig.enable_flashinfer_autotune
+    enforce_eager: bool = False
+    max_cudagraph_capture_size: int | None = Field(default=None, ge=0)
+    enable_flashinfer_autotune: bool | None = None
     compilation_config: _CompilationConfigType = None
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = Field(default=4, ge=1)
@@ -454,21 +356,18 @@ class OmniStageModelConfig:
     tokenizer_subdir: str | None = None
 
 
-@_reuse_vllm_config(
-    VllmLoadConfig,
-    reused_fields=frozenset({"download_dir", "load_format"}),
-)
+@config
 class OmniStageLoadConfig(VllmLoadConfig):
-    """Selected vLLM loading inputs plus Omni stage tokenizer inputs."""
+    """vLLM loading behavior plus Omni stage-specific tokenizer inputs."""
 
-    tokenizer: str | None = VllmModelConfig.tokenizer
-    skip_tokenizer_init: bool = VllmModelConfig.skip_tokenizer_init
-    tokenizer_mode: str = VllmModelConfig.tokenizer_mode
+    tokenizer: str | None = None
+    skip_tokenizer_init: bool = False
+    tokenizer_mode: str = "auto"
     config_format: str | None = None
     skip_mm_profiling: bool | None = None
 
 
-@_reuse_vllm_config(VllmCacheConfig, reused_fields=frozenset())
+@config
 class OmniStageCacheConfig(VllmCacheConfig):
     """Per-stage engine cache and memory behavior.
 
@@ -476,24 +375,28 @@ class OmniStageCacheConfig(VllmCacheConfig):
     vLLM-Omni diffusion-specific cache backends such as TeaCache and Cache-DiT.
     """
 
-    kv_cache_memory_bytes: int | None = Field(default=VllmCacheConfig.kv_cache_memory_bytes, ge=0)
+    kv_cache_memory_bytes: int | None = Field(default=None, ge=0)
     # None preserves backend-owned defaults; explicit values still project.
     gpu_memory_utilization: float | None = Field(default=None, gt=0.0, le=1.0)
     enable_prefix_caching: bool | None = None
-    disable_hybrid_kv_cache_manager: bool | None = VllmSchedulerConfig.disable_hybrid_kv_cache_manager
+    disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = Field(default=None, ge=0.0)
 
 
-@_reuse_vllm_config(VllmSchedulerConfig, reused_fields=frozenset({"async_scheduling"}))
+@config
 class OmniStageSchedulerConfig(VllmSchedulerConfig):
     """Per-stage request scheduling behavior."""
 
+    # Upstream receives max_model_len only while materializing SchedulerConfig.
+    # Omni retains it as unresolved stage input until the owning engine process.
     max_num_seqs: int | None = Field(default=None, ge=1)
     max_num_batched_tokens: int | None = Field(default=None, ge=1)
     max_model_len: int | None = Field(default=None, ge=-1)
+    is_encoder_decoder: InitVar[bool] = False
     enable_chunked_prefill: bool | None = None
+    async_scheduling: bool | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, is_encoder_decoder: bool = False) -> None:
         if (
             self.max_num_batched_tokens is not None
             and self.max_num_seqs is not None
@@ -524,7 +427,7 @@ class OmniStageConnectorConfig:
 class OmniStageRuntimeConfig:
     """Per-stage process placement and backend runtime behavior."""
 
-    distributed_executor_backend: Any = VllmParallelConfig.distributed_executor_backend
+    distributed_executor_backend: Any = None
     worker_cls: str | None = None
     devices: str | None = None
     num_replicas: int = Field(default=1, ge=1)
@@ -535,27 +438,18 @@ class OmniStageRuntimeConfig:
     profiler_config: _ProfilerConfigType = None
 
 
-@_reuse_vllm_config(
-    VllmParallelConfig,
-    reused_fields=frozenset(
-        {
-            "data_parallel_size",
-            "enable_expert_parallel",
-            "pipeline_parallel_size",
-            "tensor_parallel_size",
-        }
-    ),
-)
+@config
 class OmniStageParallelConfig(VllmParallelConfig):
-    """Selected common per-stage distributed parallelism inputs."""
-
-    world_size: int = Field(default=1, ge=1, init=False)
+    """Common per-stage distributed parallelism behavior."""
 
     def __post_init__(self) -> None:
+        # Keep config construction transport-safe. Upstream runtime backend,
+        # rank, port, and platform resolution happens in the owning process.
         self.world_size = self.pipeline_parallel_size * self.data_parallel_size * self.tensor_parallel_size
 
     @property
     def world_size_across_dp(self) -> int:
+        # Omni's public world_size has historically included DP.
         return self.world_size
 
 
@@ -970,10 +864,17 @@ _COMMON_STAGE_ENGINE_FIELDS = (
     | _CONNECTOR_ENGINE_FIELDS
     | _RUNTIME_ENGINE_FIELDS
 )
-_LLM_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(f.name for f in fields(OmniStageParallelConfig)) - {"world_size"}
-_DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(f.name for f in fields(OmniStageDiffusionParallelConfig)) - {
-    "world_size"
-}
+_LLM_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(
+    {
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "tensor_parallel_size",
+        "enable_expert_parallel",
+    }
+)
+_DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS = (
+    frozenset(f.name for f in fields(OmniStageDiffusionParallelConfig)) & _PARALLEL_CONFIG_ENGINE_FIELDS
+)
 _LLM_STAGE_ENGINE_FIELDS = _COMMON_STAGE_ENGINE_FIELDS | _LLM_PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
 _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS = (
     _COMMON_STAGE_ENGINE_FIELDS

@@ -27,6 +27,11 @@ from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
 from vllm_omni.config.omni_config import (
+    _CACHE_ENGINE_FIELDS,
+    _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS,
+    _LLM_PARALLEL_CONFIG_ENGINE_FIELDS,
+    _LOAD_ENGINE_FIELDS,
+    _SCHEDULER_ENGINE_FIELDS,
     BaseVllmOmniStageConfig,
     VllmOmniDiffusionStageConfig,
 )
@@ -768,13 +773,14 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
 def _project_omni_config_fields(
     config: Any,
     *,
+    include: frozenset[str] | None = None,
     exclude: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Copy defined typed config fields into backend adapter kwargs."""
     projected: dict[str, Any] = {}
     for config_field in fields(config):
         name = config_field.name
-        if name in exclude:
+        if (include is not None and name not in include) or name in exclude:
             continue
         value = getattr(config, name)
         if value is not None:
@@ -792,22 +798,25 @@ def _project_omni_stage_engine_args(
     if is_diffusion:
         engine_args.update(_project_omni_config_fields(stage_config.diffusion_config))
 
-    for config, excluded_fields in (
+    for config, included_fields, excluded_fields in (
         (
             stage_config.model_config,
+            None,
             frozenset({"default_sampling_params", "has_sampling_extra_args"}),
         ),
-        (stage_config.load_config, frozenset()),
-        (stage_config.cache_config, frozenset()),
-        (stage_config.scheduler_config, frozenset()),
+        (stage_config.load_config, _LOAD_ENGINE_FIELDS, frozenset()),
+        (stage_config.cache_config, _CACHE_ENGINE_FIELDS, frozenset()),
+        (stage_config.scheduler_config, _SCHEDULER_ENGINE_FIELDS, frozenset()),
         (
             stage_config.runtime_config,
+            None,
             frozenset({"devices", "num_replicas", "env", "num_gpus"}),
         ),
     ):
         engine_args.update(
             _project_omni_config_fields(
                 config,
+                include=included_fields,
                 exclude=excluded_fields,
             )
         )
@@ -838,12 +847,14 @@ def _project_omni_stage_engine_args(
     if is_diffusion:
         engine_args["parallel_config"] = _project_omni_config_fields(
             stage_config.parallel_config,
+            include=_DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS,
             exclude=frozenset({"world_size"}),
         )
     else:
         engine_args.update(
             _project_omni_config_fields(
                 stage_config.parallel_config,
+                include=_LLM_PARALLEL_CONFIG_ENGINE_FIELDS,
                 exclude=frozenset({"world_size"}),
             )
         )
