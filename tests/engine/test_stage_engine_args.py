@@ -270,6 +270,35 @@ def test_typed_llm_engine_args_preserve_upstream_config_objects(tmp_path, stage_
     assert typed_args["quantization_config"].ignore == ["lm_head"]
 
 
+def test_typed_llm_engine_args_forward_reused_vllm_config_inputs(tmp_path):
+    pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+    expected = {
+        "safetensors_load_strategy": "eager",
+        "kv_cache_dtype": "fp8",
+        "scheduling_policy": "priority",
+        "prefill_context_parallel_size": 2,
+        "data_parallel_address": "10.0.0.8",
+        "enable_dbo": True,
+    }
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=copy.deepcopy(deploy),
+        cli_overrides={"model": model, **{f"stage_0_{name}": value for name, value in expected.items()}},
+    )
+
+    stage_config = omni_config.stage_by_id(0)
+    typed_args = build_engine_args_dict_from_omni_stage_config(stage_config, model)
+
+    assert stage_config.load_config.safetensors_load_strategy == "eager"
+    assert stage_config.cache_config.cache_dtype == "fp8"
+    assert stage_config.scheduler_config.policy == "priority"
+    assert stage_config.parallel_config.prefill_context_parallel_size == 2
+    assert stage_config.parallel_config.data_parallel_master_ip == "10.0.0.8"
+    assert stage_config.parallel_config.enable_dbo is True
+    assert {name: typed_args[name] for name in expected} == expected
+    assert {"cache_dtype", "policy", "data_parallel_master_ip"}.isdisjoint(typed_args)
+
+
 def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
     legacy_stages, omni_config = _legacy_and_typed_stages(pipeline, deploy, model)

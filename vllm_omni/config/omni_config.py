@@ -12,11 +12,12 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import InitVar, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, model_validator
+from typing_extensions import Self
 from vllm.config import AttentionConfig as VllmAttentionConfig
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
@@ -28,6 +29,7 @@ from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
 from vllm.config.quantization import QuantizationConfigArgs
 from vllm.config.utils import config
+from vllm.engine.arg_utils import EngineArgs as VllmEngineArgs
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.config.stage_config import (
@@ -124,30 +126,9 @@ class _ModelEngineOverrides(TypedDict, total=False):
     disable_autocast: bool
 
 
-class _LoadEngineOverrides(TypedDict, total=False):
-    tokenizer: str
-    download_dir: str
-    skip_tokenizer_init: bool
-    load_format: str
-    tokenizer_mode: str
-    config_format: str
-    skip_mm_profiling: bool
-
-
-class _CacheEngineOverrides(TypedDict, total=False):
-    kv_cache_memory_bytes: int
-    gpu_memory_utilization: float
-    enable_prefix_caching: bool
-    disable_hybrid_kv_cache_manager: bool
-    mm_processor_cache_gb: float
-
-
-class _SchedulerEngineOverrides(TypedDict, total=False):
-    max_num_seqs: int
-    max_num_batched_tokens: int
-    max_model_len: int
-    enable_chunked_prefill: bool
-    async_scheduling: bool
+_LoadEngineOverrides: TypeAlias = dict[str, Any]
+_CacheEngineOverrides: TypeAlias = dict[str, Any]
+_SchedulerEngineOverrides: TypeAlias = dict[str, Any]
 
 
 class _RuntimeEngineOverrides(TypedDict, total=False):
@@ -162,28 +143,7 @@ class _RuntimeEngineOverrides(TypedDict, total=False):
     profiler_config: _ProfilerConfigType
 
 
-class _ParallelConfigEngineOverrides(TypedDict, total=False):
-    pipeline_parallel_size: int
-    data_parallel_size: int
-    tensor_parallel_size: int
-    sequence_parallel_size: int
-    ulysses_degree: int
-    ring_degree: int
-    allgather_degree: int
-    ulysses_mode: str
-    cfg_parallel_size: int
-    vae_patch_parallel_size: int
-    vae_parallel_mode: str
-    text_encoder_tp_size: int
-    use_hsdp: bool
-    mask_sp_padding: bool
-    hsdp_shard_size: int
-    hsdp_replicate_size: int
-    enable_expert_parallel: bool
-
-
-class _ParallelEngineOverrides(_ParallelConfigEngineOverrides, total=False):
-    parallel_config: _ParallelConfigEngineOverrides | Mapping[str, Any]
+_ParallelEngineOverrides: TypeAlias = dict[str, Any]
 
 
 class _ConnectorEngineOverrides(TypedDict, total=False):
@@ -239,6 +199,17 @@ def _copy_value(value: Any) -> Any:
 
 def _config_kwargs(overrides: Mapping[str, Any]) -> dict[str, Any]:
     return {name: _copy_value(value) for name, value in overrides.items() if value is not None}
+
+
+def _config_field_kwargs(
+    overrides: Mapping[str, Any],
+    field_map: Mapping[str, str],
+) -> dict[str, Any]:
+    return {
+        config_name: _copy_value(overrides[engine_arg_name])
+        for config_name, engine_arg_name in field_map.items()
+        if engine_arg_name in overrides and overrides[engine_arg_name] is not None
+    }
 
 
 def _first_defined(*values: Any) -> Any:
@@ -363,20 +334,19 @@ class OmniStageModelConfig:
 
 
 @config
-class OmniStageLoadConfig:
-    """Selected vLLM loading inputs plus Omni stage tokenizer inputs."""
+class OmniStageLoadConfig(VllmLoadConfig):
+    """vLLM loading inputs plus Omni stage tokenizer inputs."""
 
     tokenizer: str | None = VllmModelConfig.tokenizer
-    download_dir: str | None = VllmLoadConfig.download_dir
     skip_tokenizer_init: bool = VllmModelConfig.skip_tokenizer_init
-    load_format: str = VllmLoadConfig.load_format
     tokenizer_mode: str = VllmModelConfig.tokenizer_mode
     config_format: str | None = None
     skip_mm_profiling: bool | None = None
+    device: str | None = Field(default=None, init=False)
 
 
 @config
-class OmniStageCacheConfig:
+class OmniStageCacheConfig(VllmCacheConfig):
     """Per-stage engine cache and memory behavior.
 
     This is separate from ``_DiffusionConfigProjection.cache_config``, which configures
@@ -390,26 +360,36 @@ class OmniStageCacheConfig:
     disable_hybrid_kv_cache_manager: bool | None = VllmSchedulerConfig.disable_hybrid_kv_cache_manager
     mm_processor_cache_gb: float | None = Field(default=None, ge=0.0)
 
+    hash_block_size: int | None = Field(default=None, init=False)
+    is_attention_free: bool = Field(default=False, init=False)
+    sliding_window: int | None = Field(default=None, init=False)
+    mamba_page_size_padded: int | None = Field(default=None, init=False)
+    skip_page_size_padded: int | None = Field(default=None, init=False)
+
+    @model_validator(mode="after")
+    def _apply_block_size_default(self) -> Self:
+        return self
+
 
 @config
-class OmniStageSchedulerConfig:
-    """Per-stage request scheduling behavior."""
+class OmniStageSchedulerConfig(VllmSchedulerConfig):
+    """vLLM scheduler inputs retained until engine construction."""
 
     max_num_seqs: int | None = Field(default=None, ge=1)
     max_num_batched_tokens: int | None = Field(default=None, ge=1)
     max_model_len: int | None = Field(default=None, ge=-1)
+    is_encoder_decoder: InitVar[bool] = Field(default=False, init=False)
     enable_chunked_prefill: bool | None = None
     async_scheduling: bool | None = VllmSchedulerConfig.async_scheduling
 
-    def __post_init__(self) -> None:
-        if (
-            self.max_num_batched_tokens is not None
-            and self.max_num_seqs is not None
-            and self.max_num_batched_tokens < self.max_num_seqs
-        ):
-            raise ValueError(
-                f"max_num_batched_tokens ({self.max_num_batched_tokens}) must be >= max_num_seqs ({self.max_num_seqs})"
-            )
+    runner_type: str = Field(default=VllmSchedulerConfig.runner_type, init=False)
+    max_num_scheduled_tokens: int | None = Field(default=None, init=False)
+    is_multimodal_model: bool = Field(default=False, init=False)
+    scheduler_cls: Any = Field(default=None, init=False)
+    disable_hybrid_kv_cache_manager: bool | None = Field(default=None, init=False)
+
+    def __post_init__(self, is_encoder_decoder: bool = False) -> None:
+        """Defer model-dependent scheduler validation to ``EngineArgs``."""
 
 
 @config
@@ -444,23 +424,57 @@ class OmniStageRuntimeConfig:
 
 
 @config
-class OmniStageParallelConfig:
-    """Selected common per-stage distributed parallelism inputs."""
+class OmniStageParallelConfig(VllmParallelConfig):
+    """vLLM parallel inputs retained until engine construction."""
 
-    pipeline_parallel_size: int = Field(default=VllmParallelConfig.pipeline_parallel_size, ge=1)
-    data_parallel_size: int = Field(default=VllmParallelConfig.data_parallel_size, ge=1)
-    tensor_parallel_size: int = Field(default=VllmParallelConfig.tensor_parallel_size, ge=1)
-    enable_expert_parallel: bool = VllmParallelConfig.enable_expert_parallel
-    world_size: int = Field(default=1, ge=1, init=False)
+    data_parallel_size_local: int | None = None
+    data_parallel_rank: int | None = None
+    data_parallel_master_ip: str | None = None
+    data_parallel_rpc_port: int | None = None
+
+    data_parallel_rank_local: int | None = Field(default=None, init=False)
+    data_parallel_master_port: int = Field(default=VllmParallelConfig.data_parallel_master_port, init=False)
+    is_moe_model: bool | None = Field(default=None, init=False)
+    ray_runtime_env: Any = Field(default=None, init=False)
+    placement_group: Any = Field(default=None, init=False)
+    assigned_physical_gpu_ids: list[int] | None = Field(default=None, init=False)
+    distributed_executor_backend: Any = Field(default=None, init=False)
+    worker_cls: str = Field(default=VllmParallelConfig.worker_cls, init=False)
+    sd_worker_cls: str = Field(default=VllmParallelConfig.sd_worker_cls, init=False)
+    rank: int = Field(default=0, init=False)
+    _data_parallel_master_port_list: list[int] = Field(default_factory=list, init=False)
+    _coord_store_port: int = Field(default=0, init=False)
+    _api_process_count: int = Field(default=1, gt=0, init=False)
+    _api_process_rank: int = Field(default=0, ge=-1, init=False)
 
     def __post_init__(self) -> None:
-        self.world_size = self.pipeline_parallel_size * self.data_parallel_size * self.tensor_parallel_size
+        self.world_size = (
+            self.pipeline_parallel_size
+            * self.data_parallel_size
+            * self.tensor_parallel_size
+            * self.prefill_context_parallel_size
+        )
+
+    @model_validator(mode="after")
+    def _validate_parallel_config(self) -> Self:
+        return self
+
+    @model_validator(mode="after")
+    def _verify_args(self) -> Self:
+        return self
+
+    @property
+    def world_size_across_dp(self) -> int:
+        return self.world_size
 
 
 @config
-class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
+class OmniStageDiffusionParallelConfig:
     """Diffusion-stage distributed parallelism behavior."""
 
+    pipeline_parallel_size: int = Field(default=1, ge=1)
+    data_parallel_size: int = Field(default=1, ge=1)
+    tensor_parallel_size: int = Field(default=1, ge=1)
     sequence_parallel_size: int = Field(default=1, ge=1, init=False)
     ulysses_degree: int = Field(default=1, ge=1)
     ring_degree: int = Field(default=1, ge=1)
@@ -474,6 +488,8 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     mask_sp_padding: bool = False
     hsdp_shard_size: int = -1
     hsdp_replicate_size: int = Field(default=1, ge=1)
+    enable_expert_parallel: bool = False
+    world_size: int = Field(default=1, ge=1, init=False)
 
     def __post_init__(self) -> None:
         self.sequence_parallel_size = (
@@ -850,32 +866,128 @@ _DIFFUSION_STAGE_ENGINE_FIELDS = (_DIFFUSION_CONFIG_FIELDS | _DIFFUSION_BACKCOMP
     "stage_id",
 }
 
+
+def _is_config_input_field(config_field: Any) -> bool:
+    return config_field.init and getattr(config_field.default, "init", None) is not False
+
+
+_VLLM_ENGINE_ARG_FIELDS = frozenset(config_field.name for config_field in fields(VllmEngineArgs))
+
+
+def _config_engine_arg_field_map(
+    config_cls: type[Any],
+    aliases: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    aliases = aliases or {}
+    return {
+        config_field.name: engine_arg_name
+        for config_field in fields(config_cls)
+        if _is_config_input_field(config_field)
+        and (engine_arg_name := aliases.get(config_field.name, config_field.name)) in _VLLM_ENGINE_ARG_FIELDS
+    }
+
+
+_CACHE_CONFIG_ENGINE_ARG_ALIASES = {"cache_dtype": "kv_cache_dtype"}
+_SCHEDULER_CONFIG_ENGINE_ARG_ALIASES = {"policy": "scheduling_policy"}
+_PARALLEL_CONFIG_ENGINE_ARG_ALIASES = {"data_parallel_master_ip": "data_parallel_address"}
+
+_LLM_LOAD_CONFIG_FIELD_MAP = _config_engine_arg_field_map(OmniStageLoadConfig)
+_LLM_CACHE_CONFIG_FIELD_MAP = _config_engine_arg_field_map(
+    OmniStageCacheConfig,
+    _CACHE_CONFIG_ENGINE_ARG_ALIASES,
+)
+_LLM_SCHEDULER_CONFIG_FIELD_MAP = _config_engine_arg_field_map(
+    OmniStageSchedulerConfig,
+    _SCHEDULER_CONFIG_ENGINE_ARG_ALIASES,
+)
+_LLM_PARALLEL_CONFIG_FIELD_MAP = _config_engine_arg_field_map(
+    OmniStageParallelConfig,
+    _PARALLEL_CONFIG_ENGINE_ARG_ALIASES,
+)
+
+_DIFFUSION_LOAD_CONFIG_FIELD_MAP = {
+    name: name
+    for name in {
+        "tokenizer",
+        "download_dir",
+        "skip_tokenizer_init",
+        "load_format",
+        "tokenizer_mode",
+        "config_format",
+        "skip_mm_profiling",
+    }
+}
+_DIFFUSION_CACHE_CONFIG_FIELD_MAP = {
+    name: name
+    for name in {
+        "kv_cache_memory_bytes",
+        "gpu_memory_utilization",
+        "enable_prefix_caching",
+        "disable_hybrid_kv_cache_manager",
+        "mm_processor_cache_gb",
+    }
+}
+_DIFFUSION_SCHEDULER_CONFIG_FIELD_MAP = {
+    name: name
+    for name in {
+        "max_num_seqs",
+        "max_num_batched_tokens",
+        "max_model_len",
+        "enable_chunked_prefill",
+        "async_scheduling",
+    }
+}
+_DIFFUSION_PARALLEL_CONFIG_FIELD_MAP = {
+    config_field.name: config_field.name
+    for config_field in fields(OmniStageDiffusionParallelConfig)
+    if _is_config_input_field(config_field)
+}
+_PARALLEL_CONFIG_FIELD_MAPS = {
+    OmniStageParallelConfig: _LLM_PARALLEL_CONFIG_FIELD_MAP,
+    OmniStageDiffusionParallelConfig: _DIFFUSION_PARALLEL_CONFIG_FIELD_MAP,
+}
+
 _QUANTIZATION_ENGINE_FIELDS = frozenset(_QuantizationEngineOverrides.__annotations__)
 _MODEL_ENGINE_FIELDS = frozenset(_ModelEngineOverrides.__annotations__)
-_LOAD_ENGINE_FIELDS = frozenset(_LoadEngineOverrides.__annotations__)
-_CACHE_ENGINE_FIELDS = frozenset(_CacheEngineOverrides.__annotations__)
-_SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
 _CONNECTOR_ENGINE_FIELDS = frozenset(_ConnectorEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
-_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_ParallelConfigEngineOverrides.__annotations__)
-_PARALLEL_ENGINE_FIELDS = _PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
-_COMMON_STAGE_ENGINE_FIELDS = (
+
+_LLM_LOAD_ENGINE_FIELDS = frozenset(_LLM_LOAD_CONFIG_FIELD_MAP.values())
+_LLM_CACHE_ENGINE_FIELDS = frozenset(_LLM_CACHE_CONFIG_FIELD_MAP.values())
+_LLM_SCHEDULER_ENGINE_FIELDS = frozenset(_LLM_SCHEDULER_CONFIG_FIELD_MAP.values())
+_LLM_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_LLM_PARALLEL_CONFIG_FIELD_MAP)
+_LLM_PARALLEL_ENGINE_FIELDS = frozenset(_LLM_PARALLEL_CONFIG_FIELD_MAP.values())
+
+_DIFFUSION_LOAD_ENGINE_FIELDS = frozenset(_DIFFUSION_LOAD_CONFIG_FIELD_MAP.values())
+_DIFFUSION_CACHE_ENGINE_FIELDS = frozenset(_DIFFUSION_CACHE_CONFIG_FIELD_MAP.values())
+_DIFFUSION_SCHEDULER_ENGINE_FIELDS = frozenset(_DIFFUSION_SCHEDULER_CONFIG_FIELD_MAP.values())
+_DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(
+    config_field.name for config_field in fields(OmniStageDiffusionParallelConfig)
+) - {"world_size"}
+_DIFFUSION_PARALLEL_ENGINE_FIELDS = _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS
+
+_LLM_COMMON_STAGE_ENGINE_FIELDS = (
     _QUANTIZATION_ENGINE_FIELDS
     | _MODEL_ENGINE_FIELDS
-    | _LOAD_ENGINE_FIELDS
-    | _CACHE_ENGINE_FIELDS
-    | _SCHEDULER_ENGINE_FIELDS
+    | _LLM_LOAD_ENGINE_FIELDS
+    | _LLM_CACHE_ENGINE_FIELDS
+    | _LLM_SCHEDULER_ENGINE_FIELDS
     | _CONNECTOR_ENGINE_FIELDS
     | _RUNTIME_ENGINE_FIELDS
 )
-_LLM_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(f.name for f in fields(OmniStageParallelConfig)) - {"world_size"}
-_DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(f.name for f in fields(OmniStageDiffusionParallelConfig)) - {
-    "world_size"
-}
-_LLM_STAGE_ENGINE_FIELDS = _COMMON_STAGE_ENGINE_FIELDS | _LLM_PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
+_DIFFUSION_COMMON_STAGE_ENGINE_FIELDS = (
+    _QUANTIZATION_ENGINE_FIELDS
+    | _MODEL_ENGINE_FIELDS
+    | _DIFFUSION_LOAD_ENGINE_FIELDS
+    | _DIFFUSION_CACHE_ENGINE_FIELDS
+    | _DIFFUSION_SCHEDULER_ENGINE_FIELDS
+    | _CONNECTOR_ENGINE_FIELDS
+    | _RUNTIME_ENGINE_FIELDS
+)
+_LLM_STAGE_ENGINE_FIELDS = _LLM_COMMON_STAGE_ENGINE_FIELDS | _LLM_PARALLEL_ENGINE_FIELDS | {"parallel_config"}
 _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS = (
-    _COMMON_STAGE_ENGINE_FIELDS
-    | _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS
+    _DIFFUSION_COMMON_STAGE_ENGINE_FIELDS
+    | _DIFFUSION_PARALLEL_ENGINE_FIELDS
     | _DIFFUSION_STAGE_ENGINE_FIELDS
     | {"parallel_config"}
 )
@@ -980,24 +1092,34 @@ def _stage_engine_values(
         topology.execution_type,
         engine,
     )
+    if topology.execution_type == StageExecutionType.DIFFUSION:
+        load_fields = _DIFFUSION_LOAD_ENGINE_FIELDS
+        cache_fields = _DIFFUSION_CACHE_ENGINE_FIELDS
+        scheduler_fields = _DIFFUSION_SCHEDULER_ENGINE_FIELDS
+        parallel_fields = _DIFFUSION_PARALLEL_ENGINE_FIELDS
+    else:
+        load_fields = _LLM_LOAD_ENGINE_FIELDS
+        cache_fields = _LLM_CACHE_ENGINE_FIELDS
+        scheduler_fields = _LLM_SCHEDULER_ENGINE_FIELDS
+        parallel_fields = _LLM_PARALLEL_ENGINE_FIELDS
     return _StageEngineValues(
         quantization=cast(
             _QuantizationEngineOverrides,
             _select_engine_overrides(engine, _QUANTIZATION_ENGINE_FIELDS),
         ),
         model=cast(_ModelEngineOverrides, _select_engine_overrides(engine, _MODEL_ENGINE_FIELDS)),
-        load=cast(_LoadEngineOverrides, _select_engine_overrides(engine, _LOAD_ENGINE_FIELDS)),
-        cache=cast(_CacheEngineOverrides, _select_engine_overrides(engine, _CACHE_ENGINE_FIELDS)),
+        load=_select_engine_overrides(engine, load_fields),
+        cache=_select_engine_overrides(engine, cache_fields),
         scheduler=cast(
             _SchedulerEngineOverrides,
-            _select_engine_overrides(engine, _SCHEDULER_ENGINE_FIELDS),
+            _select_engine_overrides(engine, scheduler_fields),
         ),
         connector=cast(
             _ConnectorEngineOverrides,
             _select_engine_overrides(engine, _CONNECTOR_ENGINE_FIELDS),
         ),
         runtime=cast(_RuntimeEngineOverrides, _select_engine_overrides(engine, _RUNTIME_ENGINE_FIELDS)),
-        parallel=cast(_ParallelEngineOverrides, _select_engine_overrides(engine, _PARALLEL_ENGINE_FIELDS)),
+        parallel=_select_engine_overrides(engine, parallel_fields | {"parallel_config"}),
         diffusion=_DiffusionEngineOverrides.from_engine(engine),
     )
 
@@ -1161,9 +1283,9 @@ def _build_common_stage_config_kwargs(
     topology: StagePipelineConfig,
     stage_deploy: StageDeployConfig | None,
     engine: _StageEngineValues,
-    parallel_config_cls: type[OmniStageParallelConfig] = OmniStageParallelConfig,
     *,
     model: str | None,
+    parallel_config_cls: type[Any] = OmniStageParallelConfig,
 ) -> tuple[dict[str, Any], str | None, str | None]:
     input_proc, next_stage_proc = _select_processor_funcs(topology, bool(deploy.async_chunk))
     quantization_config = _build_quantization_config(deploy, engine.quantization)
@@ -1290,8 +1412,8 @@ def _build_diffusion_stage_config(
         topology,
         stage_deploy,
         engine,
-        OmniStageDiffusionParallelConfig,
         model=model,
+        parallel_config_cls=OmniStageDiffusionParallelConfig,
     )
     common_kwargs["diffusion_config"] = _build_diffusion_config_projection(
         pipeline,
@@ -1392,7 +1514,7 @@ def _build_load_config(
     topology: StagePipelineConfig,
     engine: _LoadEngineOverrides,
 ) -> OmniStageLoadConfig:
-    kwargs = _config_kwargs(engine)
+    kwargs = _config_field_kwargs(engine, _LLM_LOAD_CONFIG_FIELD_MAP)
     if "skip_mm_profiling" not in kwargs and not topology.requires_multimodal_data:
         kwargs["skip_mm_profiling"] = True
     return OmniStageLoadConfig(**kwargs)
@@ -1403,7 +1525,7 @@ def _build_cache_config(
     engine: _CacheEngineOverrides,
     execution_type: StageExecutionType,
 ) -> OmniStageCacheConfig:
-    kwargs = _config_kwargs(engine)
+    kwargs = _config_field_kwargs(engine, _LLM_CACHE_CONFIG_FIELD_MAP)
     if "enable_prefix_caching" not in kwargs and deploy.enable_prefix_caching is not None:
         kwargs["enable_prefix_caching"] = _copy_value(deploy.enable_prefix_caching)
     if "disable_hybrid_kv_cache_manager" not in kwargs and execution_type == StageExecutionType.LLM_GENERATION:
@@ -1417,7 +1539,7 @@ def _build_scheduler_config(
     engine: _SchedulerEngineOverrides,
     execution_type: StageExecutionType,
 ) -> OmniStageSchedulerConfig:
-    kwargs = _config_kwargs(engine)
+    kwargs = _config_field_kwargs(engine, _LLM_SCHEDULER_CONFIG_FIELD_MAP)
     if "enable_chunked_prefill" not in kwargs and deploy.enable_chunked_prefill is not None:
         kwargs["enable_chunked_prefill"] = _copy_value(deploy.enable_chunked_prefill)
     if "async_scheduling" not in kwargs and execution_type == StageExecutionType.LLM_AR:
@@ -1444,7 +1566,7 @@ def _build_runtime_config(
     deploy: DeployConfig,
     stage_deploy: StageDeployConfig | None,
     engine: _RuntimeEngineOverrides,
-    parallel_config: OmniStageParallelConfig,
+    parallel_config: Any,
 ) -> OmniStageRuntimeConfig:
     kwargs = _config_kwargs(engine)
     if "distributed_executor_backend" not in kwargs and deploy.distributed_executor_backend is not None:
@@ -1462,19 +1584,12 @@ def _build_runtime_config(
 def _build_parallel_config(
     deploy: DeployConfig,
     engine: _ParallelEngineOverrides,
-    config_cls: type[OmniStageParallelConfig] = OmniStageParallelConfig,
-) -> OmniStageParallelConfig:
+    config_cls: type[Any] = OmniStageParallelConfig,
+) -> Any:
     parallel_config = _mapping_or_empty(engine.get("parallel_config"))
-    config_fields = {
-        config_field.name
-        for config_field in fields(config_cls)
-        if getattr(config_field.default, "init", None) is not False
-    }
-    kwargs = {
-        name: _copy_value(value) for name in _PARALLEL_CONFIG_ENGINE_FIELDS if (value := engine.get(name)) is not None
-    }
-    kwargs = {name: value for name, value in kwargs.items() if name in config_fields}
-    kwargs.update({name: value for name, value in _config_kwargs(parallel_config).items() if name in config_fields})
+    field_map = _PARALLEL_CONFIG_FIELD_MAPS[config_cls]
+    kwargs = _config_field_kwargs(engine, field_map)
+    kwargs.update({name: value for name, value in _config_kwargs(parallel_config).items() if name in field_map})
     if "pipeline_parallel_size" not in kwargs and deploy.pipeline_parallel_size is not None:
         kwargs["pipeline_parallel_size"] = _copy_value(deploy.pipeline_parallel_size)
     if "data_parallel_size" not in kwargs and deploy.data_parallel_size is not None:
