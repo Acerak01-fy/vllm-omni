@@ -14,7 +14,7 @@ import importlib
 import multiprocessing as mp
 import os
 import time
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal, cast
@@ -27,13 +27,6 @@ from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
 from vllm_omni.config.omni_config import (
-    _DIFFUSION_CACHE_CONFIG_FIELD_MAP,
-    _DIFFUSION_LOAD_CONFIG_FIELD_MAP,
-    _DIFFUSION_SCHEDULER_CONFIG_FIELD_MAP,
-    _LLM_CACHE_CONFIG_FIELD_MAP,
-    _LLM_LOAD_CONFIG_FIELD_MAP,
-    _LLM_PARALLEL_CONFIG_FIELD_MAP,
-    _LLM_SCHEDULER_CONFIG_FIELD_MAP,
     BaseVllmOmniStageConfig,
     VllmOmniDiffusionStageConfig,
 )
@@ -776,18 +769,16 @@ def _project_omni_config_fields(
     config: Any,
     *,
     exclude: frozenset[str] = frozenset(),
-    field_map: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Copy defined typed config fields into backend adapter kwargs."""
     projected: dict[str, Any] = {}
     for config_field in fields(config):
         name = config_field.name
-        if name in exclude or (field_map is not None and name not in field_map):
+        if name in exclude:
             continue
         value = getattr(config, name)
         if value is not None:
-            projected_name = field_map[name] if field_map is not None else name
-            projected[projected_name] = copy.deepcopy(value)
+            projected[name] = copy.deepcopy(value)
     return projected
 
 
@@ -801,40 +792,23 @@ def _project_omni_stage_engine_args(
     if is_diffusion:
         engine_args.update(_project_omni_config_fields(stage_config.diffusion_config))
 
-    config_field_maps = (
-        (
-            _DIFFUSION_LOAD_CONFIG_FIELD_MAP,
-            _DIFFUSION_CACHE_CONFIG_FIELD_MAP,
-            _DIFFUSION_SCHEDULER_CONFIG_FIELD_MAP,
-        )
-        if is_diffusion
-        else (
-            _LLM_LOAD_CONFIG_FIELD_MAP,
-            _LLM_CACHE_CONFIG_FIELD_MAP,
-            _LLM_SCHEDULER_CONFIG_FIELD_MAP,
-        )
-    )
-
-    for config, excluded_fields, field_map in (
+    for config, excluded_fields in (
         (
             stage_config.model_config,
             frozenset({"default_sampling_params", "has_sampling_extra_args"}),
-            None,
         ),
-        (stage_config.load_config, frozenset(), config_field_maps[0]),
-        (stage_config.cache_config, frozenset(), config_field_maps[1]),
-        (stage_config.scheduler_config, frozenset(), config_field_maps[2]),
+        (stage_config.load_config, frozenset()),
+        (stage_config.cache_config, frozenset()),
+        (stage_config.scheduler_config, frozenset()),
         (
             stage_config.runtime_config,
             frozenset({"devices", "num_replicas", "env", "num_gpus"}),
-            None,
         ),
     ):
         engine_args.update(
             _project_omni_config_fields(
                 config,
                 exclude=excluded_fields,
-                field_map=field_map,
             )
         )
 
@@ -870,7 +844,7 @@ def _project_omni_stage_engine_args(
         engine_args.update(
             _project_omni_config_fields(
                 stage_config.parallel_config,
-                field_map=_LLM_PARALLEL_CONFIG_FIELD_MAP,
+                exclude=frozenset({"world_size"}),
             )
         )
 
