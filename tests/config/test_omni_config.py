@@ -539,6 +539,8 @@ def test_sub_config_fields_match_structured_scopes():
         "moe_backend",
         "hf_overrides",
         "limit_mm_per_prompt",
+        "interleave_mm_strings",
+        "media_io_kwargs",
         "active_stream_window",
         "duplex_max_sessions",
         "enable_sleep_mode",
@@ -575,6 +577,7 @@ def test_sub_config_fields_match_structured_scopes():
     assert {f.name for f in fields(OmniStageCacheConfig)} == {f.name for f in fields(VllmCacheConfig)} | {
         "disable_hybrid_kv_cache_manager",
         "mm_processor_cache_gb",
+        "mamba_ssm_cache_dtype",
     }
     assert issubclass(OmniStageSchedulerConfig, VllmSchedulerConfig)
     assert {f.name for f in fields(OmniStageSchedulerConfig)} == {f.name for f in fields(VllmSchedulerConfig)} | {
