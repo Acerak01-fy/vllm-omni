@@ -11,12 +11,14 @@ later PRs cut consumers over to these classes.
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import InitVar, dataclass, field, fields
+from functools import wraps
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, field_validator
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
 from vllm.config import LoadConfig as VllmLoadConfig
@@ -81,11 +83,74 @@ _LEGACY_STAGE_METADATA_EXTRA_FIELDS = frozenset(
 # of eagerly materializing terminal configs in the head process.
 _CompilationConfigType: TypeAlias = Mapping[str, Any] | VllmCompilationConfig | None
 _ProfilerConfigType: TypeAlias = Mapping[str, Any] | VllmProfilerConfig | None
-_QuantizationConfigType: TypeAlias = Mapping[str, Any] | QuantizationConfigArgs | QuantizationConfig | str | None
+_LLMQuantizationConfigType: TypeAlias = Mapping[str, Any] | QuantizationConfigArgs | QuantizationConfig | str | None
+_DiffusionQuantizationConfigType: TypeAlias = Mapping[str, Any] | QuantizationConfig | str | None
+
+
+def _validate_diffusion_quantization_config(
+    value: object,
+    *,
+    context: str,
+) -> _DiffusionQuantizationConfigType:
+    if isinstance(value, QuantizationConfigArgs):
+        raise TypeError(
+            f"{context} cannot use vLLM QuantizationConfigArgs; that schema is only "
+            "supported by AR/generation stages. Use a diffusion quantization "
+            "string, mapping, QuantizationConfig, or None."
+        )
+    if value is None or isinstance(value, (str, Mapping, QuantizationConfig)):
+        return cast(_DiffusionQuantizationConfigType, value)
+    raise TypeError(
+        f"{context} quantization config must be a string, mapping, QuantizationConfig, or None, got {type(value)!r}"
+    )
+
+
+def _preserve_legacy_positional_args(*field_names: str) -> Callable[[type[Any]], type[Any]]:
+    """Keep the pre-inheritance positional API; require new fields by keyword."""
+
+    def decorator(cls: type[Any]) -> type[Any]:
+        generated_init = cls.__init__
+        generated_signature = signature(cls)
+        parameters = generated_signature.parameters
+
+        missing_fields = set(field_names) - parameters.keys()
+        if missing_fields:
+            raise TypeError(
+                f"{cls.__name__} positional fields are missing from its signature: {sorted(missing_fields)}"
+            )
+
+        compatible_signature = generated_signature.replace(
+            parameters=[
+                *(parameters[name].replace(kind=Parameter.POSITIONAL_OR_KEYWORD) for name in field_names),
+                *(
+                    parameter.replace(kind=Parameter.KEYWORD_ONLY)
+                    for name, parameter in parameters.items()
+                    if name not in field_names
+                ),
+            ]
+        )
+
+        @wraps(generated_init)
+        def compatible_init(self: Any, *args: Any, **kwargs: Any) -> None:
+            known_kwargs = {name: value for name, value in kwargs.items() if name in parameters}
+            extra_kwargs = {name: value for name, value in kwargs.items() if name not in parameters}
+            try:
+                bound = compatible_signature.bind_partial(*args, **known_kwargs)
+            except TypeError as exc:
+                raise TypeError(f"{cls.__name__}() {exc}") from None
+            # Let Pydantic retain ownership of missing/extra-field validation.
+            generated_init(self, **bound.arguments, **extra_kwargs)
+
+        cls.__init__ = compatible_init
+        cls.__signature__ = compatible_signature
+        cls.__match_args__ = field_names
+        return cls
+
+    return decorator
 
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
-    quantization_config: _QuantizationConfigType
+    quantization_config: _LLMQuantizationConfigType
     quantization: str
 
 
@@ -356,6 +421,15 @@ class OmniStageModelConfig:
     tokenizer_subdir: str | None = None
 
 
+@_preserve_legacy_positional_args(
+    "tokenizer",
+    "download_dir",
+    "skip_tokenizer_init",
+    "load_format",
+    "tokenizer_mode",
+    "config_format",
+    "skip_mm_profiling",
+)
 @config
 class OmniStageLoadConfig(VllmLoadConfig):
     """vLLM loading behavior plus Omni stage-specific tokenizer inputs."""
@@ -367,6 +441,13 @@ class OmniStageLoadConfig(VllmLoadConfig):
     skip_mm_profiling: bool | None = None
 
 
+@_preserve_legacy_positional_args(
+    "kv_cache_memory_bytes",
+    "gpu_memory_utilization",
+    "enable_prefix_caching",
+    "disable_hybrid_kv_cache_manager",
+    "mm_processor_cache_gb",
+)
 @config
 class OmniStageCacheConfig(VllmCacheConfig):
     """Per-stage engine cache and memory behavior.
@@ -383,6 +464,13 @@ class OmniStageCacheConfig(VllmCacheConfig):
     mm_processor_cache_gb: float | None = Field(default=None, ge=0.0)
 
 
+@_preserve_legacy_positional_args(
+    "max_num_seqs",
+    "max_num_batched_tokens",
+    "max_model_len",
+    "enable_chunked_prefill",
+    "async_scheduling",
+)
 @config
 class OmniStageSchedulerConfig(VllmSchedulerConfig):
     """Per-stage request scheduling behavior."""
@@ -397,6 +485,11 @@ class OmniStageSchedulerConfig(VllmSchedulerConfig):
     async_scheduling: bool | None = None
 
     def __post_init__(self, is_encoder_decoder: bool = False) -> None:
+        # Upstream initializes these derived fields in its terminal post-init.
+        # Keep them serializable here without running model-dependent checks.
+        self.max_num_encoder_input_tokens = self.max_num_batched_tokens
+        self.encoder_cache_size = self.max_num_batched_tokens
+
         if (
             self.max_num_batched_tokens is not None
             and self.max_num_seqs is not None
@@ -438,6 +531,12 @@ class OmniStageRuntimeConfig:
     profiler_config: _ProfilerConfigType = None
 
 
+@_preserve_legacy_positional_args(
+    "pipeline_parallel_size",
+    "data_parallel_size",
+    "tensor_parallel_size",
+    "enable_expert_parallel",
+)
 @config
 class OmniStageParallelConfig(VllmParallelConfig):
     """Common per-stage distributed parallelism behavior."""
@@ -445,6 +544,7 @@ class OmniStageParallelConfig(VllmParallelConfig):
     def __post_init__(self) -> None:
         # Keep config construction transport-safe. Upstream runtime backend,
         # rank, port, and platform resolution happens in the owning process.
+        self.data_parallel_index = self.data_parallel_rank
         self.world_size = self.pipeline_parallel_size * self.data_parallel_size * self.tensor_parallel_size
 
     @property
@@ -453,6 +553,24 @@ class OmniStageParallelConfig(VllmParallelConfig):
         return self.world_size
 
 
+@_preserve_legacy_positional_args(
+    "pipeline_parallel_size",
+    "data_parallel_size",
+    "tensor_parallel_size",
+    "enable_expert_parallel",
+    "ulysses_degree",
+    "ring_degree",
+    "allgather_degree",
+    "ulysses_mode",
+    "cfg_parallel_size",
+    "vae_patch_parallel_size",
+    "text_encoder_tp_size",
+    "vae_parallel_mode",
+    "use_hsdp",
+    "mask_sp_padding",
+    "hsdp_shard_size",
+    "hsdp_replicate_size",
+)
 @config
 class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     """Diffusion-stage distributed parallelism behavior."""
@@ -472,6 +590,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     hsdp_replicate_size: int = Field(default=1, ge=1)
 
     def __post_init__(self) -> None:
+        self.data_parallel_index = self.data_parallel_rank
         self.sequence_parallel_size = (
             self.allgather_degree if self.allgather_degree > 1 else self.ulysses_degree * self.ring_degree
         )
@@ -617,8 +736,13 @@ class _DiffusionConfigProjection:
     additional_config: dict[str, Any] = field(default_factory=dict)
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
-    quantization_config: _QuantizationConfigType = None
+    quantization_config: _DiffusionQuantizationConfigType = None
     extras: dict[str, Any] = field(default_factory=dict)
+
+    @field_validator("quantization_config", mode="before")
+    @classmethod
+    def _validate_quantization_config(cls, value: object) -> _DiffusionQuantizationConfigType:
+        return _validate_diffusion_quantization_config(value, context=cls.__name__)
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
@@ -677,10 +801,7 @@ class _DiffusionConfigProjection:
 
         self._propagate_quantization_from_tf_config(self.tf_model_config)
         if self.quantization_config is not None:
-            if isinstance(
-                self.quantization_config,
-                (QuantizationConfig, QuantizationConfigArgs),
-            ):
+            if isinstance(self.quantization_config, QuantizationConfig):
                 pass
             elif isinstance(self.quantization_config, str):
                 self.quantization_config = build_quant_config(self.quantization_config)
@@ -688,8 +809,7 @@ class _DiffusionConfigProjection:
                 self.quantization_config = dict(self.quantization_config)
             else:
                 raise TypeError(
-                    "quantization_config must be str, dict, QuantizationConfigArgs, "
-                    "QuantizationConfig, or None, "
+                    "quantization_config must be str, dict, QuantizationConfig, or None, "
                     f"got {type(self.quantization_config)!r}"
                 )
 
@@ -909,6 +1029,15 @@ def _validate_stage_engine_override_ownership(
     except KeyError as exc:
         raise ValueError(f"Unsupported stage execution type: {execution_type!r}") from exc
 
+    if execution_type is StageExecutionType.DIFFUSION:
+        for field_name in ("quantization_config", "quantization"):
+            value = overrides.get(field_name)
+            if isinstance(value, QuantizationConfigArgs):
+                _validate_diffusion_quantization_config(
+                    value,
+                    context=f"Stage {stage_id} ({execution_type.value}) {field_name}",
+                )
+
     unowned_fields = set(overrides) - owner_fields
     parallel_config = overrides.get("parallel_config")
     if isinstance(parallel_config, Mapping):
@@ -1056,7 +1185,7 @@ class BaseVllmOmniStageConfig:
     connector_config: OmniStageConnectorConfig = field(default_factory=OmniStageConnectorConfig)
     runtime_config: OmniStageRuntimeConfig = field(default_factory=OmniStageRuntimeConfig)
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
-    quantization_config: _QuantizationConfigType = None
+    quantization_config: _LLMQuantizationConfigType = None
 
     @property
     def stage_id(self) -> int:
@@ -1152,7 +1281,13 @@ class VllmOmniDiffusionStageConfig(BaseVllmOmniStageConfig):
     """Structured config for diffusion stages."""
 
     parallel_config: OmniStageDiffusionParallelConfig = field(default_factory=OmniStageDiffusionParallelConfig)
+    quantization_config: _DiffusionQuantizationConfigType = None
     diffusion_config: _DiffusionConfigProjection = field(default_factory=_DiffusionConfigProjection)
+
+    @field_validator("quantization_config", mode="before")
+    @classmethod
+    def _validate_quantization_config(cls, value: object) -> _DiffusionQuantizationConfigType:
+        return _validate_diffusion_quantization_config(value, context=cls.__name__)
 
 
 StageConfigType: TypeAlias = VllmOmniARStageConfig | VllmOmniGenerationStageConfig | VllmOmniDiffusionStageConfig
@@ -1347,7 +1482,7 @@ def _build_stage_config(
 def _build_quantization_config(
     deploy: DeployConfig,
     engine: _QuantizationEngineOverrides,
-) -> _QuantizationConfigType:
+) -> _LLMQuantizationConfigType:
     return _first_defined(
         engine.get("quantization_config"),
         engine.get("quantization"),
@@ -1492,7 +1627,7 @@ def _build_diffusion_config_projection(
     engine: _DiffusionEngineOverrides,
     *,
     model: str | None,
-    quantization_config: _QuantizationConfigType,
+    quantization_config: _DiffusionQuantizationConfigType,
 ) -> _DiffusionConfigProjection:
     diffusion_kwargs = engine.to_kwargs()
     diffusion_kwargs["stage_id"] = topology.stage_id

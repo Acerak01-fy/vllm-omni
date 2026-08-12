@@ -5,10 +5,13 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from inspect import Parameter, signature
 from pathlib import Path
 
+import msgspec
 import pytest
 from pydantic import ValidationError
+from pydantic.fields import FieldInfo
 from transformers import Qwen3OmniMoeConfig
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
@@ -47,6 +50,7 @@ from vllm_omni.config.stage_config import (
     merge_pipeline_deploy,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
 from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -264,6 +268,19 @@ def test_from_pipeline_config_accepts_diffusion_only_cli_fields_for_diffusion_st
 
     assert isinstance(stage, VllmOmniDiffusionStageConfig)
     assert stage.diffusion_config.diffusion_kv_cache_dtype == "fp8"
+
+
+def test_from_pipeline_config_rejects_vllm_quantization_config_args_for_diffusion_stage():
+    quantization_config = QuantizationConfigArgs(ignore=["lm_head"])
+
+    with pytest.raises(
+        TypeError,
+        match=r"Stage 0 \(diffusion\) quantization_config cannot use vLLM QuantizationConfigArgs",
+    ):
+        _from_pipeline_key(
+            "dreamzero",
+            cli_overrides={"stage_0_quantization_config": quantization_config},
+        )
 
 
 def test_stage_cli_field_selection_defers_ownership_validation_until_sources_are_merged():
@@ -588,6 +605,200 @@ def test_sub_config_fields_match_structured_scopes():
         "hsdp_shard_size",
         "hsdp_replicate_size",
     }
+
+
+def test_inherited_sub_configs_preserve_legacy_positional_construction():
+    load_config = OmniStageLoadConfig("/tokenizer", "/download", True, "dummy", "slow", "hf", True)
+    assert load_config.tokenizer == "/tokenizer"
+    assert load_config.download_dir == "/download"
+    assert load_config.skip_tokenizer_init is True
+    assert load_config.load_format == "dummy"
+    assert load_config.tokenizer_mode == "slow"
+    assert load_config.config_format == "hf"
+    assert load_config.skip_mm_profiling is True
+
+    cache_config = OmniStageCacheConfig(1024, 0.8, True, True, 2.5)
+    assert cache_config.kv_cache_memory_bytes == 1024
+    assert cache_config.gpu_memory_utilization == 0.8
+    assert cache_config.enable_prefix_caching is True
+    assert cache_config.disable_hybrid_kv_cache_manager is True
+    assert cache_config.mm_processor_cache_gb == 2.5
+
+    scheduler_config = OmniStageSchedulerConfig(4, 8, 16, True, False)
+    assert scheduler_config.max_num_seqs == 4
+    assert scheduler_config.max_num_batched_tokens == 8
+    assert scheduler_config.max_model_len == 16
+    assert scheduler_config.enable_chunked_prefill is True
+    assert scheduler_config.async_scheduling is False
+
+    parallel_config = OmniStageParallelConfig(2, 3, 4, True)
+    assert parallel_config.pipeline_parallel_size == 2
+    assert parallel_config.data_parallel_size == 3
+    assert parallel_config.tensor_parallel_size == 4
+    assert parallel_config.enable_expert_parallel is True
+    assert parallel_config.world_size == 24
+
+    diffusion_parallel_config = OmniStageDiffusionParallelConfig(
+        2,
+        3,
+        4,
+        True,
+        5,
+        1,
+        1,
+        "advanced_uaa",
+        2,
+        3,
+        4,
+        "spatial_shard_height",
+        False,
+        True,
+        -1,
+        1,
+    )
+    assert diffusion_parallel_config.pipeline_parallel_size == 2
+    assert diffusion_parallel_config.data_parallel_size == 3
+    assert diffusion_parallel_config.tensor_parallel_size == 4
+    assert diffusion_parallel_config.ulysses_degree == 5
+    assert diffusion_parallel_config.cfg_parallel_size == 2
+    assert diffusion_parallel_config.mask_sp_padding is True
+    assert diffusion_parallel_config.world_size == 240
+
+
+@pytest.mark.parametrize(
+    ("config_cls", "legacy_fields"),
+    [
+        (
+            OmniStageLoadConfig,
+            [
+                "tokenizer",
+                "download_dir",
+                "skip_tokenizer_init",
+                "load_format",
+                "tokenizer_mode",
+                "config_format",
+                "skip_mm_profiling",
+            ],
+        ),
+        (
+            OmniStageCacheConfig,
+            [
+                "kv_cache_memory_bytes",
+                "gpu_memory_utilization",
+                "enable_prefix_caching",
+                "disable_hybrid_kv_cache_manager",
+                "mm_processor_cache_gb",
+            ],
+        ),
+        (
+            OmniStageSchedulerConfig,
+            [
+                "max_num_seqs",
+                "max_num_batched_tokens",
+                "max_model_len",
+                "enable_chunked_prefill",
+                "async_scheduling",
+            ],
+        ),
+        (
+            OmniStageParallelConfig,
+            [
+                "pipeline_parallel_size",
+                "data_parallel_size",
+                "tensor_parallel_size",
+                "enable_expert_parallel",
+            ],
+        ),
+        (
+            OmniStageDiffusionParallelConfig,
+            [
+                "pipeline_parallel_size",
+                "data_parallel_size",
+                "tensor_parallel_size",
+                "enable_expert_parallel",
+                "ulysses_degree",
+                "ring_degree",
+                "allgather_degree",
+                "ulysses_mode",
+                "cfg_parallel_size",
+                "vae_patch_parallel_size",
+                "text_encoder_tp_size",
+                "vae_parallel_mode",
+                "use_hsdp",
+                "mask_sp_padding",
+                "hsdp_shard_size",
+                "hsdp_replicate_size",
+            ],
+        ),
+    ],
+)
+def test_inherited_sub_config_signatures_keep_only_legacy_fields_positional(config_cls, legacy_fields):
+    parameters = list(signature(config_cls).parameters.values())
+    positional_fields = [
+        parameter.name for parameter in parameters if parameter.kind is Parameter.POSITIONAL_OR_KEYWORD
+    ]
+    inherited_keyword_only_fields = [parameter for parameter in parameters if parameter.name not in legacy_fields]
+
+    assert positional_fields == legacy_fields
+    assert all(parameter.kind is Parameter.KEYWORD_ONLY for parameter in inherited_keyword_only_fields)
+
+
+def test_legacy_positional_compatibility_rejects_ambiguous_calls():
+    with pytest.raises(TypeError, match="multiple values for argument 'tokenizer'"):
+        OmniStageLoadConfig("/tokenizer", tokenizer="/other")
+
+    with pytest.raises(TypeError, match="too many positional arguments"):
+        OmniStageCacheConfig(1024, 0.8, True, True, 2.5, "extra")
+
+
+def test_inherited_sub_configs_initialize_transport_safe_derived_fields():
+    scheduler_config = OmniStageSchedulerConfig(max_num_batched_tokens=4096)
+    assert scheduler_config.max_num_encoder_input_tokens == 4096
+    assert scheduler_config.encoder_cache_size == 4096
+
+    unresolved_scheduler_config = OmniStageSchedulerConfig()
+    assert unresolved_scheduler_config.max_num_encoder_input_tokens is None
+    assert unresolved_scheduler_config.encoder_cache_size is None
+
+    parallel_config = OmniStageParallelConfig(data_parallel_size=3, data_parallel_rank=2)
+    assert parallel_config.data_parallel_index == 2
+
+    diffusion_parallel_config = OmniStageDiffusionParallelConfig(data_parallel_size=3, data_parallel_rank=2)
+    assert diffusion_parallel_config.data_parallel_index == 2
+
+
+@pytest.mark.parametrize(
+    "config_cls",
+    [
+        OmniStageLoadConfig,
+        OmniStageCacheConfig,
+        OmniStageSchedulerConfig,
+        OmniStageParallelConfig,
+        OmniStageDiffusionParallelConfig,
+    ],
+)
+def test_inherited_sub_configs_remain_msgpack_transport_safe(config_cls):
+    config = config_cls()
+
+    uninitialized_fields = [
+        config_field.name
+        for config_field in fields(config)
+        if isinstance(getattr(config, config_field.name), FieldInfo)
+    ]
+    assert uninitialized_fields == []
+
+    msgspec.msgpack.encode(_serialize_stage_config(config))
+
+
+def test_structured_llm_stage_registration_payloads_remain_msgpack_transport_safe():
+    omni_config = _from_pipeline_key("qwen3_tts")
+
+    for stage_config in omni_config.stage_configs:
+        payload = {
+            "stage_id": stage_config.stage_id,
+            "stage_config": _serialize_stage_config(stage_config),
+        }
+        msgspec.msgpack.encode(payload)
 
 
 def test_diffusion_parallel_config_fields_cover_legacy_surface():
@@ -1110,3 +1321,34 @@ def test_diffusion_config_projection_keeps_mapping_quantization_config_serializa
     cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(quantization_config=quantization_config)
 
     assert cfg.quantization_config == quantization_config
+
+
+def test_diffusion_structured_configs_reject_vllm_quantization_config_args():
+    quantization_config = QuantizationConfigArgs(ignore=["lm_head"])
+
+    with pytest.raises(TypeError, match="cannot use vLLM QuantizationConfigArgs"):
+        omni_config_module._DiffusionConfigProjection(quantization_config=quantization_config)
+
+    with pytest.raises(TypeError, match="cannot use vLLM QuantizationConfigArgs"):
+        VllmOmniDiffusionStageConfig(
+            stage_pipeline_config=_resolve_pipeline_or_skip("dreamzero").stages[0],
+            quantization_config=quantization_config,
+        )
+
+
+def test_diffusion_quantization_mapping_reaches_terminal_config(monkeypatch):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    quantization_config = {"method": "int8", "activation_scheme": "dynamic"}
+    cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
+        quantization_config=quantization_config,
+    )
+
+    # Exercise the terminal construction performed by the future typed startup
+    # path without probing ports or loading remote model metadata.
+    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
+    monkeypatch.setattr(OmniDiffusionConfig, "enrich_config", lambda _self: None)
+    cfg.enrich_config()
+
+    assert cfg.quantization_config is not None
+    assert cfg.quantization_config.get_name() == "int8"
