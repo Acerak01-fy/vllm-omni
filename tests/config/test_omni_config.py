@@ -539,6 +539,7 @@ def test_sub_config_fields_match_structured_scopes():
         "trust_remote_code",
         "dtype",
         "attention_backend",
+        "attention_config",
         "moe_backend",
         "hf_overrides",
         "limit_mm_per_prompt",
