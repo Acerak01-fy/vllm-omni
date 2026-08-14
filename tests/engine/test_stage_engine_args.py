@@ -14,11 +14,15 @@ from vllm.config import LoadConfig as VllmLoadConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
-from vllm.config.quantization import QuantizationConfigArgs
 from vllm.engine.arg_utils import EngineArgs
 
 from vllm_omni.config.omni_config import (
     _LLM_STAGE_ENGINE_FIELDS,
+    OmniStageCacheConfig,
+    OmniStageLoadConfig,
+    OmniStageParallelConfig,
+    OmniStageSchedulerConfig,
+    VllmOmniARStageConfig,
     VllmOmniConfig,
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
@@ -237,12 +241,69 @@ def test_llm_stage_engine_field_schema_tracks_upstream_engine_args():
     assert _LLM_STAGE_ENGINE_FIELDS - upstream_engine_fields == _OMNI_ONLY_LLM_STAGE_ENGINE_FIELDS
 
 
+def test_typed_llm_projection_discovers_explicit_upstream_config_fields():
+    stage_config = VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),
+        load_config=OmniStageLoadConfig(ignore_patterns=["*.bin"]),
+        cache_config=OmniStageCacheConfig(block_size=32, cache_dtype="fp8"),
+        scheduler_config=OmniStageSchedulerConfig(
+            max_num_partial_prefills=2,
+            policy="priority",
+        ),
+        parallel_config=OmniStageParallelConfig(
+            data_parallel_master_ip="10.0.0.1",
+            enable_dbo=True,
+        ),
+    )
+
+    engine_args = stage_init_utils._project_omni_stage_engine_args(stage_config)
+
+    assert engine_args["ignore_patterns"] == ["*.bin"]
+    assert engine_args["block_size"] == 32
+    assert engine_args["kv_cache_dtype"] == "fp8"
+    assert engine_args["max_num_partial_prefills"] == 2
+    assert engine_args["scheduling_policy"] == "priority"
+    assert engine_args["data_parallel_address"] == "10.0.0.1"
+    assert engine_args["enable_dbo"] is True
+
+
+def test_typed_llm_projection_does_not_emit_inherited_upstream_defaults():
+    stage_config = VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),
+    )
+
+    engine_args = stage_init_utils._project_omni_stage_engine_args(stage_config)
+
+    inherited_defaults = {
+        "ignore_patterns",
+        "block_size",
+        "kv_cache_dtype",
+        "max_num_partial_prefills",
+        "scheduling_policy",
+        "data_parallel_address",
+        "data_parallel_rank",
+        "data_parallel_size_local",
+        "data_parallel_rpc_port",
+        "enable_dbo",
+    }
+    assert inherited_defaults.isdisjoint(engine_args)
+
+
+def test_typed_llm_projection_rejects_explicit_fields_owned_by_another_boundary():
+    stage_config = VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=0, model_stage="test"),
+        scheduler_config=OmniStageSchedulerConfig(scheduler_cls="test.CustomScheduler"),
+    )
+
+    with pytest.raises(ValueError, match=r"no EngineArgs projection: scheduler_cls"):
+        stage_init_utils._project_omni_stage_engine_args(stage_config)
+
+
 @pytest.mark.parametrize("stage_id", [0, 1], ids=["ar", "generation"])
 def test_typed_llm_engine_args_preserve_upstream_config_objects(tmp_path, stage_id):
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
     compilation_config = VllmCompilationConfig(backend="eager")
     profiler_config = VllmProfilerConfig(profiler="cuda")
-    quantization_config = QuantizationConfigArgs(ignore=["lm_head"])
     stage_prefix = f"stage_{stage_id}_"
     omni_config = VllmOmniConfig.from_pipeline_config(
         pipeline,
@@ -251,27 +312,21 @@ def test_typed_llm_engine_args_preserve_upstream_config_objects(tmp_path, stage_
             "model": model,
             f"{stage_prefix}compilation_config": compilation_config,
             f"{stage_prefix}profiler_config": profiler_config,
-            f"{stage_prefix}quantization_config": quantization_config,
         },
     )
 
     stage_config = omni_config.stage_by_id(stage_id)
     typed_args = build_engine_args_dict_from_omni_stage_config(stage_config, model)
 
-    assert isinstance(stage_config.model_config.compilation_config, VllmCompilationConfig)
+    assert isinstance(stage_config.compilation_config, VllmCompilationConfig)
     assert isinstance(typed_args["compilation_config"], VllmCompilationConfig)
-    assert typed_args["compilation_config"] is not stage_config.model_config.compilation_config
+    assert typed_args["compilation_config"] is not stage_config.compilation_config
     assert typed_args["compilation_config"].backend == "eager"
 
-    assert isinstance(stage_config.runtime_config.profiler_config, VllmProfilerConfig)
+    assert isinstance(stage_config.profiler_config, VllmProfilerConfig)
     assert isinstance(typed_args["profiler_config"], VllmProfilerConfig)
-    assert typed_args["profiler_config"] is not stage_config.runtime_config.profiler_config
+    assert typed_args["profiler_config"] is not stage_config.profiler_config
     assert typed_args["profiler_config"].profiler == "cuda"
-
-    assert isinstance(stage_config.quantization_config, QuantizationConfigArgs)
-    assert isinstance(typed_args["quantization_config"], QuantizationConfigArgs)
-    assert typed_args["quantization_config"] is not stage_config.quantization_config
-    assert typed_args["quantization_config"].ignore == ["lm_head"]
 
 
 def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):

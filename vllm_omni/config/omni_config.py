@@ -11,22 +11,22 @@ later PRs cut consumers over to these classes.
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import InitVar, dataclass, field, fields
-from functools import wraps
-from inspect import Parameter, signature
+from inspect import signature
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, model_validator
+from typing_extensions import Self
 from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
 from vllm.config import LoadConfig as VllmLoadConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
-from vllm.config.quantization import QuantizationConfigArgs
 from vllm.config.utils import config
+from vllm.engine.arg_utils import EngineArgs as VllmEngineArgs
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.config.stage_config import (
@@ -79,79 +79,35 @@ _LEGACY_STAGE_METADATA_EXTRA_FIELDS = frozenset(
     }
 )
 
-# Keep Mapping first so Pydantic preserves existing YAML dictionaries instead
-# of eagerly materializing terminal configs in the head process.
-_CompilationConfigType: TypeAlias = Mapping[str, Any] | VllmCompilationConfig | None
-_ProfilerConfigType: TypeAlias = Mapping[str, Any] | VllmProfilerConfig | None
-_LLMQuantizationConfigType: TypeAlias = Mapping[str, Any] | QuantizationConfigArgs | QuantizationConfig | str | None
-_DiffusionQuantizationConfigType: TypeAlias = Mapping[str, Any] | QuantizationConfig | str | None
-
-
-def _validate_diffusion_quantization_config(
-    value: object,
-    *,
-    context: str,
-) -> _DiffusionQuantizationConfigType:
-    if isinstance(value, QuantizationConfigArgs):
-        raise TypeError(
-            f"{context} cannot use vLLM QuantizationConfigArgs; that schema is only "
-            "supported by AR/generation stages. Use a diffusion quantization "
-            "string, mapping, QuantizationConfig, or None."
-        )
-    if value is None or isinstance(value, (str, Mapping, QuantizationConfig)):
-        return cast(_DiffusionQuantizationConfigType, value)
-    raise TypeError(
-        f"{context} quantization config must be a string, mapping, QuantizationConfig, or None, got {type(value)!r}"
-    )
-
-
-def _preserve_legacy_positional_args(*field_names: str) -> Callable[[type[Any]], type[Any]]:
-    """Keep the pre-inheritance positional API; require new fields by keyword."""
-
-    def decorator(cls: type[Any]) -> type[Any]:
-        generated_init = cls.__init__
-        generated_signature = signature(cls)
-        parameters = generated_signature.parameters
-
-        missing_fields = set(field_names) - parameters.keys()
-        if missing_fields:
-            raise TypeError(
-                f"{cls.__name__} positional fields are missing from its signature: {sorted(missing_fields)}"
-            )
-
-        compatible_signature = generated_signature.replace(
-            parameters=[
-                *(parameters[name].replace(kind=Parameter.POSITIONAL_OR_KEYWORD) for name in field_names),
-                *(
-                    parameter.replace(kind=Parameter.KEYWORD_ONLY)
-                    for name, parameter in parameters.items()
-                    if name not in field_names
-                ),
-            ]
-        )
-
-        @wraps(generated_init)
-        def compatible_init(self: Any, *args: Any, **kwargs: Any) -> None:
-            known_kwargs = {name: value for name, value in kwargs.items() if name in parameters}
-            extra_kwargs = {name: value for name, value in kwargs.items() if name not in parameters}
-            try:
-                bound = compatible_signature.bind_partial(*args, **known_kwargs)
-            except TypeError as exc:
-                raise TypeError(f"{cls.__name__}() {exc}") from None
-            # Let Pydantic retain ownership of missing/extra-field validation.
-            generated_init(self, **bound.arguments, **extra_kwargs)
-
-        cls.__init__ = compatible_init
-        cls.__signature__ = compatible_signature
-        cls.__match_args__ = field_names
-        return cls
-
-    return decorator
+_QuantizationConfigType: TypeAlias = QuantizationConfig | str | Mapping[str, Any] | None
 
 
 class _QuantizationEngineOverrides(TypedDict, total=False):
-    quantization_config: _LLMQuantizationConfigType
+    quantization_config: _QuantizationConfigType
     quantization: str
+
+
+class _TrackExplicitConfigFields:
+    """Record constructor inputs without adding a serialized config field."""
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _record_explicit_config_fields(cls, value: Any, handler: Any) -> Any:
+        result = handler(value)
+        kwargs = getattr(value, "kwargs", None)
+        args = getattr(value, "args", None)
+        if kwargs is not None or args is not None:
+            explicit_fields = set(kwargs or {})
+            if args:
+                positional_fields = tuple(signature(cls).parameters)
+                explicit_fields.update(positional_fields[: len(args)])
+            explicit_fields = frozenset(explicit_fields)
+        elif isinstance(value, cls):
+            explicit_fields = getattr(value, "_omni_explicit_fields", frozenset())
+        else:
+            explicit_fields = frozenset()
+        object.__setattr__(result, "_omni_explicit_fields", explicit_fields)
+        return result
 
 
 class _ModelEngineOverrides(TypedDict, total=False):
@@ -182,7 +138,6 @@ class _ModelEngineOverrides(TypedDict, total=False):
     enforce_eager: bool
     max_cudagraph_capture_size: int
     enable_flashinfer_autotune: bool
-    compilation_config: _CompilationConfigType
     enable_multithread_weight_load: bool
     num_weight_load_threads: int
     disable_autocast: bool
@@ -224,7 +179,6 @@ class _RuntimeEngineOverrides(TypedDict, total=False):
     num_gpus: int
     log_level: str
     log_stats: bool
-    profiler_config: _ProfilerConfigType
 
 
 class _ParallelConfigEngineOverrides(TypedDict, total=False):
@@ -268,6 +222,8 @@ class _StageEngineValues:
     runtime: _RuntimeEngineOverrides
     parallel: _ParallelEngineOverrides
     diffusion: _DiffusionEngineOverrides
+    compilation_config: Mapping[str, Any] | VllmCompilationConfig | None
+    profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
 
 
 @dataclass(frozen=True)
@@ -416,7 +372,6 @@ class OmniStageModelConfig:
     enforce_eager: bool = False
     max_cudagraph_capture_size: int | None = Field(default=None, ge=0)
     enable_flashinfer_autotune: bool | None = None
-    compilation_config: _CompilationConfigType = None
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = Field(default=4, ge=1)
     disable_autocast: bool = False
@@ -427,17 +382,8 @@ class OmniStageModelConfig:
     tokenizer_subdir: str | None = None
 
 
-@_preserve_legacy_positional_args(
-    "tokenizer",
-    "download_dir",
-    "skip_tokenizer_init",
-    "load_format",
-    "tokenizer_mode",
-    "config_format",
-    "skip_mm_profiling",
-)
 @config
-class OmniStageLoadConfig(VllmLoadConfig):
+class OmniStageLoadConfig(_TrackExplicitConfigFields, VllmLoadConfig):
     """vLLM loading behavior plus Omni stage-specific tokenizer inputs."""
 
     tokenizer: str | None = None
@@ -447,15 +393,8 @@ class OmniStageLoadConfig(VllmLoadConfig):
     skip_mm_profiling: bool | None = None
 
 
-@_preserve_legacy_positional_args(
-    "kv_cache_memory_bytes",
-    "gpu_memory_utilization",
-    "enable_prefix_caching",
-    "disable_hybrid_kv_cache_manager",
-    "mm_processor_cache_gb",
-)
 @config
-class OmniStageCacheConfig(VllmCacheConfig):
+class OmniStageCacheConfig(_TrackExplicitConfigFields, VllmCacheConfig):
     """Per-stage engine cache and memory behavior.
 
     This is separate from ``_DiffusionConfigProjection.cache_config``, which configures
@@ -472,15 +411,8 @@ class OmniStageCacheConfig(VllmCacheConfig):
     mamba_ssm_cache_dtype: str | None = None
 
 
-@_preserve_legacy_positional_args(
-    "max_num_seqs",
-    "max_num_batched_tokens",
-    "max_model_len",
-    "enable_chunked_prefill",
-    "async_scheduling",
-)
 @config
-class OmniStageSchedulerConfig(VllmSchedulerConfig):
+class OmniStageSchedulerConfig(_TrackExplicitConfigFields, VllmSchedulerConfig):
     """Per-stage request scheduling behavior."""
 
     # Upstream receives max_model_len only while materializing SchedulerConfig.
@@ -536,18 +468,57 @@ class OmniStageRuntimeConfig:
     num_gpus: int = Field(default=1, ge=1)
     log_level: str = "info"
     log_stats: bool = False
-    profiler_config: _ProfilerConfigType = None
 
 
-@_preserve_legacy_positional_args(
-    "pipeline_parallel_size",
-    "data_parallel_size",
-    "tensor_parallel_size",
-    "enable_expert_parallel",
-)
 @config
-class OmniStageParallelConfig(VllmParallelConfig):
+class OmniStageParallelConfig(_TrackExplicitConfigFields, VllmParallelConfig):
     """Common per-stage distributed parallelism behavior."""
+
+    # EngineArgs intentionally leaves these unresolved. The upstream terminal
+    # ParallelConfig defaults (rank 0, local size 1, port 29550, worker
+    # ``"auto"``) must not turn into explicit engine inputs in the head
+    # process merely because this transport class inherits ParallelConfig.
+    data_parallel_size_local: int | None = Field(default=None, ge=0)
+    data_parallel_rank: int | None = Field(default=None, ge=0)
+    data_parallel_rpc_port: int | None = None
+    worker_cls: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_parallel_config(self) -> Self:
+        """Run upstream validation without resolving deferred engine inputs."""
+        deferred_values = (
+            self.data_parallel_size_local,
+            self.data_parallel_rank,
+            self.data_parallel_rpc_port,
+            self.worker_cls,
+            self.all2all_backend,
+            self.disable_custom_all_reduce,
+        )
+        if self.data_parallel_size_local is not None and self.data_parallel_size_local > self.data_parallel_size:
+            raise ValueError(
+                f"data_parallel_size_local ({self.data_parallel_size_local}) "
+                f"must be <= data_parallel_size ({self.data_parallel_size})"
+            )
+        if self.data_parallel_rank is not None and not 0 <= self.data_parallel_rank < self.data_parallel_size:
+            raise ValueError(
+                f"data_parallel_rank ({self.data_parallel_rank}) must be in the range [0, {self.data_parallel_size})"
+            )
+        self.data_parallel_size_local = self.data_parallel_size
+        self.data_parallel_rank = 0
+        self.data_parallel_rpc_port = VllmParallelConfig.data_parallel_rpc_port
+        self.worker_cls = VllmParallelConfig.worker_cls
+        try:
+            VllmParallelConfig._validate_parallel_config(self)
+        finally:
+            (
+                self.data_parallel_size_local,
+                self.data_parallel_rank,
+                self.data_parallel_rpc_port,
+                self.worker_cls,
+                self.all2all_backend,
+                self.disable_custom_all_reduce,
+            ) = deferred_values
+        return self
 
     def __post_init__(self) -> None:
         # Keep config construction transport-safe. Upstream runtime backend,
@@ -561,24 +532,6 @@ class OmniStageParallelConfig(VllmParallelConfig):
         return self.world_size
 
 
-@_preserve_legacy_positional_args(
-    "pipeline_parallel_size",
-    "data_parallel_size",
-    "tensor_parallel_size",
-    "enable_expert_parallel",
-    "ulysses_degree",
-    "ring_degree",
-    "allgather_degree",
-    "ulysses_mode",
-    "cfg_parallel_size",
-    "vae_patch_parallel_size",
-    "text_encoder_tp_size",
-    "vae_parallel_mode",
-    "use_hsdp",
-    "mask_sp_padding",
-    "hsdp_shard_size",
-    "hsdp_replicate_size",
-)
 @config
 class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     """Diffusion-stage distributed parallelism behavior."""
@@ -745,13 +698,8 @@ class _DiffusionConfigProjection:
     additional_config: dict[str, Any] = field(default_factory=dict)
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
-    quantization_config: _DiffusionQuantizationConfigType = None
+    quantization_config: _QuantizationConfigType = None
     extras: dict[str, Any] = field(default_factory=dict)
-
-    @field_validator("quantization_config", mode="before")
-    @classmethod
-    def _validate_quantization_config(cls, value: object) -> _DiffusionQuantizationConfigType:
-        return _validate_diffusion_quantization_config(value, context=cls.__name__)
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
@@ -975,6 +923,58 @@ _DIFFUSION_STAGE_ENGINE_FIELDS = (_DIFFUSION_CONFIG_FIELDS | _DIFFUSION_BACKCOMP
     "stage_id",
 }
 
+
+def _upstream_engine_field_map(
+    config_cls: type[Any],
+    *,
+    aliases: Mapping[str, str] = {},
+    exclude: frozenset[str] = frozenset(),
+) -> dict[str, str]:
+    """Map reusable upstream config fields to their EngineArgs inputs."""
+    engine_fields = frozenset(config_field.name for config_field in fields(VllmEngineArgs))
+    return {
+        config_field.name: engine_name
+        for config_field in fields(config_cls)
+        if config_field.init
+        and config_field.name not in exclude
+        and (engine_name := aliases.get(config_field.name, config_field.name)) in engine_fields
+    }
+
+
+_LOAD_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(VllmLoadConfig)
+_CACHE_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
+    VllmCacheConfig,
+    aliases={"cache_dtype": "kv_cache_dtype"},
+)
+_SCHEDULER_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
+    VllmSchedulerConfig,
+    aliases={"policy": "scheduling_policy"},
+    # ``scheduler_cls`` is selected by the immutable stage topology, while
+    # ``disable_hybrid_kv_cache_manager`` belongs to the cache concern in the
+    # Omni schema.  Keep both out of the dynamic SchedulerConfig projection so
+    # one input cannot acquire two owners.
+    exclude=frozenset(
+        {
+            "scheduler_cls",
+            "disable_hybrid_kv_cache_manager",
+        }
+    ),
+)
+_PARALLEL_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
+    VllmParallelConfig,
+    aliases={"data_parallel_master_ip": "data_parallel_address"},
+    # Runtime owns worker selection. The private API-process fields are
+    # terminal vLLM internals rather than per-stage user inputs.
+    exclude=frozenset(
+        {
+            "distributed_executor_backend",
+            "worker_cls",
+            "_api_process_count",
+            "_api_process_rank",
+        }
+    ),
+)
+
 _QUANTIZATION_ENGINE_FIELDS = frozenset(_QuantizationEngineOverrides.__annotations__)
 _MODEL_ENGINE_FIELDS = frozenset(_ModelEngineOverrides.__annotations__)
 _LOAD_ENGINE_FIELDS = frozenset(_LoadEngineOverrides.__annotations__)
@@ -982,7 +982,17 @@ _CACHE_ENGINE_FIELDS = frozenset(_CacheEngineOverrides.__annotations__)
 _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
 _CONNECTOR_ENGINE_FIELDS = frozenset(_ConnectorEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
-_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_ParallelConfigEngineOverrides.__annotations__)
+_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset({"compilation_config", "profiler_config"})
+_LLM_LOAD_ENGINE_FIELDS = _LOAD_ENGINE_FIELDS | frozenset(_LOAD_CONFIG_ENGINE_FIELD_MAP.values())
+_LLM_CACHE_ENGINE_FIELDS = _CACHE_ENGINE_FIELDS | frozenset(_CACHE_CONFIG_ENGINE_FIELD_MAP.values())
+_LLM_SCHEDULER_ENGINE_FIELDS = _SCHEDULER_ENGINE_FIELDS | frozenset(_SCHEDULER_CONFIG_ENGINE_FIELD_MAP.values())
+_LLM_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(_PARALLEL_CONFIG_ENGINE_FIELD_MAP.values())
+_DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(
+    f.name for f in fields(OmniStageDiffusionParallelConfig)
+) & frozenset(_ParallelConfigEngineOverrides.__annotations__)
+_DIFFUSION_PARALLEL_CONFIG_FIELD_MAP = {name: name for name in _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS}
+_LLM_PARALLEL_CONFIG_FIELDS = frozenset(_PARALLEL_CONFIG_ENGINE_FIELD_MAP)
+_PARALLEL_CONFIG_ENGINE_FIELDS = _LLM_PARALLEL_CONFIG_ENGINE_FIELDS | _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS
 _PARALLEL_ENGINE_FIELDS = _PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
 _COMMON_STAGE_ENGINE_FIELDS = (
     _QUANTIZATION_ENGINE_FIELDS
@@ -992,19 +1002,16 @@ _COMMON_STAGE_ENGINE_FIELDS = (
     | _SCHEDULER_ENGINE_FIELDS
     | _CONNECTOR_ENGINE_FIELDS
     | _RUNTIME_ENGINE_FIELDS
+    | _DIRECT_VLLM_CONFIG_ENGINE_FIELDS
 )
-_LLM_PARALLEL_CONFIG_ENGINE_FIELDS = frozenset(
-    {
-        "pipeline_parallel_size",
-        "data_parallel_size",
-        "tensor_parallel_size",
-        "enable_expert_parallel",
-    }
+_LLM_STAGE_ENGINE_FIELDS = (
+    _COMMON_STAGE_ENGINE_FIELDS
+    | _LLM_LOAD_ENGINE_FIELDS
+    | _LLM_CACHE_ENGINE_FIELDS
+    | _LLM_SCHEDULER_ENGINE_FIELDS
+    | _LLM_PARALLEL_CONFIG_ENGINE_FIELDS
+    | {"parallel_config"}
 )
-_DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS = (
-    frozenset(f.name for f in fields(OmniStageDiffusionParallelConfig)) & _PARALLEL_CONFIG_ENGINE_FIELDS
-)
-_LLM_STAGE_ENGINE_FIELDS = _COMMON_STAGE_ENGINE_FIELDS | _LLM_PARALLEL_CONFIG_ENGINE_FIELDS | {"parallel_config"}
 _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS = (
     _COMMON_STAGE_ENGINE_FIELDS
     | _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS
@@ -1025,6 +1032,27 @@ _PARALLEL_CONFIG_ENGINE_FIELDS_BY_EXECUTION_TYPE = {
     StageExecutionType.LLM_GENERATION: _LLM_PARALLEL_CONFIG_ENGINE_FIELDS,
     StageExecutionType.DIFFUSION: _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS,
 }
+_PARALLEL_CONFIG_FIELDS_BY_EXECUTION_TYPE = {
+    StageExecutionType.LLM_AR: _LLM_PARALLEL_CONFIG_FIELDS,
+    StageExecutionType.LLM_GENERATION: _LLM_PARALLEL_CONFIG_FIELDS,
+    StageExecutionType.DIFFUSION: frozenset(_DIFFUSION_PARALLEL_CONFIG_FIELD_MAP),
+}
+
+_LOAD_STAGE_ENGINE_FIELD_MAP = {
+    **{name: name for name in _LOAD_ENGINE_FIELDS},
+    **_LOAD_CONFIG_ENGINE_FIELD_MAP,
+}
+_CACHE_STAGE_ENGINE_FIELD_MAP = {
+    **{name: name for name in _CACHE_ENGINE_FIELDS},
+    **_CACHE_CONFIG_ENGINE_FIELD_MAP,
+}
+_SCHEDULER_STAGE_ENGINE_FIELD_MAP = {
+    **{name: name for name in _SCHEDULER_ENGINE_FIELDS},
+    **_SCHEDULER_CONFIG_ENGINE_FIELD_MAP,
+}
+_DIFFUSION_LOAD_STAGE_ENGINE_FIELD_MAP = {name: name for name in _LOAD_ENGINE_FIELDS}
+_DIFFUSION_CACHE_STAGE_ENGINE_FIELD_MAP = {name: name for name in _CACHE_ENGINE_FIELDS}
+_DIFFUSION_SCHEDULER_STAGE_ENGINE_FIELD_MAP = {name: name for name in _SCHEDULER_ENGINE_FIELDS}
 
 
 def _validate_stage_engine_override_ownership(
@@ -1035,22 +1063,19 @@ def _validate_stage_engine_override_ownership(
     try:
         owner_fields = _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
         parallel_owner_fields = _PARALLEL_CONFIG_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
+        parallel_config_fields = _PARALLEL_CONFIG_FIELDS_BY_EXECUTION_TYPE[execution_type]
     except KeyError as exc:
         raise ValueError(f"Unsupported stage execution type: {execution_type!r}") from exc
-
-    if execution_type is StageExecutionType.DIFFUSION:
-        for field_name in ("quantization_config", "quantization"):
-            value = overrides.get(field_name)
-            if isinstance(value, QuantizationConfigArgs):
-                _validate_diffusion_quantization_config(
-                    value,
-                    context=f"Stage {stage_id} ({execution_type.value}) {field_name}",
-                )
 
     unowned_fields = set(overrides) - owner_fields
     parallel_config = overrides.get("parallel_config")
     if isinstance(parallel_config, Mapping):
-        unowned_fields.update(f"parallel_config.{name}" for name in set(parallel_config) - parallel_owner_fields)
+        # Nested values traditionally use upstream config names, while flat
+        # EngineArgs uses aliases such as ``data_parallel_address``.  Accept
+        # either spelling at the boundary; the builder canonicalizes aliases
+        # before instantiating the inherited config.
+        accepted_parallel_names = parallel_config_fields | parallel_owner_fields
+        unowned_fields.update(f"parallel_config.{name}" for name in set(parallel_config) - accepted_parallel_names)
     if unowned_fields:
         names = ", ".join(sorted(unowned_fields))
         raise ValueError(
@@ -1121,17 +1146,28 @@ def _stage_engine_values(
         topology.execution_type,
         engine,
     )
+    if topology.execution_type in {
+        StageExecutionType.LLM_AR,
+        StageExecutionType.LLM_GENERATION,
+    }:
+        load_engine_fields = _LLM_LOAD_ENGINE_FIELDS
+        cache_engine_fields = _LLM_CACHE_ENGINE_FIELDS
+        scheduler_engine_fields = _LLM_SCHEDULER_ENGINE_FIELDS
+    else:
+        load_engine_fields = _LOAD_ENGINE_FIELDS
+        cache_engine_fields = _CACHE_ENGINE_FIELDS
+        scheduler_engine_fields = _SCHEDULER_ENGINE_FIELDS
     return _StageEngineValues(
         quantization=cast(
             _QuantizationEngineOverrides,
             _select_engine_overrides(engine, _QUANTIZATION_ENGINE_FIELDS),
         ),
         model=cast(_ModelEngineOverrides, _select_engine_overrides(engine, _MODEL_ENGINE_FIELDS)),
-        load=cast(_LoadEngineOverrides, _select_engine_overrides(engine, _LOAD_ENGINE_FIELDS)),
-        cache=cast(_CacheEngineOverrides, _select_engine_overrides(engine, _CACHE_ENGINE_FIELDS)),
+        load=cast(_LoadEngineOverrides, _select_engine_overrides(engine, load_engine_fields)),
+        cache=cast(_CacheEngineOverrides, _select_engine_overrides(engine, cache_engine_fields)),
         scheduler=cast(
             _SchedulerEngineOverrides,
-            _select_engine_overrides(engine, _SCHEDULER_ENGINE_FIELDS),
+            _select_engine_overrides(engine, scheduler_engine_fields),
         ),
         connector=cast(
             _ConnectorEngineOverrides,
@@ -1140,6 +1176,8 @@ def _stage_engine_values(
         runtime=cast(_RuntimeEngineOverrides, _select_engine_overrides(engine, _RUNTIME_ENGINE_FIELDS)),
         parallel=cast(_ParallelEngineOverrides, _select_engine_overrides(engine, _PARALLEL_ENGINE_FIELDS)),
         diffusion=_DiffusionEngineOverrides.from_engine(engine),
+        compilation_config=_copy_value(engine.get("compilation_config")),
+        profiler_config=_copy_value(engine.get("profiler_config")),
     )
 
 
@@ -1194,7 +1232,9 @@ class BaseVllmOmniStageConfig:
     connector_config: OmniStageConnectorConfig = field(default_factory=OmniStageConnectorConfig)
     runtime_config: OmniStageRuntimeConfig = field(default_factory=OmniStageRuntimeConfig)
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
-    quantization_config: _LLMQuantizationConfigType = None
+    compilation_config: VllmCompilationConfig | None = None
+    profiler_config: VllmProfilerConfig | None = None
+    quantization_config: _QuantizationConfigType = None
 
     @property
     def stage_id(self) -> int:
@@ -1290,13 +1330,7 @@ class VllmOmniDiffusionStageConfig(BaseVllmOmniStageConfig):
     """Structured config for diffusion stages."""
 
     parallel_config: OmniStageDiffusionParallelConfig = field(default_factory=OmniStageDiffusionParallelConfig)
-    quantization_config: _DiffusionQuantizationConfigType = None
     diffusion_config: _DiffusionConfigProjection = field(default_factory=_DiffusionConfigProjection)
-
-    @field_validator("quantization_config", mode="before")
-    @classmethod
-    def _validate_quantization_config(cls, value: object) -> _DiffusionQuantizationConfigType:
-        return _validate_diffusion_quantization_config(value, context=cls.__name__)
 
 
 StageConfigType: TypeAlias = VllmOmniARStageConfig | VllmOmniGenerationStageConfig | VllmOmniDiffusionStageConfig
@@ -1351,6 +1385,8 @@ def _build_common_stage_config_kwargs(
                 parallel_config,
             ),
             "parallel_config": parallel_config,
+            "compilation_config": _copy_value(engine.compilation_config),
+            "profiler_config": _copy_value(engine.profiler_config),
             "quantization_config": _copy_value(quantization_config),
         },
         input_proc,
@@ -1491,7 +1527,7 @@ def _build_stage_config(
 def _build_quantization_config(
     deploy: DeployConfig,
     engine: _QuantizationEngineOverrides,
-) -> _LLMQuantizationConfigType:
+) -> _QuantizationConfigType:
     return _first_defined(
         engine.get("quantization_config"),
         engine.get("quantization"),
@@ -1545,12 +1581,51 @@ def _build_load_config(
     return OmniStageLoadConfig(**kwargs)
 
 
+def _config_kwargs_from_engine_args(
+    engine: Mapping[str, Any],
+    field_map: Mapping[str, str],
+) -> dict[str, Any]:
+    """Convert EngineArgs names back to their upstream config field names."""
+    return {
+        config_name: _copy_value(engine[engine_name])
+        for config_name, engine_name in field_map.items()
+        if engine_name in engine and engine[engine_name] is not None
+    }
+
+
+def _normalize_config_mapping(
+    values: Mapping[str, Any],
+    field_map: Mapping[str, str],
+) -> dict[str, Any]:
+    """Canonicalize config and EngineArgs spellings to config field names."""
+    engine_to_config = {engine_name: config_name for config_name, engine_name in field_map.items()}
+    normalized: dict[str, Any] = {}
+    source_names: dict[str, str] = {}
+    for name, value in values.items():
+        if value is None:
+            continue
+        config_name = name if name in field_map else engine_to_config.get(name, name)
+        if config_name in normalized:
+            raise ValueError(
+                f"Config mapping specifies both {source_names[config_name]!r} and {name!r} "
+                f"for upstream field {config_name!r}"
+            )
+        normalized[config_name] = _copy_value(value)
+        source_names[config_name] = name
+    return normalized
+
+
+def _omni_config_kwargs(engine: Mapping[str, Any], fields_: frozenset[str]) -> dict[str, Any]:
+    return {name: _copy_value(engine[name]) for name in fields_ if name in engine and engine[name] is not None}
+
+
 def _build_cache_config(
     deploy: DeployConfig,
     engine: _CacheEngineOverrides,
     execution_type: StageExecutionType,
 ) -> OmniStageCacheConfig:
-    kwargs = _config_kwargs(engine)
+    kwargs = _config_kwargs_from_engine_args(engine, _CACHE_CONFIG_ENGINE_FIELD_MAP)
+    kwargs.update(_omni_config_kwargs(engine, _CACHE_ENGINE_FIELDS))
     if "enable_prefix_caching" not in kwargs and deploy.enable_prefix_caching is not None:
         kwargs["enable_prefix_caching"] = _copy_value(deploy.enable_prefix_caching)
     if "disable_hybrid_kv_cache_manager" not in kwargs and execution_type == StageExecutionType.LLM_GENERATION:
@@ -1564,7 +1639,8 @@ def _build_scheduler_config(
     engine: _SchedulerEngineOverrides,
     execution_type: StageExecutionType,
 ) -> OmniStageSchedulerConfig:
-    kwargs = _config_kwargs(engine)
+    kwargs = _config_kwargs_from_engine_args(engine, _SCHEDULER_CONFIG_ENGINE_FIELD_MAP)
+    kwargs.update(_omni_config_kwargs(engine, _SCHEDULER_ENGINE_FIELDS))
     if "enable_chunked_prefill" not in kwargs and deploy.enable_chunked_prefill is not None:
         kwargs["enable_chunked_prefill"] = _copy_value(deploy.enable_chunked_prefill)
     if "async_scheduling" not in kwargs and execution_type == StageExecutionType.LLM_AR:
@@ -1612,16 +1688,21 @@ def _build_parallel_config(
     config_cls: type[OmniStageParallelConfig] = OmniStageParallelConfig,
 ) -> OmniStageParallelConfig:
     parallel_config = _mapping_or_empty(engine.get("parallel_config"))
-    config_fields = {
-        config_field.name
-        for config_field in fields(config_cls)
-        if getattr(config_field.default, "init", None) is not False
-    }
-    kwargs = {
-        name: _copy_value(value) for name in _PARALLEL_CONFIG_ENGINE_FIELDS if (value := engine.get(name)) is not None
-    }
+    config_fields = frozenset(signature(config_cls).parameters)
+    is_diffusion = issubclass(config_cls, OmniStageDiffusionParallelConfig)
+    field_map = _DIFFUSION_PARALLEL_CONFIG_FIELD_MAP if is_diffusion else _PARALLEL_CONFIG_ENGINE_FIELD_MAP
+    owned_parallel_fields = frozenset(field_map)
+    kwargs = _config_kwargs(engine) if is_diffusion else _config_kwargs_from_engine_args(engine, field_map)
+    kwargs = {name: value for name, value in kwargs.items() if name in owned_parallel_fields}
     kwargs = {name: value for name, value in kwargs.items() if name in config_fields}
-    kwargs.update({name: value for name, value in _config_kwargs(parallel_config).items() if name in config_fields})
+    nested_kwargs = _normalize_config_mapping(parallel_config, field_map)
+    kwargs.update(
+        {
+            name: value
+            for name, value in nested_kwargs.items()
+            if name in owned_parallel_fields and name in config_fields
+        }
+    )
     if "pipeline_parallel_size" not in kwargs and deploy.pipeline_parallel_size is not None:
         kwargs["pipeline_parallel_size"] = _copy_value(deploy.pipeline_parallel_size)
     if "data_parallel_size" not in kwargs and deploy.data_parallel_size is not None:
@@ -1636,7 +1717,7 @@ def _build_diffusion_config_projection(
     engine: _DiffusionEngineOverrides,
     *,
     model: str | None,
-    quantization_config: _DiffusionQuantizationConfigType,
+    quantization_config: _QuantizationConfigType,
 ) -> _DiffusionConfigProjection:
     diffusion_kwargs = engine.to_kwargs()
     diffusion_kwargs["stage_id"] = topology.stage_id

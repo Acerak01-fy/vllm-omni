@@ -49,30 +49,44 @@ schema source for AR and generation stages:
 - `OmniStageSchedulerConfig` inherits `vllm.config.SchedulerConfig`.
 - `OmniStageParallelConfig` inherits `vllm.config.ParallelConfig`.
 
-This inheritance preserves the existing `VllmOmniConfig` paths while reducing
-duplicate downstream declarations. It does not, by itself, make every
-inherited field an effective vLLM-Omni runtime option. Construction and
-runtime consumption are separate surfaces:
+This inheritance preserves the existing load, cache, scheduler, and parallel
+concern boundaries while reducing duplicate downstream declarations. It does
+not, by itself, make every inherited field an effective vLLM-Omni runtime
+option. Construction and runtime consumption are separate surfaces:
 
 | Surface | Current behavior |
 | --- | --- |
 | Structured schema | Upstream dataclass fields are inherited. Their defaults, default factories, and applicable Pydantic validation can participate when the structured object is constructed. |
 | Omni input ownership | Pipeline/deploy/CLI construction continues to accept only fields with an existing structured owner. Direct construction of an inherited sub-config can expose a wider upstream schema. |
-| Engine projection | The explicit load, cache, scheduler, and parallel engine-field sets define which values are emitted to flat `EngineArgs`. An inherited field is not guaranteed to affect execution unless it is part of that projection. |
+| Engine projection | For AR and generation stages, reusable fields are discovered by intersecting each upstream config dataclass with upstream `EngineArgs`. Only constructor-explicit values are emitted; inherited defaults remain deferred to terminal materialization. |
 | Terminal materialization | The engine-owning process constructs the final upstream `VllmConfig` and performs model-, platform-, rank-, port-, and backend-dependent initialization. |
 
-The distinction is intentional for this reuse step: upstream schema can be
-shared without silently expanding current backend behavior. Adopting an
-additional upstream field requires an explicit ownership and projection
-decision, plus an effective-engine-argument parity test. Code must not infer
-runtime support solely from `dataclasses.fields()` or an inherited constructor
-parameter.
+The generated projection maps include known upstream naming differences such
+as `cache_dtype` to `kv_cache_dtype`, `policy` to `scheduling_policy`, and
+`data_parallel_master_ip` to `data_parallel_address`. A field added to both an
+upstream concern config and `EngineArgs` therefore enters the AR/generation
+projection without requiring a second downstream allowlist. Explicit inherited
+fields that have no projection raise an error rather than being silently
+dropped.
 
-Existing nested paths for `CompilationConfig`, `ProfilerConfig`, and
-`QuantizationConfigArgs` also accept complete upstream value objects. This is
-object pass-through reuse: the outer Omni field remains defined, mappings
-remain supported, and prebuilt upstream objects retain their type across the
-structured projection boundary.
+Ownership exclusions remain deliberate. Stage topology owns `scheduler_cls`,
+cache owns `disable_hybrid_kv_cache_manager`, and Omni runtime owns
+`distributed_executor_backend` and `worker_cls`; vLLM's private API-process
+fields are terminal internals. These exclusions prevent one input from being
+constructed or projected through two config concerns. Effective-engine-argument
+tests cover both the dynamic mapping and this exclusion boundary.
+
+`CompilationConfig` and `ProfilerConfig` are direct structured-stage fields:
+`stage.compilation_config` and `stage.profiler_config`. They accept mapping/YAML
+inputs and complete upstream value objects. Mapping inputs are validated and
+materialized as their concrete upstream types when the structured config is
+constructed, so downstream consumers see one resolved representation.
+Prebuilt upstream objects retain their type across the structured projection
+boundary.
+
+Quantization remains on its existing Omni-owned transport contract. This
+reuse step does not adopt upstream `QuantizationConfigArgs`, because the
+current engine-specific quantization split needs to be resolved separately.
 
 Diffusion keeps its existing engine-field ownership and projection surface.
 Shared Python inheritance must not be treated as evidence that an LLM-only

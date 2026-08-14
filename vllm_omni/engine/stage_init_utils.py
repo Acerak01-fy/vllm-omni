@@ -14,7 +14,7 @@ import importlib
 import multiprocessing as mp
 import os
 import time
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from typing import Any, Literal, cast
@@ -29,11 +29,14 @@ from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
 from vllm_omni.config.omni_config import (
-    _CACHE_ENGINE_FIELDS,
+    _CACHE_STAGE_ENGINE_FIELD_MAP,
+    _DIFFUSION_CACHE_STAGE_ENGINE_FIELD_MAP,
+    _DIFFUSION_LOAD_STAGE_ENGINE_FIELD_MAP,
     _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS,
-    _LLM_PARALLEL_CONFIG_ENGINE_FIELDS,
-    _LOAD_ENGINE_FIELDS,
-    _SCHEDULER_ENGINE_FIELDS,
+    _DIFFUSION_SCHEDULER_STAGE_ENGINE_FIELD_MAP,
+    _LOAD_STAGE_ENGINE_FIELD_MAP,
+    _PARALLEL_CONFIG_ENGINE_FIELD_MAP,
+    _SCHEDULER_STAGE_ENGINE_FIELD_MAP,
     BaseVllmOmniStageConfig,
     VllmOmniDiffusionStageConfig,
 )
@@ -786,19 +789,36 @@ def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, 
 def _project_omni_config_fields(
     config: Any,
     *,
-    include: frozenset[str] | None = None,
+    field_map: Mapping[str, str] | None = None,
     exclude: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Copy defined typed config fields into backend adapter kwargs."""
     projected: dict[str, Any] = {}
     for config_field in fields(config):
         name = config_field.name
-        if (include is not None and name not in include) or name in exclude:
+        if name in exclude or (field_map is not None and name not in field_map):
             continue
         value = getattr(config, name)
         if value is not None:
-            projected[name] = copy.deepcopy(value)
+            projected[field_map.get(name, name) if field_map is not None else name] = copy.deepcopy(value)
     return projected
+
+
+def _project_upstream_config_fields(
+    config: Any,
+    field_map: Mapping[str, str],
+) -> dict[str, Any]:
+    """Project every explicit upstream input, including newly added fields."""
+    explicit_fields = getattr(config, "_omni_explicit_fields", frozenset())
+    unprojected_fields = explicit_fields - frozenset(field_map)
+    if unprojected_fields:
+        names = ", ".join(sorted(unprojected_fields))
+        raise ValueError(f"{type(config).__name__} has explicit field(s) with no EngineArgs projection: {names}")
+    return _project_omni_config_fields(
+        config,
+        field_map=field_map,
+        exclude=frozenset(field_map) - explicit_fields,
+    )
 
 
 def _project_omni_stage_engine_args(
@@ -811,28 +831,42 @@ def _project_omni_stage_engine_args(
     if is_diffusion:
         engine_args.update(_project_omni_config_fields(stage_config.diffusion_config))
 
-    for config, included_fields, excluded_fields in (
+    for config, excluded_fields in (
         (
             stage_config.model_config,
-            None,
             frozenset({"default_sampling_params", "has_sampling_extra_args"}),
         ),
-        (stage_config.load_config, _LOAD_ENGINE_FIELDS, frozenset()),
-        (stage_config.cache_config, _CACHE_ENGINE_FIELDS, frozenset()),
-        (stage_config.scheduler_config, _SCHEDULER_ENGINE_FIELDS, frozenset()),
         (
             stage_config.runtime_config,
-            None,
             frozenset({"devices", "num_replicas", "env", "num_gpus"}),
         ),
     ):
         engine_args.update(
             _project_omni_config_fields(
                 config,
-                include=included_fields,
                 exclude=excluded_fields,
             )
         )
+
+    if is_diffusion:
+        for config, field_map in (
+            (stage_config.load_config, _DIFFUSION_LOAD_STAGE_ENGINE_FIELD_MAP),
+            (stage_config.cache_config, _DIFFUSION_CACHE_STAGE_ENGINE_FIELD_MAP),
+            (stage_config.scheduler_config, _DIFFUSION_SCHEDULER_STAGE_ENGINE_FIELD_MAP),
+        ):
+            engine_args.update(_project_omni_config_fields(config, field_map=field_map))
+    else:
+        for config, field_map in (
+            (stage_config.load_config, _LOAD_STAGE_ENGINE_FIELD_MAP),
+            (stage_config.cache_config, _CACHE_STAGE_ENGINE_FIELD_MAP),
+            (stage_config.scheduler_config, _SCHEDULER_STAGE_ENGINE_FIELD_MAP),
+        ):
+            engine_args.update(_project_upstream_config_fields(config, field_map))
+
+    for name in ("compilation_config", "profiler_config"):
+        value = getattr(stage_config, name)
+        if value is not None:
+            engine_args[name] = copy.deepcopy(value)
 
     # The legacy builder always emits this key, including for pipelines such
     # as Audex that intentionally defer architecture discovery to HF config.
@@ -860,15 +894,14 @@ def _project_omni_stage_engine_args(
     if is_diffusion:
         engine_args["parallel_config"] = _project_omni_config_fields(
             stage_config.parallel_config,
-            include=_DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS,
+            field_map={name: name for name in _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS},
             exclude=frozenset({"world_size"}),
         )
     else:
         engine_args.update(
-            _project_omni_config_fields(
+            _project_upstream_config_fields(
                 stage_config.parallel_config,
-                include=_LLM_PARALLEL_CONFIG_ENGINE_FIELDS,
-                exclude=frozenset({"world_size"}),
+                _PARALLEL_CONFIG_ENGINE_FIELD_MAP,
             )
         )
 
