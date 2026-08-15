@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from inspect import Parameter, signature
 from pathlib import Path
 
 import msgspec
@@ -627,6 +628,23 @@ def test_inherited_sub_configs_initialize_transport_safe_derived_fields():
 
     diffusion_parallel_config = OmniStageDiffusionParallelConfig(data_parallel_size=3, data_parallel_rank=2)
     assert diffusion_parallel_config.data_parallel_index == 2
+
+
+@pytest.mark.parametrize(
+    "config_cls",
+    [
+        OmniStageLoadConfig,
+        OmniStageCacheConfig,
+        OmniStageSchedulerConfig,
+        OmniStageParallelConfig,
+        OmniStageDiffusionParallelConfig,
+    ],
+)
+def test_inherited_sub_configs_are_keyword_only(config_cls):
+    assert all(parameter.kind is Parameter.KEYWORD_ONLY for parameter in signature(config_cls).parameters.values())
+
+    with pytest.raises(TypeError):
+        config_cls(1)
 
 
 @pytest.mark.parametrize(

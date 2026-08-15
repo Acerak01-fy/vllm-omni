@@ -13,7 +13,8 @@ from __future__ import annotations
 import copy
 from collections.abc import Mapping
 from dataclasses import InitVar, dataclass, field, fields
-from inspect import signature
+from functools import wraps
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import Any, Literal, TypeAlias, TypedDict, cast
 
@@ -107,6 +108,31 @@ class _TrackExplicitConfigFields:
             explicit_fields = frozenset()
         object.__setattr__(result, "_omni_explicit_fields", explicit_fields)
         return result
+
+
+def _enforce_keyword_only_init(cls: type[Any]) -> type[Any]:
+    """Make inherited Pydantic dataclass fields keyword-only as well."""
+    generated_init = cls.__init__
+    generated_signature = signature(cls)
+    keyword_only_signature = generated_signature.replace(
+        parameters=[
+            parameter.replace(kind=Parameter.KEYWORD_ONLY)
+            if parameter.kind in {Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD}
+            else parameter
+            for parameter in generated_signature.parameters.values()
+        ]
+    )
+
+    @wraps(generated_init)
+    def keyword_only_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        if args:
+            raise TypeError(f"{cls.__name__}() accepts keyword arguments only; got {len(args)} positional argument(s)")
+        generated_init(self, **kwargs)
+
+    cls.__init__ = keyword_only_init
+    cls.__signature__ = keyword_only_signature
+    cls.__match_args__ = ()
+    return cls
 
 
 class _ModelEngineOverrides(TypedDict, total=False):
@@ -383,7 +409,8 @@ class OmniStageModelConfig:
     tokenizer_subdir: str | None = None
 
 
-@config
+@_enforce_keyword_only_init
+@config(kw_only=True)
 class OmniStageLoadConfig(_TrackExplicitConfigFields, VllmLoadConfig):
     """vLLM loading behavior plus Omni stage-specific tokenizer inputs."""
 
@@ -394,7 +421,8 @@ class OmniStageLoadConfig(_TrackExplicitConfigFields, VllmLoadConfig):
     skip_mm_profiling: bool | None = None
 
 
-@config
+@_enforce_keyword_only_init
+@config(kw_only=True)
 class OmniStageCacheConfig(_TrackExplicitConfigFields, VllmCacheConfig):
     """Per-stage engine cache and memory behavior.
 
@@ -412,7 +440,8 @@ class OmniStageCacheConfig(_TrackExplicitConfigFields, VllmCacheConfig):
     mamba_ssm_cache_dtype: str | None = None
 
 
-@config
+@_enforce_keyword_only_init
+@config(kw_only=True)
 class OmniStageSchedulerConfig(_TrackExplicitConfigFields, VllmSchedulerConfig):
     """Per-stage request scheduling behavior."""
 
@@ -471,7 +500,8 @@ class OmniStageRuntimeConfig:
     log_stats: bool = False
 
 
-@config
+@_enforce_keyword_only_init
+@config(kw_only=True)
 class OmniStageParallelConfig(_TrackExplicitConfigFields, VllmParallelConfig):
     """Common per-stage distributed parallelism behavior."""
 
@@ -533,7 +563,8 @@ class OmniStageParallelConfig(_TrackExplicitConfigFields, VllmParallelConfig):
         return self.world_size
 
 
-@config
+@_enforce_keyword_only_init
+@config(kw_only=True)
 class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     """Diffusion-stage distributed parallelism behavior."""
 
