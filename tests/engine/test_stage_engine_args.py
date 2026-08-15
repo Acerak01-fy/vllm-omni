@@ -248,7 +248,7 @@ def test_typed_llm_projection_discovers_explicit_upstream_config_fields():
         load_config=OmniStageLoadConfig(ignore_patterns=["*.bin"]),
         cache_config=OmniStageCacheConfig(block_size=32, cache_dtype="fp8"),
         scheduler_config=OmniStageSchedulerConfig(
-            max_num_partial_prefills=2,
+            prefill_schedule_interval=2,
             policy="priority",
         ),
         parallel_config=OmniStageParallelConfig(
@@ -262,7 +262,7 @@ def test_typed_llm_projection_discovers_explicit_upstream_config_fields():
     assert engine_args["ignore_patterns"] == ["*.bin"]
     assert engine_args["block_size"] == 32
     assert engine_args["kv_cache_dtype"] == "fp8"
-    assert engine_args["max_num_partial_prefills"] == 2
+    assert engine_args["prefill_schedule_interval"] == 2
     assert engine_args["scheduling_policy"] == "priority"
     assert engine_args["data_parallel_address"] == "10.0.0.1"
     assert engine_args["enable_dbo"] is True
@@ -279,7 +279,7 @@ def test_typed_llm_projection_does_not_emit_inherited_upstream_defaults():
         "ignore_patterns",
         "block_size",
         "kv_cache_dtype",
-        "max_num_partial_prefills",
+        "prefill_schedule_interval",
         "scheduling_policy",
         "data_parallel_address",
         "data_parallel_rank",
