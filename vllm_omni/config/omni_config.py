@@ -95,13 +95,8 @@ class _TrackExplicitConfigFields:
     def _record_explicit_config_fields(cls, value: Any, handler: Any) -> Any:
         result = handler(value)
         kwargs = getattr(value, "kwargs", None)
-        args = getattr(value, "args", None)
-        if kwargs is not None or args is not None:
-            explicit_fields = set(kwargs or {})
-            if args:
-                positional_fields = tuple(signature(cls).parameters)
-                explicit_fields.update(positional_fields[: len(args)])
-            explicit_fields = frozenset(explicit_fields)
+        if kwargs is not None:
+            explicit_fields = frozenset(kwargs)
         elif isinstance(value, cls):
             explicit_fields = getattr(value, "_omni_explicit_fields", frozenset())
         else:
