@@ -33,6 +33,12 @@ class _RunnerKVBackend:
         return {layer_name: spec for layer_name, (_layer, spec) in layers.items()}
 
     def initialize_kv_cache(self, config) -> None:
+        configured_layers = {layer_name for group in config.kv_cache_groups for layer_name in group.layer_names}
+        if configured_layers != {"image_attention"}:
+            raise ValueError(
+                "Rank-local Diffusion KVCacheConfig layer mismatch: "
+                f"expected=['image_attention'], configured={sorted(configured_layers)}"
+            )
         self.kv_cache_config = config
 
 

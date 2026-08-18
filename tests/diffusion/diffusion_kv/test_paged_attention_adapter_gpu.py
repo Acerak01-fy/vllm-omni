@@ -58,6 +58,11 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
         hf_config=SimpleNamespace(model_type="diffusion_paged_attention_smoke"),
     )
     vllm_config.model_config = model_config
+    model_config.set_attention_geometry(
+        num_heads=_NUM_HEADS,
+        num_kv_heads=_NUM_HEADS,
+        head_size=_HEAD_SIZE,
+    )
     vllm_config.compilation_config.static_forward_context.clear()
 
     diffusion_layer = _SmokeDiffusionAttention().to(device)
