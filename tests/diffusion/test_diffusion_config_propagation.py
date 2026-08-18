@@ -126,9 +126,14 @@ class TestCreateDefaultDiffusion:
         assert ea["lora_path"] == "/tmp/lora"
 
     def test_diffusion_kv_mode_roundtrip(self):
-        od = _roundtrip_diffusion_config(model="x", diffusion_kv_mode="paged_scheduler")
+        od = _roundtrip_diffusion_config(
+            model="x",
+            diffusion_kv_mode="paged_scheduler",
+            diffusion_kv_max_rows_per_request=2,
+        )
 
         assert od.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+        assert od.diffusion_kv_max_rows_per_request == 2
 
     def test_diffusion_kv_sizing_fields_roundtrip(self, monkeypatch):
         monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda self: 29500)
