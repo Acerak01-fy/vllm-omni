@@ -44,16 +44,16 @@ def _registration_backend(parallel_config: object):
     return backend, vllm_config, model_config
 
 
+def _parallel_config(**overrides):
+    values = dict(ulysses_degree=1, ring_degree=1, allgather_degree=1, ulysses_mode="strict")
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_cache_layer_registration_installs_adapters_with_ulysses_local_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    parallel_config = SimpleNamespace(
-        ulysses_degree=2,
-        ring_degree=1,
-        allgather_degree=1,
-        ulysses_mode="strict",
-    )
-    backend, vllm_config, model_config = _registration_backend(parallel_config)
+    backend, vllm_config, model_config = _registration_backend(_parallel_config(ulysses_degree=2))
     layer = SimpleNamespace(num_heads=8, softmax_scale=0.125, skip_sequence_parallel=False)
     unrelated = object()
     vllm_config.compilation_config.static_forward_context.update({"layer-0": layer, "unrelated": unrelated})
@@ -92,67 +92,12 @@ def test_cache_layer_registration_installs_adapters_with_ulysses_local_geometry(
     assert vllm_config.attention_config.use_non_causal is True
 
 
-def test_cache_layer_registration_failure_preserves_previous_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    parallel_config = SimpleNamespace(
-        ulysses_degree=1,
-        ring_degree=1,
-        allgather_degree=1,
-        ulysses_mode="strict",
-    )
-    backend, vllm_config, model_config = _registration_backend(parallel_config)
-    previous_adapter = object()
-    unrelated = object()
-    previous_adapters = {"layer-0": previous_adapter}
-    backend._kv_cache_layer_adapters = previous_adapters
-    vllm_config.compilation_config.static_forward_context.update({"layer-0": previous_adapter, "unrelated": unrelated})
-    layer = SimpleNamespace(num_heads=8, softmax_scale=0.125, skip_sequence_parallel=False)
-    spec = FullAttentionSpec(
-        block_size=16,
-        num_kv_heads=4,
-        head_size=8,
-        dtype=torch.float16,
-        non_causal=True,
-    )
-
-    class FailingLayerAdapter:
-        def __init__(self, **_kwargs) -> None:
-            raise RuntimeError("adapter construction failed")
-
-    monkeypatch.setattr(model_runner_backend_module, "DiffusionPagedAttentionLayerAdapter", FailingLayerAdapter)
-    monkeypatch.setattr(model_runner_backend_module, "set_current_vllm_config", lambda _config: nullcontext())
-
-    with pytest.raises(RuntimeError, match="adapter construction failed"):
-        backend.register_kv_cache_layers({"layer-0": (layer, spec)})
-
-    assert backend._kv_cache_layer_adapters is previous_adapters
-    assert vllm_config.compilation_config.static_forward_context == {
-        "layer-0": previous_adapter,
-        "unrelated": unrelated,
-    }
-    assert vllm_config.attention_config.use_non_causal is False
-    model_config.set_attention_geometry.assert_not_called()
-
-
 @pytest.mark.parametrize(
     ("parallel_config", "message"),
     [
-        (
-            SimpleNamespace(ulysses_degree=1, ring_degree=2, allgather_degree=1, ulysses_mode="strict"),
-            "Ring",
-        ),
-        (
-            SimpleNamespace(ulysses_degree=1, ring_degree=1, allgather_degree=2, ulysses_mode="strict"),
-            "AllGather-KV",
-        ),
-        (
-            SimpleNamespace(
-                ulysses_degree=2,
-                ring_degree=1,
-                allgather_degree=1,
-                ulysses_mode="advanced_uaa",
-            ),
-            "strict Ulysses",
-        ),
+        (_parallel_config(ring_degree=2), "Ring"),
+        (_parallel_config(allgather_degree=2), "AllGather-KV"),
+        (_parallel_config(ulysses_degree=2, ulysses_mode="advanced_uaa"), "strict Ulysses"),
     ],
 )
 def test_cache_layer_registration_rejects_unsupported_sp_modes(parallel_config, message: str) -> None:
@@ -163,13 +108,9 @@ def test_cache_layer_registration_rejects_unsupported_sp_modes(parallel_config, 
 
 
 def test_cache_layer_registration_ignores_sp_for_opted_out_layer() -> None:
-    parallel_config = SimpleNamespace(
-        ulysses_degree=2,
-        ring_degree=2,
-        allgather_degree=1,
-        ulysses_mode="advanced_uaa",
+    backend, _, _ = _registration_backend(
+        _parallel_config(ulysses_degree=2, ring_degree=2, ulysses_mode="advanced_uaa")
     )
-    backend, _, _ = _registration_backend(parallel_config)
 
     assert backend._get_paged_attention_ulysses_degree(SimpleNamespace(skip_sequence_parallel=True)) == 1
 

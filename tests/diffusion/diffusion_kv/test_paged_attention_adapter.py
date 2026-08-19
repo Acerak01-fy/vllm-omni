@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import math
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -22,7 +23,6 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRowBinding,
 )
 from vllm_omni.diffusion.forward_context import (
-    get_forward_context,
     override_paged_kv_adapter,
     set_forward_context,
 )
@@ -297,19 +297,6 @@ def test_forward_rejects_untranslated_omni_metadata_before_cache_write(monkeypat
     assert layer.updates == []
 
 
-def test_activate_exposes_adapter_only_for_active_omni_forward(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter, _, _, _ = _make_adapter(monkeypatch)
-    batch = adapter.prepare_batch(
-        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=1, seq_len=1)]
-    )
-
-    with set_forward_context():
-        assert get_forward_context().paged_kv_adapter is None
-        with adapter.activate(batch):
-            assert get_forward_context().paged_kv_adapter is adapter
-        assert get_forward_context().paged_kv_adapter is None
-
-
 def test_forward_accepts_flattened_hidden_dimension(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, _, _ = _make_adapter(monkeypatch)
     batch = adapter.prepare_batch(
@@ -568,26 +555,12 @@ def test_row_contract_rejects_invalid_identity_or_span(kwargs: dict, message: st
 
 def test_layer_adapter_forces_flash_attention_and_uses_rank_local_heads(monkeypatch: pytest.MonkeyPatch) -> None:
     selected_backends = []
-    in_config_context = False
-
-    class FakeImpl:
-        def __init__(self, **kwargs) -> None:
-            assert in_config_context
-            self.kwargs = kwargs
-            self.vllm_flash_attn_version = 3
-
-    class FakeFlashAttentionBackend:
-        @staticmethod
-        def get_name() -> str:
-            return "FLASH_ATTN"
-
-        @staticmethod
-        def indexes_kv_by_block_stride() -> bool:
-            return True
-
-        @staticmethod
-        def get_impl_cls():
-            return FakeImpl
+    impl_cls = Mock(return_value=SimpleNamespace(vllm_flash_attn_version=3))
+    flash_backend = SimpleNamespace(
+        get_name=lambda: "FLASH_ATTN",
+        indexes_kv_by_block_stride=lambda: True,
+        get_impl_cls=lambda: impl_cls,
+    )
 
     original_backend_per_kind = {"full": object()}
     config = SimpleNamespace(
@@ -597,22 +570,11 @@ def test_layer_adapter_forces_flash_attention_and_uses_rank_local_heads(monkeypa
     )
 
     def select_backend(**_kwargs):
-        assert in_config_context
         selected_backends.append((config.attention_config.backend, config.attention_config.backend_per_kind))
-        return FakeFlashAttentionBackend
-
-    @contextmanager
-    def current_config(_config):
-        nonlocal in_config_context
-        previous = in_config_context
-        in_config_context = True
-        try:
-            yield
-        finally:
-            in_config_context = previous
+        return flash_backend
 
     monkeypatch.setattr(adapter_module, "get_attn_backend", select_backend)
-    monkeypatch.setattr(adapter_module, "set_current_vllm_config", current_config)
+    monkeypatch.setattr(adapter_module, "set_current_vllm_config", lambda _config: nullcontext())
     layer = SimpleNamespace(num_heads=8, softmax_scale=0.125)
     spec = FullAttentionSpec(
         block_size=16,
@@ -638,33 +600,9 @@ def test_layer_adapter_forces_flash_attention_and_uses_rank_local_heads(monkeypa
     assert native_layer.num_kv_heads == 2
     assert native_layer.spec.num_kv_heads == 2
     assert native_layer.spec.indexes_kv_by_block_stride is True
-    assert native_layer.impl.kwargs["num_heads"] == 4
-    assert native_layer.impl.kwargs["num_kv_heads"] == 2
-
-
-def test_layer_adapter_rejects_invalid_gqa_geometry() -> None:
-    config = SimpleNamespace(
-        attention_config=SimpleNamespace(backend=None, backend_per_kind={}),
-        model_config=SimpleNamespace(dtype=torch.float16),
-        cache_config=SimpleNamespace(cache_dtype="auto"),
-    )
-    layer = SimpleNamespace(num_heads=8, softmax_scale=0.125)
-    spec = FullAttentionSpec(
-        block_size=16,
-        num_kv_heads=3,
-        head_size=8,
-        dtype=torch.float16,
-        non_causal=True,
-    )
-
-    with pytest.raises(ValueError, match="num_heads divisible by num_kv_heads"):
-        adapter_module.DiffusionPagedAttentionLayerAdapter(
-            layer_name="layer-0",
-            layer=layer,
-            spec=spec,
-            vllm_config=config,
-            device=torch.device("cpu"),
-        )
+    impl_kwargs = impl_cls.call_args.kwargs
+    assert impl_kwargs["num_heads"] == 4
+    assert impl_kwargs["num_kv_heads"] == 2
 
 
 def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:

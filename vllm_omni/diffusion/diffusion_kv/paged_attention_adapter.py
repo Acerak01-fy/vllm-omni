@@ -124,11 +124,6 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         with set_current_vllm_config(vllm_config):
             self.impl = self._create_native_impl(vllm_config)
 
-    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        """Bind the cache view produced by vLLM's allocator."""
-
-        self.kv_cache = kv_cache
-
     def get_attn_backend(self):
         return self.attn_backend
 
