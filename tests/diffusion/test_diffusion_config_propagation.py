@@ -125,7 +125,10 @@ class TestCreateDefaultDiffusion:
         assert ea["enforce_eager"] is True
         assert ea["lora_path"] == "/tmp/lora"
 
-    def test_diffusion_kv_mode_roundtrip(self):
+    def test_diffusion_kv_mode_roundtrip(self, monkeypatch):
+        from vllm_omni.platforms import current_omni_platform
+
+        monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
         od = _roundtrip_diffusion_config(
             model="x",
             diffusion_kv_mode="paged_scheduler",

@@ -1090,7 +1090,10 @@ def test_diffusion_config_preserves_existing_coercion_hooks():
 
 
 def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
+    from vllm_omni.platforms import current_omni_platform
+
     monkeypatch.setenv("DIFFUSION_CACHE_BACKEND", "TEA_CACHE")
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
 
     cfg = omni_config_module._DiffusionConfigProjection.from_kwargs(
         diffusion_attention_backend="flash_attn",
@@ -1117,7 +1120,10 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     assert cfg.diffusers_call_kwargs == {}
 
 
-def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args(tmp_path):
+def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_args(tmp_path, monkeypatch):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
     deploy_path = tmp_path / "dreamzero_diffusion_aliases.yaml"
     deploy_path.write_text(
         "\n".join(

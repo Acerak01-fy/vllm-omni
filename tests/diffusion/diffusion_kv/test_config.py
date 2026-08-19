@@ -13,6 +13,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 @pytest.fixture(autouse=True)
 def _fixed_master_port(monkeypatch) -> None:
     monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
 
 
 def test_dense_legacy_is_default() -> None:
@@ -55,6 +58,28 @@ def test_paged_scheduler_does_not_depend_on_model_registry() -> None:
     )
 
     assert config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+def test_paged_scheduler_rejects_non_cuda_platforms(monkeypatch, config_cls) -> None:
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+
+    with pytest.raises(ValueError, match="currently supported only on CUDA"):
+        config_cls.from_kwargs(
+            diffusion_kv_mode="paged_scheduler",
+            diffusion_kv_max_rows_per_request=1,
+        )
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+def test_dense_legacy_remains_available_on_non_cuda_platforms(monkeypatch, config_cls) -> None:
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+
+    assert config_cls.from_kwargs().diffusion_kv_mode is DiffusionKVCacheMode.DENSE_LEGACY
 
 
 def test_paged_scheduler_requires_a_worker_row_limit() -> None:
