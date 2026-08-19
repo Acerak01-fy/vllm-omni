@@ -81,6 +81,7 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
             vllm_config=vllm_config,
             device=device,
         )
+    vllm_config.compilation_config.static_forward_context[_LAYER_NAME] = native_layer
 
     canonical_spec = native_layer.spec
     kv_cache_config = KVCacheConfig(
@@ -169,7 +170,7 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
         ]
     )
     with adapter.activate(suffix_batch):
-        suffix_output = adapter.forward(_LAYER_NAME, query[17:], key[17:], value[17:])
+        suffix_output = adapter.forward(_LAYER_NAME, query[17:], key, value)
 
     prefix_reference = (
         F.scaled_dot_product_attention(

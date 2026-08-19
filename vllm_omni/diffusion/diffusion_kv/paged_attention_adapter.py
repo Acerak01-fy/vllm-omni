@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -11,15 +10,17 @@ from typing import Any
 
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.forward_context import set_forward_context as set_vllm_forward_context
-from vllm.model_executor.layers.attention import Attention as VllmAttention
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata, build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
+
+from vllm_omni.diffusion.forward_context import override_paged_kv_adapter
 
 
 @dataclass(frozen=True)
@@ -36,8 +37,16 @@ DiffusionKVRowResolver = Callable[
 ]
 
 
-class DiffusionPagedAttentionLayerAdapter(VllmAttention):
-    """A native vLLM attention layer backed by a diffusion Attention spec."""
+class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
+    """Register a diffusion layer with vLLM's native cache machinery.
+
+    This object deliberately does *not* subclass ``vllm.Attention``.  The
+    latter owns a second execution path and would bypass Omni's sequence
+    parallel pre/post hooks.  The wrapper only supplies the small
+    ``AttentionLayerBase`` contract needed by ``init_attn_backend`` and keeps
+    the native FlashAttention implementation/cache view available to the
+    diffusion adapter.
+    """
 
     def __init__(
         self,
@@ -47,39 +56,120 @@ class DiffusionPagedAttentionLayerAdapter(VllmAttention):
         spec: AttentionSpec,
         vllm_config: VllmConfig,
         device: torch.device,
+        ulysses_degree: int = 1,
     ) -> None:
-        with set_current_vllm_config(vllm_config):
-            attn_backend = get_attn_backend(
-                head_size=spec.head_size,
-                dtype=vllm_config.model_config.dtype,
-                kv_cache_dtype=vllm_config.cache_config.cache_dtype,
-                num_heads=layer.num_heads,
+        if type(ulysses_degree) is not int or ulysses_degree <= 0:
+            raise ValueError(f"ulysses_degree must be a positive integer, got {ulysses_degree!r}")
+        num_heads = int(layer.num_heads)
+        num_kv_heads = int(spec.num_kv_heads)
+        if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
+            raise ValueError(
+                "Paged attention requires positive Q/KV heads with num_heads divisible by num_kv_heads: "
+                f"num_heads={num_heads}, num_kv_heads={num_kv_heads}"
             )
-            canonical_spec = replace(
-                spec,
-                indexes_kv_by_block_stride=attn_backend.indexes_kv_by_block_stride(),
+        if num_heads % ulysses_degree != 0 or num_kv_heads % ulysses_degree != 0:
+            raise ValueError(
+                "Paged attention requires Q/KV heads divisible by ulysses_degree: "
+                f"num_heads={num_heads}, num_kv_heads={num_kv_heads}, ulysses_degree={ulysses_degree}"
             )
-            super().__init__(
-                num_heads=layer.num_heads,
-                head_size=canonical_spec.head_size,
-                scale=layer.softmax_scale,
-                num_kv_heads=canonical_spec.num_kv_heads,
-                cache_config=vllm_config.cache_config,
-                prefix=layer_name,
-                attn_type=AttentionType.DECODER,
-                attn_backend=attn_backend,
-                head_size_v=getattr(canonical_spec, "head_size_v", canonical_spec.head_size),
-            )
-        self._diffusion_layer_ref = weakref.ref(layer)
-        self.spec = canonical_spec
-        self.to(device=device)
+        num_heads //= ulysses_degree
+        num_kv_heads //= ulysses_degree
 
-    @property
-    def layer(self) -> Any:
-        layer = self._diffusion_layer_ref()
-        if layer is None:
-            raise RuntimeError("The diffusion Attention layer backing this native adapter no longer exists")
-        return layer
+        attention_config = vllm_config.attention_config
+        previous_backend = attention_config.backend
+        previous_backend_per_kind = attention_config.backend_per_kind
+        try:
+            attention_config.backend = AttentionBackendEnum.FLASH_ATTN
+            attention_config.backend_per_kind = {}
+            with set_current_vllm_config(vllm_config):
+                attn_backend = get_attn_backend(
+                    head_size=spec.head_size,
+                    dtype=vllm_config.model_config.dtype,
+                    kv_cache_dtype=vllm_config.cache_config.cache_dtype,
+                    attn_type=AttentionType.DECODER,
+                    num_heads=num_heads,
+                )
+        finally:
+            attention_config.backend = previous_backend
+            attention_config.backend_per_kind = previous_backend_per_kind
+        if attn_backend.get_name() != "FLASH_ATTN":
+            raise RuntimeError(
+                f"Diffusion paged attention requires vLLM's FLASH_ATTN backend; selected {attn_backend.get_name()!r}"
+            )
+        canonical_spec = replace(
+            spec,
+            num_kv_heads=num_kv_heads,
+            indexes_kv_by_block_stride=attn_backend.indexes_kv_by_block_stride(),
+        )
+        self.layer_name = layer_name
+        self.spec = canonical_spec
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = int(canonical_spec.head_size)
+        self.head_size_v = int(getattr(canonical_spec, "head_size_v", canonical_spec.head_size))
+        if self.head_size_v != self.head_size:
+            raise ValueError(
+                "Diffusion paged FlashAttention requires equal key/value head sizes; "
+                f"got head_size={self.head_size}, head_size_v={self.head_size_v}"
+            )
+        self.softmax_scale = float(layer.softmax_scale)
+        self.attn_backend = attn_backend
+        self.kv_cache: torch.Tensor | None = None
+        # Native FlashAttention uses these fields for KV cache quantization.
+        # They are harmless for the normal (unquantized) path and avoid making
+        # the adapter depend on the concrete vLLM Attention module.
+        self._q_scale = torch.ones(1, device=device, dtype=torch.float32)
+        self._k_scale = torch.ones(1, device=device, dtype=torch.float32)
+        self._v_scale = torch.ones(1, device=device, dtype=torch.float32)
+        with set_current_vllm_config(vllm_config):
+            self.impl = self._create_native_impl(vllm_config)
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        """Bind the cache view produced by vLLM's allocator."""
+
+        self.kv_cache = kv_cache
+
+    def get_attn_backend(self):
+        return self.attn_backend
+
+    def _create_native_impl(self, vllm_config: VllmConfig):
+        impl_cls = self.attn_backend.get_impl_cls()
+        impl = impl_cls(
+            num_heads=self.num_heads,
+            head_size=self.head_size,
+            scale=self.softmax_scale,
+            num_kv_heads=self.num_kv_heads,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype=vllm_config.cache_config.cache_dtype,
+            logits_soft_cap=None,
+            attn_type=AttentionType.DECODER,
+            kv_sharing_target_layer_name=None,
+        )
+        if getattr(impl, "vllm_flash_attn_version", None) is None:
+            raise RuntimeError(f"FlashAttention paged-KV kernel is unavailable for diffusion layer {self.layer_name!r}")
+        return impl
+
+    def do_kv_cache_update(self, key: torch.Tensor, value: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+        if self.kv_cache is None:
+            raise RuntimeError(f"Native KV cache is not bound for diffusion layer {self.layer_name!r}")
+        self.impl.do_kv_cache_update(self, key, value, self.kv_cache, slot_mapping)
+
+    def forward_native(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        metadata: Any,
+    ) -> torch.Tensor:
+        if self.kv_cache is None:
+            raise RuntimeError(f"Native KV cache is not bound for diffusion layer {self.layer_name!r}")
+        output = torch.empty(
+            (query.shape[0], self.num_heads, self.head_size_v),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        return self.impl.forward(self, query, key, value, self.kv_cache, metadata, output)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> AttentionSpec:
         del vllm_config
@@ -387,15 +477,7 @@ class DiffusionPagedAttentionAdapter:
             raise RuntimeError("Paged attention adapter already has an active forward")
         self._active_batch = batch
         try:
-            with (
-                set_current_vllm_config(self.vllm_config),
-                set_vllm_forward_context(
-                    batch.attn_metadata,
-                    self.vllm_config,
-                    num_tokens=batch.num_tokens,
-                    slot_mapping=batch.slot_mappings_by_layer,
-                ),
-            ):
+            with override_paged_kv_adapter(self), set_current_vllm_config(self.vllm_config):
                 yield self
         finally:
             self._active_batch = None
@@ -419,7 +501,7 @@ class DiffusionPagedAttentionAdapter:
         )
 
     @staticmethod
-    def _validate_token_layout(
+    def _validate_query_layout(
         token_shape: tuple[int, ...],
         batch: PreparedDiffusionPagedAttentionBatch,
     ) -> None:
@@ -439,12 +521,89 @@ class DiffusionPagedAttentionAdapter:
             f"got token shape={token_shape}"
         )
 
+    @staticmethod
+    def _extract_write_tokens(
+        tensor: torch.Tensor,
+        token_shape: tuple[int, ...],
+        batch: PreparedDiffusionPagedAttentionBatch,
+        *,
+        name: str,
+    ) -> torch.Tensor:
+        """Return the K/V tokens covered by the current page-table write.
+
+        A diffusion step commonly passes ``K/V=[prefix | current image]``
+        while the query contains only ``current image``.  The native cache
+        writer must receive only the write span, and that span may begin in
+        the middle of a physical block.  This helper accepts both packed and
+        per-row full-sequence layouts and slices with the logical
+        ``kv_start_pos`` from the prepared rows.
+        """
+
+        query_tokens = batch.num_tokens
+        if tensor.shape[0] == query_tokens:
+            if len(token_shape) == 2:
+                batch_size, tokens_per_row = token_shape
+                if batch_size != len(batch.rows) or any(row.query_len != tokens_per_row for row in batch.rows):
+                    raise ValueError(
+                        f"Paged attention {name} query-aligned layout does not match prepared rows: "
+                        f"shape={token_shape}, row_query_lens={tuple(row.query_len for row in batch.rows)}"
+                    )
+            return tensor
+
+        full_tokens = sum(row.seq_len for row in batch.rows)
+        if tensor.shape[0] != full_tokens:
+            raise ValueError(
+                f"Paged attention {name} must contain either {query_tokens} write tokens or "
+                f"{full_tokens} full-sequence tokens; got {tensor.shape[0]}"
+            )
+
+        pieces: list[torch.Tensor] = []
+        if len(token_shape) == 2:
+            batch_size, tokens_per_row = token_shape
+            if batch_size != len(batch.rows):
+                raise ValueError(
+                    f"Paged attention {name} batch dimension {batch_size} does not match rows {len(batch.rows)}"
+                )
+            row_seq_lens = tuple(row.seq_len for row in batch.rows)
+            if any(seq_len != tokens_per_row for seq_len in row_seq_lens):
+                raise ValueError(
+                    f"Paged attention {name} full-sequence layout does not match prepared rows: "
+                    f"shape={token_shape}, row_seq_lens={row_seq_lens}"
+                )
+            row_offset = 0
+            for row in batch.rows:
+                if tokens_per_row < row.kv_start_pos + row.query_len:
+                    raise ValueError(
+                        f"Paged attention {name} row {row.identity!r} has only {tokens_per_row} tokens, "
+                        f"but write span ends at {row.kv_start_pos + row.query_len}"
+                    )
+                pieces.append(tensor[row_offset + row.kv_start_pos : row_offset + row.kv_start_pos + row.query_len])
+                row_offset += tokens_per_row
+        elif len(token_shape) == 1:
+            row_offset = 0
+            for row in batch.rows:
+                pieces.append(tensor[row_offset + row.kv_start_pos : row_offset + row.kv_start_pos + row.query_len])
+                row_offset += row.seq_len
+        else:
+            raise ValueError(
+                f"Paged attention {name} supports packed [T, ...] or batched [B, S, ...] layouts; "
+                f"got token shape={token_shape}"
+            )
+        result = torch.cat(pieces, dim=0)
+        if result.shape[0] != query_tokens:
+            raise RuntimeError(
+                f"Paged attention {name} write extraction produced {result.shape[0]} tokens; expected {query_tokens}"
+            )
+        return result
+
     def forward(
         self,
         layer_name: str,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        *,
+        omni_attn_metadata: Any | None = None,
     ) -> torch.Tensor:
         if self._active_batch is None:
             raise RuntimeError("Paged attention forward must run inside adapter.activate(batch)")
@@ -453,6 +612,7 @@ class DiffusionPagedAttentionAdapter:
         except KeyError as exc:
             raise KeyError(f"Unknown diffusion paged attention layer {layer_name!r}") from exc
         batch = self._active_batch
+        self._validate_omni_attn_metadata(omni_attn_metadata)
 
         query_flat, query_token_shape, query_has_head_dims = self._flatten_tensor(
             query,
@@ -472,17 +632,11 @@ class DiffusionPagedAttentionAdapter:
             head_size=layer.head_size_v,
             name="value",
         )
-        if key_token_shape != query_token_shape or value_token_shape != query_token_shape:
+        self._validate_query_layout(query_token_shape, batch)
+        if query_flat.shape[0] != batch.num_tokens:
             raise ValueError(
-                "Paged attention Q/K/V token layouts must match; "
-                f"got query={query_token_shape}, key={key_token_shape}, value={value_token_shape}"
-            )
-        self._validate_token_layout(query_token_shape, batch)
-        token_counts = (query_flat.shape[0], key_flat.shape[0], value_flat.shape[0])
-        if token_counts != (batch.num_tokens, batch.num_tokens, batch.num_tokens):
-            raise ValueError(
-                "Paged attention Q/K/V token count must match the prepared batch: "
-                f"qkv={token_counts}, prepared={batch.num_tokens}"
+                "Paged attention query token count must match the prepared batch: "
+                f"query={query_flat.shape[0]}, prepared={batch.num_tokens}"
             )
         if query.device != self.device or key.device != self.device or value.device != self.device:
             raise ValueError(
@@ -504,7 +658,61 @@ class DiffusionPagedAttentionAdapter:
                     f"invalid rows={non_suffix_rows!r}"
                 )
 
-        output = layer(query_flat, key_flat, value_flat)
+        key_write = self._extract_write_tokens(key_flat, key_token_shape, batch, name="key")
+        value_write = self._extract_write_tokens(value_flat, value_token_shape, batch, name="value")
+        if key_write.shape[0] != value_write.shape[0]:
+            raise ValueError(
+                f"Paged attention key/value write lengths differ: {key_write.shape[0]} vs {value_write.shape[0]}"
+            )
+        slot_mapping = batch.slot_mappings_by_layer.get(layer_name)
+        if slot_mapping is None:
+            raise KeyError(f"No native slot mapping was built for diffusion layer {layer_name!r}")
+        slot_mapping = slot_mapping.reshape(-1)[: batch.num_tokens]
+        if slot_mapping.numel() != batch.num_tokens:
+            raise ValueError(
+                f"Paged attention slot mapping for {layer_name!r} has {slot_mapping.numel()} entries; "
+                f"expected {batch.num_tokens}"
+            )
+
+        # vLLM's writer consumes slot_mapping directly, so a span that starts
+        # inside a physical block naturally writes only the requested suffix.
+        key_write = key_write.contiguous()
+        value_write = value_write.contiguous()
+        try:
+            native_metadata = batch.attn_metadata[layer_name]
+        except KeyError as exc:
+            raise KeyError(f"No native attention metadata was built for diffusion layer {layer_name!r}") from exc
+        layer.do_kv_cache_update(key_write, value_write, slot_mapping)
+        output = layer.forward_native(
+            query_flat.contiguous(),
+            key_write,
+            value_write,
+            native_metadata,
+        )
         if query_has_head_dims:
             return output.reshape(*query_token_shape, layer.num_heads, layer.head_size_v)
         return output.reshape(*query_token_shape, layer.num_heads * layer.head_size_v)
+
+    @staticmethod
+    def _validate_omni_attn_metadata(metadata: Any | None) -> None:
+        if metadata is None:
+            return
+        unsupported_fields = [
+            field_name
+            for field_name in (
+                "attn_mask",
+                "joint_attn_mask",
+                "full_attn_spans",
+                "query_ranges",
+                "video_layout",
+            )
+            if getattr(metadata, field_name, None) is not None
+        ]
+        extra = getattr(metadata, "extra", None)
+        if extra:
+            unsupported_fields.append(f"extra={sorted(extra)}")
+        if unsupported_fields:
+            raise NotImplementedError(
+                "Diffusion paged attention cannot translate Omni attention metadata fields "
+                f"{unsupported_fields!r} to native FlashAttention metadata"
+            )

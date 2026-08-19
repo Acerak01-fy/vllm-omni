@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
+import torch
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.worker import block_table as native_block_table
 
 from vllm_omni.diffusion.diffusion_kv import model_runner_backend as model_runner_backend_module
@@ -24,6 +27,151 @@ from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSche
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def _registration_backend(parallel_config: object):
+    model_config = SimpleNamespace(set_attention_geometry=Mock())
+    vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(use_non_causal=False),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        model_config=model_config,
+    )
+    backend = DiffusionKVModelRunnerBackend(
+        vllm_config=vllm_config,
+        od_config=SimpleNamespace(parallel_config=parallel_config),
+        device=torch.device("cpu"),
+    )
+    return backend, vllm_config, model_config
+
+
+def test_cache_layer_registration_installs_adapters_with_ulysses_local_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parallel_config = SimpleNamespace(
+        ulysses_degree=2,
+        ring_degree=1,
+        allgather_degree=1,
+        ulysses_mode="strict",
+    )
+    backend, vllm_config, model_config = _registration_backend(parallel_config)
+    layer = SimpleNamespace(num_heads=8, softmax_scale=0.125, skip_sequence_parallel=False)
+    unrelated = object()
+    vllm_config.compilation_config.static_forward_context.update({"layer-0": layer, "unrelated": unrelated})
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=8,
+        dtype=torch.float16,
+        non_causal=True,
+    )
+    constructor_calls = []
+
+    class FakeLayerAdapter:
+        def __init__(self, *, layer_name, layer, spec, ulysses_degree, **_kwargs) -> None:
+            constructor_calls.append((layer_name, layer, spec, ulysses_degree))
+            self.num_heads = layer.num_heads // ulysses_degree
+            self.num_kv_heads = spec.num_kv_heads // ulysses_degree
+            self.head_size = spec.head_size
+            self.spec = replace(spec, num_kv_heads=self.num_kv_heads)
+
+    monkeypatch.setattr(model_runner_backend_module, "DiffusionPagedAttentionLayerAdapter", FakeLayerAdapter)
+    monkeypatch.setattr(model_runner_backend_module, "set_current_vllm_config", lambda _config: nullcontext())
+
+    specs = backend.register_kv_cache_layers({"layer-0": (layer, spec)})
+
+    installed = vllm_config.compilation_config.static_forward_context["layer-0"]
+    assert isinstance(installed, FakeLayerAdapter)
+    assert vllm_config.compilation_config.static_forward_context["unrelated"] is unrelated
+    assert specs["layer-0"].num_kv_heads == 2
+    assert constructor_calls == [("layer-0", layer, spec, 2)]
+    model_config.set_attention_geometry.assert_called_once_with(
+        num_heads=4,
+        num_kv_heads=2,
+        head_size=8,
+    )
+    assert vllm_config.attention_config.use_non_causal is True
+
+
+def test_cache_layer_registration_failure_preserves_previous_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    parallel_config = SimpleNamespace(
+        ulysses_degree=1,
+        ring_degree=1,
+        allgather_degree=1,
+        ulysses_mode="strict",
+    )
+    backend, vllm_config, model_config = _registration_backend(parallel_config)
+    previous_adapter = object()
+    unrelated = object()
+    previous_adapters = {"layer-0": previous_adapter}
+    backend._kv_cache_layer_adapters = previous_adapters
+    vllm_config.compilation_config.static_forward_context.update({"layer-0": previous_adapter, "unrelated": unrelated})
+    layer = SimpleNamespace(num_heads=8, softmax_scale=0.125, skip_sequence_parallel=False)
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=8,
+        dtype=torch.float16,
+        non_causal=True,
+    )
+
+    class FailingLayerAdapter:
+        def __init__(self, **_kwargs) -> None:
+            raise RuntimeError("adapter construction failed")
+
+    monkeypatch.setattr(model_runner_backend_module, "DiffusionPagedAttentionLayerAdapter", FailingLayerAdapter)
+    monkeypatch.setattr(model_runner_backend_module, "set_current_vllm_config", lambda _config: nullcontext())
+
+    with pytest.raises(RuntimeError, match="adapter construction failed"):
+        backend.register_kv_cache_layers({"layer-0": (layer, spec)})
+
+    assert backend._kv_cache_layer_adapters is previous_adapters
+    assert vllm_config.compilation_config.static_forward_context == {
+        "layer-0": previous_adapter,
+        "unrelated": unrelated,
+    }
+    assert vllm_config.attention_config.use_non_causal is False
+    model_config.set_attention_geometry.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("parallel_config", "message"),
+    [
+        (
+            SimpleNamespace(ulysses_degree=1, ring_degree=2, allgather_degree=1, ulysses_mode="strict"),
+            "Ring",
+        ),
+        (
+            SimpleNamespace(ulysses_degree=1, ring_degree=1, allgather_degree=2, ulysses_mode="strict"),
+            "AllGather-KV",
+        ),
+        (
+            SimpleNamespace(
+                ulysses_degree=2,
+                ring_degree=1,
+                allgather_degree=1,
+                ulysses_mode="advanced_uaa",
+            ),
+            "strict Ulysses",
+        ),
+    ],
+)
+def test_cache_layer_registration_rejects_unsupported_sp_modes(parallel_config, message: str) -> None:
+    backend, _, _ = _registration_backend(parallel_config)
+
+    with pytest.raises(NotImplementedError, match=message):
+        backend._get_paged_attention_ulysses_degree(SimpleNamespace(skip_sequence_parallel=False))
+
+
+def test_cache_layer_registration_ignores_sp_for_opted_out_layer() -> None:
+    parallel_config = SimpleNamespace(
+        ulysses_degree=2,
+        ring_degree=2,
+        allgather_degree=1,
+        ulysses_mode="advanced_uaa",
+    )
+    backend, _, _ = _registration_backend(parallel_config)
+
+    assert backend._get_paged_attention_ulysses_degree(SimpleNamespace(skip_sequence_parallel=True)) == 1
 
 
 class _FakeSpec:

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,7 +22,9 @@ from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
     DiffusionPagedAttentionLayerAdapter,
+    DiffusionPagedAttentionRow,
     DiffusionPagedAttentionRowBinding,
+    PreparedDiffusionPagedAttentionBatch,
 )
 
 DiffusionKVIdentity = tuple[str, int | None, str | None]
@@ -58,10 +60,6 @@ class DiffusionKVModelRunnerBackend:
         self.device = device
         self.kv_cache_config: KVCacheConfig | None = None
         self.kv_caches: list[torch.Tensor | list[torch.Tensor]] = []
-        self.kv_caches_by_layer: dict[str, Any] = {}
-        self.attn_groups: list[list[Any]] = []
-        self.attn_cg_support_info: Any | None = None
-        self.kernel_block_sizes: list[int] = []
         self.block_tables: BlockTables | None = None
         self.paged_attention_adapter: DiffusionPagedAttentionAdapter | None = None
         self._kv_cache_layer_adapters: dict[str, DiffusionPagedAttentionLayerAdapter] = {}
@@ -80,9 +78,6 @@ class DiffusionKVModelRunnerBackend:
 
         forward_context = self.vllm_config.compilation_config.static_forward_context
         previous_adapters = self._kv_cache_layer_adapters
-        managed_layer_names = set(layers) | set(previous_adapters)
-        missing = object()
-        previous_entries = {layer_name: forward_context.get(layer_name, missing) for layer_name in managed_layer_names}
         for layer_name, (layer, spec) in layers.items():
             if not isinstance(spec, AttentionSpec):
                 raise TypeError(
@@ -93,12 +88,29 @@ class DiffusionKVModelRunnerBackend:
             if existing is not None and existing is not layer and existing is not previous_adapters.get(layer_name):
                 raise RuntimeError(f"Diffusion KV layer name {layer_name!r} collides with the native forward context")
 
-        geometries = {
-            (layer.num_heads, spec.num_kv_heads, spec.head_size)
-            for layer, spec in layers.values()
-            if isinstance(spec, AttentionSpec)
-        }
+        previous_use_non_causal = self.vllm_config.attention_config.use_non_causal
+        self.vllm_config.attention_config.use_non_causal = any(
+            bool(getattr(spec, "non_causal", False)) for _, spec in layers.values()
+        )
+        adapters: dict[str, DiffusionPagedAttentionLayerAdapter] = {}
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                for layer_name, (layer, spec) in layers.items():
+                    adapters[layer_name] = DiffusionPagedAttentionLayerAdapter(
+                        layer_name=layer_name,
+                        layer=layer,
+                        spec=spec,
+                        vllm_config=self.vllm_config,
+                        device=self.device,
+                        ulysses_degree=self._get_paged_attention_ulysses_degree(layer),
+                    )
+        except Exception:
+            self.vllm_config.attention_config.use_non_causal = previous_use_non_causal
+            raise
+
+        geometries = {(adapter.num_heads, adapter.num_kv_heads, adapter.head_size) for adapter in adapters.values()}
         if len(geometries) > 1:
+            self.vllm_config.attention_config.use_non_causal = previous_use_non_causal
             raise ValueError(
                 "Native paged attention metadata builders require one rank-local attention geometry; "
                 f"got {sorted(geometries)!r}"
@@ -110,48 +122,56 @@ class DiffusionKVModelRunnerBackend:
             else None
         )
         if attention_geometry is not None and not callable(set_attention_geometry):
+            self.vllm_config.attention_config.use_non_causal = previous_use_non_causal
             raise RuntimeError(
                 "Diffusion native paged attention requires a model config that exposes set_attention_geometry"
             )
 
-        if attention_geometry is not None:
-            num_heads, num_kv_heads, head_size = attention_geometry
-            set_attention_geometry(
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                head_size=head_size,
-            )
-
-        previous_use_non_causal = self.vllm_config.attention_config.use_non_causal
-        self.vllm_config.attention_config.use_non_causal = any(
-            bool(getattr(spec, "non_causal", False)) for _, spec in layers.values()
-        )
-        for layer_name, entry in previous_entries.items():
+        updated_forward_context = dict(forward_context)
+        for layer_name in set(layers) | set(previous_adapters):
+            entry = updated_forward_context.get(layer_name)
             layer_entry = layers.get(layer_name)
             if entry is previous_adapters.get(layer_name) or (layer_entry is not None and entry is layer_entry[0]):
-                del forward_context[layer_name]
-        adapters: dict[str, DiffusionPagedAttentionLayerAdapter] = {}
-        try:
-            with set_current_vllm_config(self.vllm_config):
-                for layer_name, (layer, spec) in layers.items():
-                    adapters[layer_name] = DiffusionPagedAttentionLayerAdapter(
-                        layer_name=layer_name,
-                        layer=layer,
-                        spec=spec,
-                        vllm_config=self.vllm_config,
-                        device=self.device,
-                    )
-        except Exception:
-            for layer_name, entry in previous_entries.items():
-                if entry is missing:
-                    forward_context.pop(layer_name, None)
-                else:
-                    forward_context[layer_name] = entry
-            self.vllm_config.attention_config.use_non_causal = previous_use_non_causal
-            raise
+                updated_forward_context.pop(layer_name, None)
+        updated_forward_context.update(adapters)
 
+        if attention_geometry is not None:
+            num_heads, num_kv_heads, head_size = attention_geometry
+            try:
+                set_attention_geometry(
+                    num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                )
+            except Exception:
+                self.vllm_config.attention_config.use_non_causal = previous_use_non_causal
+                raise
+
+        forward_context.clear()
+        forward_context.update(updated_forward_context)
         self._kv_cache_layer_adapters = adapters
         return {layer_name: adapter.spec for layer_name, adapter in adapters.items()}
+
+    def _get_paged_attention_ulysses_degree(self, layer: Any) -> int:
+        if bool(getattr(layer, "skip_sequence_parallel", False)):
+            return 1
+
+        parallel_config = getattr(self.od_config, "parallel_config", None)
+        ulysses_degree = int(getattr(parallel_config, "ulysses_degree", 1))
+        ring_degree = int(getattr(parallel_config, "ring_degree", 1))
+        allgather_degree = int(getattr(parallel_config, "allgather_degree", 1))
+        ulysses_mode = str(getattr(parallel_config, "ulysses_mode", "strict"))
+        if ring_degree > 1:
+            raise NotImplementedError(
+                "Diffusion paged attention does not support Ring or hybrid Ulysses+Ring attention"
+            )
+        if allgather_degree > 1:
+            raise NotImplementedError("Diffusion paged attention does not support AllGather-KV sequence parallelism")
+        if ulysses_degree > 1 and ulysses_mode != "strict":
+            raise NotImplementedError(
+                f"Diffusion paged attention currently supports only strict Ulysses; got ulysses_mode={ulysses_mode!r}"
+            )
+        return ulysses_degree
 
     def _get_max_rows_per_request(self) -> int:
         max_rows = getattr(self.od_config, "diffusion_kv_max_rows_per_request", None)
@@ -226,7 +246,7 @@ class DiffusionKVModelRunnerBackend:
         }
         try:
             with set_current_vllm_config(self.vllm_config):
-                attn_groups, attn_cg_support_info, kernel_block_sizes = init_attn_backend(
+                attn_groups, _, kernel_block_sizes = init_attn_backend(
                     kv_cache_config,
                     self.vllm_config,
                     self.device,
@@ -251,7 +271,7 @@ class DiffusionKVModelRunnerBackend:
                     layers=self._kv_cache_layer_adapters,
                     resolve_row=self._resolve_paged_attention_row,
                 )
-                kv_caches_by_layer = init_kv_cache(
+                init_kv_cache(
                     kv_caches,
                     self.vllm_config.compilation_config.static_forward_context,
                     kv_cache_config,
@@ -268,10 +288,6 @@ class DiffusionKVModelRunnerBackend:
             raise
 
         self.kv_caches = kv_caches
-        self.kv_caches_by_layer = kv_caches_by_layer
-        self.attn_groups = attn_groups
-        self.attn_cg_support_info = attn_cg_support_info
-        self.kernel_block_sizes = kernel_block_sizes
         self.block_tables = block_tables
         self.paged_attention_adapter = paged_attention_adapter
         self._diffusion_kv_identity_to_row.clear()
@@ -528,6 +544,25 @@ class DiffusionKVModelRunnerBackend:
         if self.paged_attention_adapter is None:
             raise RuntimeError("paged_scheduler native attention adapter is not initialized")
         return self.paged_attention_adapter
+
+    def prepare_paged_attention_batch(
+        self,
+        rows: Sequence[DiffusionPagedAttentionRow],
+    ) -> PreparedDiffusionPagedAttentionBatch:
+        """Build native page-table metadata for one Diffusion forward.
+
+        The scheduler allocation payload describes capacity, while the model
+        integration supplies the current ``query_len``/``kv_start_pos`` span
+        for each row.  Keeping this boundary explicit prevents the Worker from
+        guessing model-specific text/image layout.
+        """
+
+        return self.get_paged_attention_adapter().prepare_batch(rows)
+
+    def activate_paged_attention(self, batch: PreparedDiffusionPagedAttentionBatch):
+        """Return the context manager that exposes a prepared batch to Omni Attention."""
+
+        return self.get_paged_attention_adapter().activate(batch)
 
     def _resolve_paged_attention_row(
         self,

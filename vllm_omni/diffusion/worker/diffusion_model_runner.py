@@ -36,6 +36,10 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
+from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
+    DiffusionPagedAttentionRow,
+    PreparedDiffusionPagedAttentionBatch,
+)
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
@@ -428,6 +432,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
     def refresh_diffusion_kv_block_table_layout(self) -> None:
         self.diffusion_kv_backend.refresh_block_table_layout()
+
+    def prepare_paged_attention_batch(
+        self,
+        rows: list[DiffusionPagedAttentionRow] | tuple[DiffusionPagedAttentionRow, ...],
+    ) -> PreparedDiffusionPagedAttentionBatch:
+        """Prepare model-specific query/write spans against installed Worker rows."""
+
+        return self.diffusion_kv_backend.prepare_paged_attention_batch(rows)
+
+    def activate_paged_attention(self, batch: PreparedDiffusionPagedAttentionBatch):
+        """Expose a prepared paged batch to Omni Attention for one forward."""
+
+        return self.diffusion_kv_backend.activate_paged_attention(batch)
 
     def clear_prompt_embed_cache(self) -> None:
         """Evict all cached text-encoder outputs (e.g. between training epochs).
