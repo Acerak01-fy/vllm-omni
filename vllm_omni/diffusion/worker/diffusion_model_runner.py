@@ -915,9 +915,14 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         # Scheduler metadata is installed only for newly admitted requests;
         # cached requests continue to use the row installed on their first
-        # step. Rows are retired here for scheduler-finished requests so a
-        # subsequent wave can reuse the native table slots.
-        if scheduler_output.finished_req_ids:
+        # step. Paged rows are retired here for scheduler-finished requests so
+        # a subsequent wave can reuse the native table slots. Dense execution
+        # must not issue Worker KV cleanup side effects.
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and scheduler_output.finished_req_ids
+        ):
             self.remove_diffusion_kv_requests(list(scheduler_output.finished_req_ids))
         installed_request_ids: list[str] = []
         try:
@@ -1067,7 +1072,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     runner_output.request_id for runner_output in runner_output_list if runner_output.finished
                 ]
                 self._update_states_after(states, input_batch, pipeline_interrupted)
-                if terminal_request_ids:
+                if (
+                    getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+                    is DiffusionKVCacheMode.PAGED_SCHEDULER
+                    and terminal_request_ids
+                ):
                     self.remove_diffusion_kv_requests(terminal_request_ids)
 
                 return BatchRunnerOutput.from_list(runner_output_list)
