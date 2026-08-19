@@ -150,27 +150,6 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
             raise RuntimeError(f"FlashAttention paged-KV kernel is unavailable for diffusion layer {self.layer_name!r}")
         return impl
 
-    def do_kv_cache_update(self, key: torch.Tensor, value: torch.Tensor, slot_mapping: torch.Tensor) -> None:
-        if self.kv_cache is None:
-            raise RuntimeError(f"Native KV cache is not bound for diffusion layer {self.layer_name!r}")
-        self.impl.do_kv_cache_update(self, key, value, self.kv_cache, slot_mapping)
-
-    def forward_native(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        metadata: Any,
-    ) -> torch.Tensor:
-        if self.kv_cache is None:
-            raise RuntimeError(f"Native KV cache is not bound for diffusion layer {self.layer_name!r}")
-        output = torch.empty(
-            (query.shape[0], self.num_heads, self.head_size_v),
-            dtype=query.dtype,
-            device=query.device,
-        )
-        return self.impl.forward(self, query, key, value, self.kv_cache, metadata, output)
-
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> AttentionSpec:
         del vllm_config
         return self.spec
@@ -231,8 +210,27 @@ class PreparedDiffusionPagedAttentionBatch:
     _generation: int = field(repr=False, compare=False)
 
 
+@dataclass(frozen=True, slots=True)
+class DiffusionPagedAttentionContext:
+    """One layer's native inputs for an Omni paged-backend invocation."""
+
+    layer: DiffusionPagedAttentionLayerAdapter
+    query: torch.Tensor
+    key_write: torch.Tensor
+    value_write: torch.Tensor
+    slot_mapping: torch.Tensor
+    native_metadata: Any
+    query_token_shape: tuple[int, ...]
+    query_has_head_dims: bool
+
+    def restore_output(self, output: torch.Tensor) -> torch.Tensor:
+        if self.query_has_head_dims:
+            return output.reshape(*self.query_token_shape, self.layer.num_heads, self.layer.head_size_v)
+        return output.reshape(*self.query_token_shape, self.layer.num_heads * self.layer.head_size_v)
+
+
 class DiffusionPagedAttentionAdapter:
-    """Translate diffusion rows into vLLM metadata and execute native attention."""
+    """Translate diffusion rows into vLLM metadata for an Omni paged backend."""
 
     def __init__(
         self,
@@ -596,7 +594,7 @@ class DiffusionPagedAttentionAdapter:
             )
         return result
 
-    def forward(
+    def prepare_layer_context(
         self,
         layer_name: str,
         query: torch.Tensor,
@@ -604,7 +602,7 @@ class DiffusionPagedAttentionAdapter:
         value: torch.Tensor,
         *,
         omni_attn_metadata: Any | None = None,
-    ) -> torch.Tensor:
+    ) -> DiffusionPagedAttentionContext:
         if self._active_batch is None:
             raise RuntimeError("Paged attention forward must run inside adapter.activate(batch)")
         try:
@@ -682,16 +680,16 @@ class DiffusionPagedAttentionAdapter:
             native_metadata = batch.attn_metadata[layer_name]
         except KeyError as exc:
             raise KeyError(f"No native attention metadata was built for diffusion layer {layer_name!r}") from exc
-        layer.do_kv_cache_update(key_write, value_write, slot_mapping)
-        output = layer.forward_native(
-            query_flat.contiguous(),
-            key_write,
-            value_write,
-            native_metadata,
+        return DiffusionPagedAttentionContext(
+            layer=layer,
+            query=query_flat.contiguous(),
+            key_write=key_write,
+            value_write=value_write,
+            slot_mapping=slot_mapping,
+            native_metadata=native_metadata,
+            query_token_shape=query_token_shape,
+            query_has_head_dims=query_has_head_dims,
         )
-        if query_has_head_dims:
-            return output.reshape(*query_token_shape, layer.num_heads, layer.head_size_v)
-        return output.reshape(*query_token_shape, layer.num_heads * layer.head_size_v)
 
     @staticmethod
     def _validate_omni_attn_metadata(metadata: Any | None) -> None:

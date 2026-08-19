@@ -13,6 +13,7 @@ import torch
 from torch import nn
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.diffusion_kv import paged_attention_adapter as adapter_module
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
@@ -97,26 +98,39 @@ class _FakeLayer:
         self.updates: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         self.calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, object]] = []
         self.native_events: list[str] = []
+        self.layer_name = "layer-0"
+        self.kv_cache = object()
+        self.impl = _FakeNativeImpl(self)
+
+
+class _FakeNativeImpl:
+    def __init__(self, layer: _FakeLayer) -> None:
+        self.layer = layer
 
     def do_kv_cache_update(
         self,
+        _layer,
         key: torch.Tensor,
         value: torch.Tensor,
+        _kv_cache,
         slot_mapping: torch.Tensor,
     ) -> None:
-        self.native_events.append("update")
-        self.updates.append((key, value, slot_mapping))
+        self.layer.native_events.append("update")
+        self.layer.updates.append((key, value, slot_mapping))
 
-    def forward_native(
+    def forward(
         self,
+        _layer,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        _kv_cache,
         metadata: object,
+        output: torch.Tensor,
     ) -> torch.Tensor:
-        self.native_events.append("forward")
-        self.calls.append((query, key, value, metadata))
-        return query.reshape(query.shape[0], -1)
+        self.layer.native_events.append("forward")
+        self.layer.calls.append((query, key, value, metadata))
+        return output.copy_(query.reshape_as(output))
 
 
 def _make_adapter(
@@ -166,6 +180,16 @@ def _make_adapter(
     return adapter, block_tables, layer, events
 
 
+def _run_omni_paged_backend(context):
+    backend = FlashAttentionImpl(
+        num_heads=context.layer.num_heads,
+        head_size=context.layer.head_size,
+        softmax_scale=0.5,
+        num_kv_heads=context.layer.num_kv_heads,
+    )
+    return backend.forward_paged(context)
+
+
 def test_prepare_batch_reuses_native_block_table_and_metadata_builders(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, block_tables, _, events = _make_adapter(monkeypatch)
     rows = (
@@ -203,7 +227,9 @@ def test_prepare_batch_reuses_native_block_table_and_metadata_builders(monkeypat
     assert batch.slot_mappings_by_layer["layer-0"].tolist() == [4, 5, 6, 0, 1]
 
 
-def test_active_batch_runs_native_layer_and_restores_diffusion_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_omni_paged_backend_consumes_context_and_restores_diffusion_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     adapter, _, layer, _ = _make_adapter(monkeypatch)
     batch = adapter.prepare_batch(
         [
@@ -220,7 +246,8 @@ def test_active_batch_runs_native_layer_and_restores_diffusion_shape(monkeypatch
     value = torch.randn_like(query)
 
     with adapter.activate(batch):
-        output = adapter.forward("layer-0", query, key, value)
+        context = adapter.prepare_layer_context("layer-0", query, key, value)
+        output = _run_omni_paged_backend(context)
 
     assert output.shape == query.shape
     assert torch.equal(output, query)
@@ -247,14 +274,13 @@ def test_forward_extracts_non_aligned_suffix_from_full_kv(monkeypatch: pytest.Mo
     value = key + 100
 
     with adapter.activate(batch):
-        output = adapter.forward("layer-0", query, key, value)
+        context = adapter.prepare_layer_context("layer-0", query, key, value)
 
-    key_write, value_write, slot_mapping = layer.updates[0]
-    assert output.shape == query.shape
-    assert torch.equal(key_write, key[:, 3:5].reshape(2, 2, 4))
-    assert torch.equal(value_write, value[:, 3:5].reshape(2, 2, 4))
-    assert slot_mapping.tolist() == [3, 4]
-    assert layer.native_events == ["update", "forward"]
+    assert context.query.shape == (2, 2, 4)
+    assert torch.equal(context.key_write, key[:, 3:5].reshape(2, 2, 4))
+    assert torch.equal(context.value_write, value[:, 3:5].reshape(2, 2, 4))
+    assert context.slot_mapping.tolist() == [3, 4]
+    assert layer.native_events == []
 
 
 def test_forward_rejects_untranslated_omni_metadata_before_cache_write(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -266,7 +292,7 @@ def test_forward_rejects_untranslated_omni_metadata_before_cache_write(monkeypat
     metadata = SimpleNamespace(attn_mask=torch.ones(1, 1), extra={})
 
     with adapter.activate(batch), pytest.raises(NotImplementedError, match="cannot translate"):
-        adapter.forward("layer-0", qkv, qkv, qkv, omni_attn_metadata=metadata)
+        adapter.prepare_layer_context("layer-0", qkv, qkv, qkv, omni_attn_metadata=metadata)
 
     assert layer.updates == []
 
@@ -292,10 +318,10 @@ def test_forward_accepts_flattened_hidden_dimension(monkeypatch: pytest.MonkeyPa
     query = torch.randn(3, 8)
 
     with adapter.activate(batch):
-        output = adapter.forward("layer-0", query, query, query)
+        context = adapter.prepare_layer_context("layer-0", query, query, query)
 
-    assert output.shape == query.shape
-    assert torch.equal(output, query)
+    assert context.query.shape == (3, 2, 4)
+    assert context.restore_output(context.query).shape == query.shape
 
 
 def test_forward_requires_active_prepared_batch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -303,7 +329,7 @@ def test_forward_requires_active_prepared_batch(monkeypatch: pytest.MonkeyPatch)
     qkv = torch.randn(1, 2, 4)
 
     with pytest.raises(RuntimeError, match="adapter.activate"):
-        adapter.forward("layer-0", qkv, qkv, qkv)
+        adapter.prepare_layer_context("layer-0", qkv, qkv, qkv)
 
 
 def test_new_preparation_invalidates_native_buffer_views_in_older_batch(
@@ -363,7 +389,7 @@ def test_forward_rejects_tensor_count_different_from_prepared_batch(monkeypatch:
     qkv = torch.randn(2, 2, 4)
 
     with adapter.activate(batch), pytest.raises(ValueError, match="token count"):
-        adapter.forward("layer-0", qkv, qkv, qkv)
+        adapter.prepare_layer_context("layer-0", qkv, qkv, qkv)
 
 
 def test_forward_rejects_dtype_different_from_model_activation_dtype(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -374,7 +400,7 @@ def test_forward_rejects_dtype_different_from_model_activation_dtype(monkeypatch
     qkv = torch.randn(1, 2, 4, dtype=torch.float64)
 
     with adapter.activate(batch), pytest.raises(ValueError, match="model activation dtype"):
-        adapter.forward("layer-0", qkv, qkv, qkv)
+        adapter.prepare_layer_context("layer-0", qkv, qkv, qkv)
 
 
 def test_forward_rejects_invalid_key_token_count(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -386,7 +412,7 @@ def test_forward_rejects_invalid_key_token_count(monkeypatch: pytest.MonkeyPatch
     key = torch.randn(3, 2, 4)
 
     with adapter.activate(batch), pytest.raises(ValueError, match="must contain either"):
-        adapter.forward("layer-0", query, key, query)
+        adapter.prepare_layer_context("layer-0", query, key, query)
 
 
 def test_forward_rejects_batched_layout_that_does_not_match_rows(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -400,7 +426,7 @@ def test_forward_rejects_batched_layout_that_does_not_match_rows(monkeypatch: py
     qkv = torch.randn(2, 2, 2, 4)
 
     with adapter.activate(batch), pytest.raises(ValueError, match="must match prepared rows"):
-        adapter.forward("layer-0", qkv, qkv, qkv)
+        adapter.prepare_layer_context("layer-0", qkv, qkv, qkv)
 
 
 def test_forward_rejects_uniform_full_kv_for_nonuniform_row_lengths(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -427,7 +453,7 @@ def test_forward_rejects_uniform_full_kv_for_nonuniform_row_lengths(monkeypatch:
     full_kv = torch.randn(2, 4, 2, 4)
 
     with adapter.activate(batch), pytest.raises(ValueError, match="full-sequence layout does not match"):
-        adapter.forward("layer-0", query, full_kv, full_kv)
+        adapter.prepare_layer_context("layer-0", query, full_kv, full_kv)
 
 
 def test_causal_batch_rejects_non_suffix_write(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -444,7 +470,7 @@ def test_causal_batch_rejects_non_suffix_write(monkeypatch: pytest.MonkeyPatch) 
     qkv = torch.randn(2, 2, 4)
 
     with adapter.activate(batch), pytest.raises(ValueError, match="requires each query/write span to end"):
-        adapter.forward("layer-0", qkv, qkv, qkv)
+        adapter.prepare_layer_context("layer-0", qkv, qkv, qkv)
 
 
 def test_prepare_batch_rejects_native_decode_after_prefill_order(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -656,18 +682,25 @@ def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:
             return output + 4
 
     class Adapter:
-        def forward(self, layer_name, query, key, value, *, omni_attn_metadata):
-            events.append("kernel")
+        def prepare_layer_context(self, layer_name, query, key, value, *, omni_attn_metadata):
+            events.append("prepare")
             assert layer_name == "layer-0"
             assert omni_attn_metadata is None
             assert torch.equal(key, original + 2)
             assert torch.equal(value, original + 3)
-            return query * 2
+            return SimpleNamespace(query=query)
+
+    class Backend:
+        def forward_paged(self, context):
+            events.append("kernel")
+            return context.query * 2
 
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
     layer.prefix = "layer-0"
     layer.paged_kv_cache_role = "primary"
+    layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
+    layer.attention = Backend()
     layer.use_ring = False
     layer._no_parallel_strategy = object()
     layer._get_active_parallel_strategy = lambda: Strategy()
@@ -677,8 +710,30 @@ def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:
     with set_forward_context(), override_paged_kv_adapter(Adapter()):
         output = layer._forward_impl(original, original, original)
 
-    assert events == ["pre", "kernel", "post"]
+    assert events == ["pre", "prepare", "kernel", "post"]
     assert torch.equal(output, torch.full_like(original, 6))
+
+
+def test_omni_attention_rejects_paged_request_for_backend_without_paged_support() -> None:
+    class Adapter:
+        def prepare_layer_context(self, *args, **kwargs):
+            raise AssertionError("an unsupported backend must fail before adapter preparation")
+
+    layer = Attention.__new__(Attention)
+    nn.Module.__init__(layer)
+    layer.prefix = "layer-0"
+    layer.paged_kv_cache_role = "primary"
+    layer.attn_backend = SimpleNamespace(supports_paged_kv=False, get_name=lambda: "SDPA")
+    layer.use_ring = False
+    layer._no_parallel_strategy = object()
+    layer._get_active_parallel_strategy = lambda: layer._no_parallel_strategy
+
+    with (
+        set_forward_context(),
+        override_paged_kv_adapter(Adapter()),
+        pytest.raises(NotImplementedError, match="backend with paged support"),
+    ):
+        layer._forward_impl(torch.zeros(1, 2, 2, 4), torch.zeros(1, 2, 2, 4), torch.zeros(1, 2, 2, 4))
 
 
 def test_omni_attention_keeps_dense_kernel_without_active_adapter() -> None:

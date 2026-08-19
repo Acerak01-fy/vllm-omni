@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
 
+from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
     DiffusionPagedAttentionLayerAdapter,
@@ -154,8 +155,15 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
     query = torch.randn(19, _NUM_HEADS, _HEAD_SIZE, dtype=torch.float16, device=device)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
+    omni_backend = FlashAttentionImpl(
+        num_heads=_NUM_HEADS,
+        head_size=_HEAD_SIZE,
+        softmax_scale=diffusion_layer.softmax_scale,
+        num_kv_heads=_NUM_HEADS,
+    )
     with adapter.activate(prefix_batch):
-        prefix_output = adapter.forward(_LAYER_NAME, query[:17], key[:17], value[:17])
+        prefix_context = adapter.prepare_layer_context(_LAYER_NAME, query[:17], key[:17], value[:17])
+        prefix_output = omni_backend.forward_paged(prefix_context)
     prefix_slot_mappings = prefix_batch.slot_mappings.clone()
 
     suffix_batch = adapter.prepare_batch(
@@ -170,7 +178,8 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
         ]
     )
     with adapter.activate(suffix_batch):
-        suffix_output = adapter.forward(_LAYER_NAME, query[17:], key, value)
+        suffix_context = adapter.prepare_layer_context(_LAYER_NAME, query[17:], key, value)
+        suffix_output = omni_backend.forward_paged(suffix_context)
 
     prefix_reference = (
         F.scaled_dot_product_attention(

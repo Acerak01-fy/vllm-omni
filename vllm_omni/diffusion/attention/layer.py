@@ -322,6 +322,11 @@ class Attention(nn.Module):
         strategy = self._get_active_parallel_strategy()
         paged_adapter = self._active_paged_kv_adapter()
         use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
+        if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
+            raise NotImplementedError(
+                f"Diffusion paged KV requires an Omni backend with paged support; "
+                f"selected {self.attn_backend.get_name()}"
+            )
         if use_paged_attention and strategy is not self._no_parallel_strategy:
             strategy_name = strategy.name
             if self.use_ring or strategy_name == "ring":
@@ -338,20 +343,19 @@ class Attention(nn.Module):
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
 
-        # 2. Kernel Execution (Computation).  The Worker-side paged adapter is
-        # intentionally selected after ``pre_attention``: Ulysses must first
-        # perform its Q/K/V all-to-all, then the native FlashAttention kernel
-        # consumes the rank-local heads and global sequence metadata.  Ring is
-        # a separate distributed kernel and has no page-table contract yet.
+        # 2. Kernel execution stays inside the selected Omni backend.  The
+        # Worker adapter only prepares the native page-table context after
+        # SP has produced rank-local Q/K/V tensors.
         if use_paged_attention:
             assert paged_adapter is not None
-            out = paged_adapter.forward(
+            paged_kv_context = paged_adapter.prepare_layer_context(
                 self.prefix,
                 query,
                 key,
                 value,
                 omni_attn_metadata=attn_metadata,
             )
+            out = self.attention.forward_paged(paged_kv_context)
         else:
             attn_metadata = self._with_kv_cache_dtype(attn_metadata)
             if self.use_ring and strategy is not self._no_parallel_strategy:
