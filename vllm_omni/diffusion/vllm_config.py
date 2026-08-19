@@ -90,6 +90,9 @@ class _DiffusionVllmModelConfig:
     _attention_num_kv_heads: int | None = field(default=None, init=False, repr=False)
     _attention_head_size: int | None = field(default=None, init=False, repr=False)
 
+    # Needed for models that bundle things like LogitsProcessors, e.g., SenseNova
+    head_dtype: torch.dtype | None = None
+
     @property
     def is_quantized(self) -> bool:
         return self.quantization is not None
