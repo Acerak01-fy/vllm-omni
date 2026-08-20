@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 from contextlib import nullcontext
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -88,6 +89,16 @@ class _FakeAttentionGroup:
         return self.builder
 
 
+@dataclass(frozen=True, slots=True)
+class _FakeNativeMetadata:
+    build_id: int
+    causal: bool
+    seq_lens: torch.Tensor
+    query_start_loc_cpu: torch.Tensor
+    positions: torch.Tensor
+    slot_mappings: torch.Tensor
+
+
 class _FakeLayer:
     def __init__(self, *, non_causal: bool) -> None:
         self.num_heads = 2
@@ -155,8 +166,16 @@ def _make_adapter(
     monkeypatch.setattr(adapter_module, "set_current_vllm_config", lambda _config: nullcontext())
 
     def build_metadata(**kwargs):
-        events.append(("build", kwargs))
-        return {"layer-0": "native-metadata"}
+        metadata = _FakeNativeMetadata(
+            build_id=len(events),
+            causal=kwargs["causal"],
+            seq_lens=kwargs["seq_lens"].clone(),
+            query_start_loc_cpu=kwargs["query_start_loc_cpu"].clone(),
+            positions=kwargs["positions"].clone(),
+            slot_mappings=kwargs["slot_mappings"].clone(),
+        )
+        events.append(("build", kwargs, metadata))
+        return {"layer-0": metadata}
 
     monkeypatch.setattr(adapter_module.current_omni_platform, "build_diffusion_kv_attn_metadata", build_metadata)
     monkeypatch.setattr(
@@ -224,14 +243,15 @@ def test_prepare_batch_reuses_native_block_table_and_metadata_builders(monkeypat
     assert build_kwargs["max_query_len"] == 3
     assert build_kwargs["max_seq_len"] == 8
     assert build_kwargs["positions"] is batch.positions
-    assert batch.attn_metadata == {"layer-0": "native-metadata"}
+    assert batch.attn_metadata["layer-0"] is events[0][2]
+    assert events[0][2].build_id == 0
     assert batch.slot_mappings_by_layer["layer-0"].tolist() == [4, 5, 6, 0, 1]
 
 
 def test_omni_paged_backend_consumes_context_and_restores_diffusion_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    adapter, _, layer, _ = _make_adapter(monkeypatch)
+    adapter, _, layer, events = _make_adapter(monkeypatch)
     batch = adapter.prepare_batch(
         [
             DiffusionPagedAttentionRow(
@@ -254,7 +274,7 @@ def test_omni_paged_backend_consumes_context_and_restores_diffusion_shape(
     assert torch.equal(output, query)
     assert layer.calls[0][0].shape == (5, 2, 4)
     assert layer.native_events == ["update", "forward"]
-    assert layer.calls[0][3] == "native-metadata"
+    assert layer.calls[0][3] is events[0][2]
 
 
 def test_omni_paged_backend_defers_backend_owned_cache_update(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -274,6 +294,40 @@ def test_omni_paged_backend_defers_backend_owned_cache_update(monkeypatch: pytes
     assert layer.updates == []
 
 
+def test_omni_piecewise_backend_defers_backend_owned_cache_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, layer, events = _make_adapter(monkeypatch)
+    layer.attn_backend.forward_includes_kv_cache_update = True
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=4, seq_len=4)]
+    )
+    qkv = torch.randn(1, 4, 2, 4)
+    metadata = SimpleNamespace(full_attn_spans=[[(1, 3)]], extra={})
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context(
+            "layer-0",
+            qkv,
+            qkv,
+            qkv,
+            omni_attn_metadata=metadata,
+        )
+        output = _run_omni_paged_backend(context)
+
+    assert torch.equal(output, qkv)
+    assert layer.native_events == ["forward", "forward", "forward"]
+    assert layer.updates == []
+    assert [call[0].shape[0] for call in layer.calls] == [1, 2, 1]
+    assert [call[1].shape[0] for call in layer.calls] == [1, 2, 1]
+    assert [call[2].shape[0] for call in layer.calls] == [1, 2, 1]
+    assert all(call[3] is event[2] for call, event in zip(layer.calls, events[1:], strict=True))
+    segment_metadata = [call[3] for call in layer.calls]
+    assert [metadata.causal for metadata in segment_metadata] == [True, False, True]
+    assert [metadata.seq_lens.tolist() for metadata in segment_metadata] == [[1], [3], [4]]
+    assert [metadata.query_start_loc_cpu.tolist() for metadata in segment_metadata] == [[0, 1], [0, 2], [0, 1]]
+    assert [metadata.positions.tolist() for metadata in segment_metadata] == [[0], [1, 2], [3]]
+    assert [metadata.slot_mappings.tolist() for metadata in segment_metadata] == [[[0]], [[1, 2]], [[3]]]
+
+
 def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, layer, events = _make_adapter(monkeypatch)
     batch = adapter.prepare_batch(
@@ -282,24 +336,26 @@ def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.
                 request_id="req-0",
                 sequence_id=0,
                 query_len=6,
-                seq_len=6,
+                seq_len=9,
+                kv_start_pos=3,
             ),
             DiffusionPagedAttentionRow(
                 request_id="req-1",
                 sequence_id=1,
                 query_len=6,
-                seq_len=6,
+                seq_len=9,
+                kv_start_pos=3,
             ),
         ]
     )
     query = torch.arange(2 * 6 * 2 * 4, dtype=torch.float32).reshape(2, 6, 2, 4)
-    key = query + 100
-    value = query + 200
-    attn_mask = torch.ones(6, 6, dtype=torch.bool).tril().repeat(2, 1, 1)
-    attn_mask[:, 2:5, 2:5] = True
+    key = torch.arange(2 * 9 * 2 * 4, dtype=torch.float32).reshape(2, 9, 2, 4) + 100
+    value = key + 100
+    attn_mask = torch.ones(9, 9, dtype=torch.bool).tril().repeat(2, 1, 1)
+    attn_mask[:, 5:8, 5:8] = True
     metadata = SimpleNamespace(
         attn_mask=attn_mask.unsqueeze(1),
-        full_attn_spans=[[(2, 5)], [(2, 5)]],
+        full_attn_spans=[[(5, 8)], [(5, 8)]],
         query_ranges=None,
         extra={},
     )
@@ -327,24 +383,46 @@ def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.
     assert layer.native_events == ["update", "forward", "forward", "forward"]
     assert len(layer.updates) == 1
     assert layer.updates[0][0].shape[0] == 12
+    assert torch.equal(layer.updates[0][0], key[:, 3:9].reshape(12, 2, 4))
+    assert torch.equal(layer.updates[0][1], value[:, 3:9].reshape(12, 2, 4))
     assert [call[0].shape[0] for call in layer.calls] == [4, 6, 2]
     assert [call[1].shape[0] for call in layer.calls] == [4, 6, 2]
     assert [call[2].shape[0] for call in layer.calls] == [4, 6, 2]
+    assert all(call[3] is event[2] for call, event in zip(layer.calls, events[1:], strict=True))
+    assert [metadata.build_id for metadata in context.piecewise_native_metadata] == [1, 2, 3]
 
     # The first metadata build is the normal whole-query path. Piecewise calls
-    # then use causal [0, 2), full [2, 5), and causal [5, 6) segments.
+    # then use causal [3, 5), full [5, 8), and causal [8, 9) segments.
     assert len(events) == 4
     segment_builds = [event[1] for event in events[1:]]
     assert [build["causal"] for build in segment_builds] == [True, False, True]
     assert [build["seq_lens"].tolist() for build in segment_builds] == [
-        [2, 2],
         [5, 5],
-        [6, 6],
+        [8, 8],
+        [9, 9],
     ]
     assert [build["query_start_loc_cpu"].tolist() for build in segment_builds] == [
         [0, 2, 4],
         [0, 3, 6],
         [0, 1, 2],
+    ]
+    segment_metadata = [call[3] for call in layer.calls]
+    assert [metadata.causal for metadata in segment_metadata] == [True, False, True]
+    assert [metadata.seq_lens.tolist() for metadata in segment_metadata] == [[5, 5], [8, 8], [9, 9]]
+    assert [metadata.query_start_loc_cpu.tolist() for metadata in segment_metadata] == [
+        [0, 2, 4],
+        [0, 3, 6],
+        [0, 1, 2],
+    ]
+    assert [metadata.positions.tolist() for metadata in segment_metadata] == [
+        [3, 4, 3, 4],
+        [5, 6, 7, 5, 6, 7],
+        [8, 8],
+    ]
+    assert [metadata.slot_mappings.tolist() for metadata in segment_metadata] == [
+        [[3, 4, 3, 4]],
+        [[5, 6, 7, 5, 6, 7]],
+        [[8, 8]],
     ]
 
 

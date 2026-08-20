@@ -15,6 +15,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
+    run_paged_piecewise_plan,
 )
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.platforms import current_omni_platform
@@ -296,23 +297,15 @@ class FlashAttentionImpl(AttentionImpl):
                 output,
             )
 
-        if paged_kv_context.piecewise_segments:
-            output = torch.empty(
-                (paged_kv_context.query.shape[0], layer.num_heads, layer.head_size_v),
-                dtype=paged_kv_context.query.dtype,
-                device=paged_kv_context.query.device,
+        if paged_kv_context.piecewise_plan is not None:
+            output = run_paged_piecewise_plan(
+                paged_kv_context.query,
+                paged_kv_context.key_write,
+                paged_kv_context.value_write,
+                paged_kv_context.piecewise_plan,
+                paged_kv_context.piecewise_native_metadata,
+                run_native_attention,
             )
-            for segment in paged_kv_context.piecewise_segments:
-                segment_query = paged_kv_context.query.index_select(0, segment.query_indices)
-                segment_key = paged_kv_context.key_write.index_select(0, segment.query_indices)
-                segment_value = paged_kv_context.value_write.index_select(0, segment.query_indices)
-                segment_output = run_native_attention(
-                    segment_query,
-                    segment_key,
-                    segment_value,
-                    segment.native_metadata,
-                )
-                output.index_copy_(0, segment.query_indices, segment_output)
         else:
             output = run_native_attention(
                 paged_kv_context.query,
