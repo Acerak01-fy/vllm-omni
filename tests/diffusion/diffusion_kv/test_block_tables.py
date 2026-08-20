@@ -258,7 +258,11 @@ def _install_native_modules(monkeypatch: pytest.MonkeyPatch, events: list[tuple]
 
     monkeypatch.setattr(model_runner_backend_module, "init_attn_backend", init_backend)
     monkeypatch.setattr(model_runner_backend_module, "init_kv_cache", init_cache)
-    monkeypatch.setattr(model_runner_backend_module, "BlockTables", _FakeBlockTables)
+    monkeypatch.setattr(
+        model_runner_backend_module.current_omni_platform,
+        "get_diffusion_kv_block_tables_cls",
+        lambda: _FakeBlockTables,
+    )
     monkeypatch.setattr(native_block_table, "get_block_table_width", get_block_table_width, raising=False)
 
 

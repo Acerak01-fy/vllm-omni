@@ -17,11 +17,12 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
-from vllm.v1.worker.gpu.attn_utils import build_attn_metadata, build_slot_mappings_by_layer
+from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import Segment, build_segments
 from vllm_omni.diffusion.forward_context import override_paged_kv_adapter
+from vllm_omni.platforms import current_omni_platform
 
 
 @dataclass(frozen=True)
@@ -45,7 +46,7 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
     latter owns a second execution path and would bypass Omni's sequence
     parallel pre/post hooks.  The wrapper only supplies the small
     ``AttentionLayerBase`` contract needed by ``init_attn_backend`` and keeps
-    the native FlashAttention implementation/cache view available to the
+    the platform-native attention implementation/cache view available to the
     diffusion adapter.
     """
 
@@ -80,6 +81,9 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         previous_backend = attention_config.backend
         previous_backend_per_kind = attention_config.backend_per_kind
         try:
+            # This is a portable vLLM backend request. The active platform
+            # resolves it to its native implementation, such as FlashAttention
+            # on CUDA or AscendAttentionBackend on NPU.
             attention_config.backend = AttentionBackendEnum.FLASH_ATTN
             attention_config.backend_per_kind = {}
             with set_current_vllm_config(vllm_config):
@@ -93,10 +97,6 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         finally:
             attention_config.backend = previous_backend
             attention_config.backend_per_kind = previous_backend_per_kind
-        if attn_backend.get_name() != "FLASH_ATTN":
-            raise RuntimeError(
-                f"Diffusion paged attention requires vLLM's FLASH_ATTN backend; selected {attn_backend.get_name()!r}"
-            )
         canonical_spec = replace(
             spec,
             num_kv_heads=num_kv_heads,
@@ -110,18 +110,21 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         self.head_size_v = int(getattr(canonical_spec, "head_size_v", canonical_spec.head_size))
         if self.head_size_v != self.head_size:
             raise ValueError(
-                "Diffusion paged FlashAttention requires equal key/value head sizes; "
+                "Diffusion native paged attention requires equal key/value head sizes; "
                 f"got head_size={self.head_size}, head_size_v={self.head_size_v}"
             )
         self.softmax_scale = float(layer.softmax_scale)
         self.attn_backend = attn_backend
         self.kv_cache: torch.Tensor | None = None
-        # Native FlashAttention uses these fields for KV cache quantization.
-        # They are harmless for the normal (unquantized) path and avoid making
-        # the adapter depend on the concrete vLLM Attention module.
+        # Native attention backends consume either device tensors or host
+        # scalar copies of these scales. The paged diffusion path is currently
+        # unquantized, so initialize both contracts to identity.
         self._q_scale = torch.ones(1, device=device, dtype=torch.float32)
         self._k_scale = torch.ones(1, device=device, dtype=torch.float32)
         self._v_scale = torch.ones(1, device=device, dtype=torch.float32)
+        self._q_scale_float = 1.0
+        self._k_scale_float = 1.0
+        self._v_scale_float = 1.0
         with set_current_vllm_config(vllm_config):
             self.impl = self._create_native_impl(vllm_config)
 
@@ -142,8 +145,18 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
             attn_type=AttentionType.DECODER,
             kv_sharing_target_layer_name=None,
         )
-        if getattr(impl, "vllm_flash_attn_version", None) is None:
-            raise RuntimeError(f"FlashAttention paged-KV kernel is unavailable for diffusion layer {self.layer_name!r}")
+        if not callable(getattr(impl, "forward", None)):
+            raise RuntimeError(
+                f"Native paged-attention backend {self.attn_backend.get_name()!r} has no forward implementation"
+            )
+        if not self.attn_backend.forward_includes_kv_cache_update and not callable(
+            getattr(impl, "do_kv_cache_update", None)
+        ):
+            raise RuntimeError(
+                f"Native paged-attention backend {self.attn_backend.get_name()!r} cannot update the KV cache"
+            )
+        if hasattr(impl, "vllm_flash_attn_version") and impl.vllm_flash_attn_version is None:
+            raise RuntimeError(f"Native paged-attention kernel is unavailable for diffusion layer {self.layer_name!r}")
         return impl
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> AttentionSpec:
@@ -370,7 +383,7 @@ class DiffusionPagedAttentionAdapter:
                 cp_kv_cache_interleave_size=self.block_tables.cp_interleave,
             )
         with set_current_vllm_config(self.vllm_config):
-            return build_attn_metadata(
+            return current_omni_platform.build_diffusion_kv_attn_metadata(
                 attn_groups=self.attn_groups,
                 num_reqs=len(query_lens),
                 num_tokens=sum(query_lens),
@@ -382,6 +395,7 @@ class DiffusionPagedAttentionAdapter:
                 block_tables=block_tables,
                 slot_mappings=slot_mappings,
                 kv_cache_config=self.kv_cache_config,
+                seq_lens_cpu=seq_lens_cpu,
                 seq_lens_cpu_upper_bound=seq_lens_cpu,
                 dcp_local_seq_lens=dcp_local_seq_lens,
                 positions=positions,

@@ -26,6 +26,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRowBinding,
     PreparedDiffusionPagedAttentionBatch,
 )
+from vllm_omni.platforms import current_omni_platform
 
 DiffusionKVIdentity = tuple[str, int | None, str | None]
 DiffusionKVSnapshot = tuple[object, ...]
@@ -251,7 +252,8 @@ class DiffusionKVModelRunnerBackend:
                     self.vllm_config,
                     self.device,
                 )
-                block_tables = BlockTables(
+                block_tables_cls = current_omni_platform.get_diffusion_kv_block_tables_cls()
+                block_tables = block_tables_cls(
                     block_sizes=block_sizes,
                     max_num_reqs=max_num_reqs,
                     max_num_batched_tokens=max_num_batched_tokens,

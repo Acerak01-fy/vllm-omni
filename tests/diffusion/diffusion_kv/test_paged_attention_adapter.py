@@ -100,6 +100,7 @@ class _FakeLayer:
         self.native_events: list[str] = []
         self.layer_name = "layer-0"
         self.kv_cache = object()
+        self.attn_backend = SimpleNamespace(forward_includes_kv_cache_update=False)
         self.impl = _FakeNativeImpl(self)
 
 
@@ -157,7 +158,7 @@ def _make_adapter(
         events.append(("build", kwargs))
         return {"layer-0": "native-metadata"}
 
-    monkeypatch.setattr(adapter_module, "build_attn_metadata", build_metadata)
+    monkeypatch.setattr(adapter_module.current_omni_platform, "build_diffusion_kv_attn_metadata", build_metadata)
     monkeypatch.setattr(
         adapter_module,
         "build_slot_mappings_by_layer",
@@ -254,6 +255,23 @@ def test_omni_paged_backend_consumes_context_and_restores_diffusion_shape(
     assert layer.calls[0][0].shape == (5, 2, 4)
     assert layer.native_events == ["update", "forward"]
     assert layer.calls[0][3] == "native-metadata"
+
+
+def test_omni_paged_backend_defers_backend_owned_cache_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, layer, _ = _make_adapter(monkeypatch)
+    layer.attn_backend.forward_includes_kv_cache_update = True
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=3, seq_len=3)]
+    )
+    qkv = torch.randn(1, 3, 2, 4)
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context("layer-0", qkv, qkv, qkv)
+        output = _run_omni_paged_backend(context)
+
+    assert torch.equal(output, qkv)
+    assert layer.native_events == ["forward"]
+    assert layer.updates == []
 
 
 def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -797,13 +815,16 @@ def test_row_contract_rejects_invalid_identity_or_span(kwargs: dict, message: st
         DiffusionPagedAttentionRow(**values)
 
 
-def test_layer_adapter_forces_flash_attention_and_uses_rank_local_heads(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     selected_backends = []
-    impl_cls = Mock(return_value=SimpleNamespace(vllm_flash_attn_version=3))
-    flash_backend = SimpleNamespace(
-        get_name=lambda: "FLASH_ATTN",
+    impl_cls = Mock(return_value=SimpleNamespace(forward=Mock()))
+    native_backend = SimpleNamespace(
+        get_name=lambda: "ASCEND",
         indexes_kv_by_block_stride=lambda: True,
         get_impl_cls=lambda: impl_cls,
+        forward_includes_kv_cache_update=True,
     )
 
     original_backend_per_kind = {"full": object()}
@@ -815,7 +836,7 @@ def test_layer_adapter_forces_flash_attention_and_uses_rank_local_heads(monkeypa
 
     def select_backend(**_kwargs):
         selected_backends.append((config.attention_config.backend, config.attention_config.backend_per_kind))
-        return flash_backend
+        return native_backend
 
     monkeypatch.setattr(adapter_module, "get_attn_backend", select_backend)
     monkeypatch.setattr(adapter_module, "set_current_vllm_config", lambda _config: nullcontext())
@@ -844,6 +865,9 @@ def test_layer_adapter_forces_flash_attention_and_uses_rank_local_heads(monkeypa
     assert native_layer.num_kv_heads == 2
     assert native_layer.spec.num_kv_heads == 2
     assert native_layer.spec.indexes_kv_by_block_stride is True
+    assert native_layer._q_scale_float == 1.0
+    assert native_layer._k_scale_float == 1.0
+    assert native_layer._v_scale_float == 1.0
     impl_kwargs = impl_cls.call_args.kwargs
     assert impl_kwargs["num_heads"] == 4
     assert impl_kwargs["num_kv_heads"] == 2

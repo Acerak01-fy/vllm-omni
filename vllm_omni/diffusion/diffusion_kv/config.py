@@ -36,15 +36,6 @@ def parse_diffusion_kv_cache_mode(value: object) -> DiffusionKVCacheMode:
             "Diffusion KV diffusion_kv_mode 'paged_worker_local' is reserved but not implemented; "
             "use 'dense_legacy' or 'paged_scheduler'"
         )
-    if mode is DiffusionKVCacheMode.PAGED_SCHEDULER:
-        # Native BlockTables and attention execution are validated only on CUDA.
-        from vllm_omni.platforms import current_omni_platform
-
-        if not current_omni_platform.is_cuda():
-            raise ValueError(
-                "paged_scheduler Diffusion KV is currently supported only on CUDA; "
-                f"current platform is {current_omni_platform.device_type}"
-            )
     return mode
 
 

@@ -248,7 +248,7 @@ class FlashAttentionImpl(AttentionImpl):
         return out.reshape(batch_size, q_len, *out.shape[1:])
 
     def forward_paged(self, paged_kv_context) -> torch.Tensor:
-        """Run vLLM's paged kernel through the Omni FlashAttention backend.
+        """Run platform-native paged attention through the Omni backend.
 
         ``DiffusionPagedAttentionAdapter`` owns BlockTables and prepares the
         rank-local native cache context.  The adapter no longer performs the
@@ -266,13 +266,14 @@ class FlashAttentionImpl(AttentionImpl):
         native_impl = getattr(layer, "impl", None)
         if native_impl is None:
             raise RuntimeError(f"Native attention implementation is not bound for diffusion layer {layer.layer_name!r}")
-        native_impl.do_kv_cache_update(
-            layer,
-            paged_kv_context.key_write,
-            paged_kv_context.value_write,
-            kv_cache,
-            paged_kv_context.slot_mapping,
-        )
+        if not layer.attn_backend.forward_includes_kv_cache_update:
+            native_impl.do_kv_cache_update(
+                layer,
+                paged_kv_context.key_write,
+                paged_kv_context.value_write,
+                kv_cache,
+                paged_kv_context.slot_mapping,
+            )
 
         def run_native_attention(
             query: torch.Tensor,
