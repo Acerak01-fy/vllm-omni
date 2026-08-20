@@ -256,6 +256,250 @@ def test_omni_paged_backend_consumes_context_and_restores_diffusion_shape(
     assert layer.calls[0][3] == "native-metadata"
 
 
+def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, layer, events = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [
+            DiffusionPagedAttentionRow(
+                request_id="req-0",
+                sequence_id=0,
+                query_len=6,
+                seq_len=6,
+            ),
+            DiffusionPagedAttentionRow(
+                request_id="req-1",
+                sequence_id=1,
+                query_len=6,
+                seq_len=6,
+            ),
+        ]
+    )
+    query = torch.arange(2 * 6 * 2 * 4, dtype=torch.float32).reshape(2, 6, 2, 4)
+    key = query + 100
+    value = query + 200
+    attn_mask = torch.ones(6, 6, dtype=torch.bool).tril().repeat(2, 1, 1)
+    attn_mask[:, 2:5, 2:5] = True
+    metadata = SimpleNamespace(
+        attn_mask=attn_mask.unsqueeze(1),
+        full_attn_spans=[[(2, 5)], [(2, 5)]],
+        query_ranges=None,
+        extra={},
+    )
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context(
+            "layer-0",
+            query,
+            key,
+            value,
+            omni_attn_metadata=metadata,
+        )
+        # Every model layer sees the same spans, so the native segment metadata
+        # is built once per active batch and then reused.
+        adapter.prepare_layer_context(
+            "layer-0",
+            query,
+            key,
+            value,
+            omni_attn_metadata=metadata,
+        )
+        output = _run_omni_paged_backend(context)
+
+    assert torch.equal(output, query)
+    assert layer.native_events == ["update", "forward", "forward", "forward"]
+    assert len(layer.updates) == 1
+    assert layer.updates[0][0].shape[0] == 12
+    assert [call[0].shape[0] for call in layer.calls] == [4, 6, 2]
+    assert [call[1].shape[0] for call in layer.calls] == [4, 6, 2]
+    assert [call[2].shape[0] for call in layer.calls] == [4, 6, 2]
+
+    # The first metadata build is the normal whole-query path. Piecewise calls
+    # then use causal [0, 2), full [2, 5), and causal [5, 6) segments.
+    assert len(events) == 4
+    segment_builds = [event[1] for event in events[1:]]
+    assert [build["causal"] for build in segment_builds] == [True, False, True]
+    assert [build["seq_lens"].tolist() for build in segment_builds] == [
+        [2, 2],
+        [5, 5],
+        [6, 6],
+    ]
+    assert [build["query_start_loc_cpu"].tolist() for build in segment_builds] == [
+        [0, 2, 4],
+        [0, 3, 6],
+        [0, 1, 2],
+    ]
+
+
+def test_omni_paged_backend_treats_empty_full_spans_as_causal(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, layer, events = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=4, seq_len=4)]
+    )
+    qkv = torch.randn(1, 4, 2, 4)
+    metadata = SimpleNamespace(
+        attn_mask=torch.ones(1, 1, 4, 4, dtype=torch.bool).tril(),
+        full_attn_spans=[[]],
+        query_ranges=None,
+        extra={},
+    )
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context(
+            "layer-0",
+            qkv,
+            qkv,
+            qkv,
+            omni_attn_metadata=metadata,
+        )
+        output = _run_omni_paged_backend(context)
+
+    assert torch.equal(output, qkv)
+    assert layer.native_events == ["update", "forward"]
+    assert len(events) == 2
+    assert events[1][1]["causal"] is True
+    assert events[1][1]["seq_lens"].tolist() == [4]
+
+
+def test_forward_rejects_heterogeneous_piecewise_spans_before_cache_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, layer, _ = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [
+            DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=4, seq_len=4),
+            DiffusionPagedAttentionRow(request_id="req-1", sequence_id=1, query_len=4, seq_len=4),
+        ]
+    )
+    qkv = torch.randn(2, 4, 2, 4)
+    metadata = SimpleNamespace(
+        attn_mask=torch.ones(2, 1, 4, 4, dtype=torch.bool),
+        full_attn_spans=[[(1, 3)], [(2, 4)]],
+        query_ranges=None,
+        extra={},
+    )
+
+    with adapter.activate(batch), pytest.raises(ValueError, match="requires homogeneous batch"):
+        adapter.prepare_layer_context(
+            "layer-0",
+            qkv,
+            qkv,
+            qkv,
+            omni_attn_metadata=metadata,
+        )
+
+    assert layer.native_events == []
+
+
+@pytest.mark.parametrize(
+    ("spans", "message"),
+    [
+        ([(1, 3), (2, 4)], "sorted and non-overlapping"),
+        ([(1, 5)], "exceeds.*seq_len=4"),
+    ],
+)
+def test_forward_rejects_invalid_piecewise_spans_before_cache_write(
+    monkeypatch: pytest.MonkeyPatch,
+    spans: list[tuple[int, int]],
+    message: str,
+) -> None:
+    adapter, _, layer, _ = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=4, seq_len=4)]
+    )
+    qkv = torch.randn(1, 4, 2, 4)
+    metadata = SimpleNamespace(full_attn_spans=[spans], extra={})
+
+    with adapter.activate(batch), pytest.raises(ValueError, match=message):
+        adapter.prepare_layer_context(
+            "layer-0",
+            qkv,
+            qkv,
+            qkv,
+            omni_attn_metadata=metadata,
+        )
+
+    assert layer.native_events == []
+
+
+def test_forward_rejects_non_4d_mask_with_piecewise_spans_before_cache_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, layer, _ = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=4, seq_len=4)]
+    )
+    qkv = torch.randn(1, 4, 2, 4)
+    metadata = SimpleNamespace(
+        attn_mask=torch.ones(1, 4, 4, dtype=torch.bool),
+        full_attn_spans=[[(1, 3)]],
+        extra={},
+    )
+
+    with adapter.activate(batch), pytest.raises(NotImplementedError, match="requires a 4D tensor"):
+        adapter.prepare_layer_context(
+            "layer-0",
+            qkv,
+            qkv,
+            qkv,
+            omni_attn_metadata=metadata,
+        )
+
+    assert layer.native_events == []
+
+
+def test_forward_rejects_piecewise_query_ranges_before_cache_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, layer, _ = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=4, seq_len=4)]
+    )
+    qkv = torch.randn(1, 4, 2, 4)
+    metadata = SimpleNamespace(
+        attn_mask=torch.ones(1, 1, 4, 4, dtype=torch.bool),
+        full_attn_spans=[[(1, 3)]],
+        query_ranges=(object(),),
+        extra={},
+    )
+
+    with adapter.activate(batch), pytest.raises(NotImplementedError, match="query_ranges"):
+        adapter.prepare_layer_context(
+            "layer-0",
+            qkv,
+            qkv,
+            qkv,
+            omni_attn_metadata=metadata,
+        )
+
+    assert layer.native_events == []
+
+
+def test_forward_rejects_piecewise_non_suffix_query_before_cache_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, layer, _ = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [
+            DiffusionPagedAttentionRow(
+                request_id="req-0",
+                sequence_id=0,
+                query_len=2,
+                seq_len=6,
+                kv_start_pos=2,
+            )
+        ]
+    )
+    qkv = torch.randn(1, 2, 2, 4)
+    metadata = SimpleNamespace(full_attn_spans=[[(2, 4)]], extra={})
+
+    with adapter.activate(batch), pytest.raises(ValueError, match="requires each query/write span to end"):
+        adapter.prepare_layer_context(
+            "layer-0",
+            qkv,
+            qkv,
+            qkv,
+            omni_attn_metadata=metadata,
+        )
+
+    assert layer.native_events == []
+
+
 def test_forward_extracts_non_aligned_suffix_from_full_kv(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, layer, _ = _make_adapter(monkeypatch)
     batch = adapter.prepare_batch(

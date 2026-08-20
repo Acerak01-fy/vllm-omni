@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata, build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 
+from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import Segment, build_segments
 from vllm_omni.diffusion.forward_context import override_paged_kv_adapter
 
 
@@ -206,6 +207,14 @@ class PreparedDiffusionPagedAttentionBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class DiffusionPagedAttentionSegmentContext:
+    """One piecewise query selection and its native attention metadata."""
+
+    query_indices: torch.Tensor
+    native_metadata: Any
+
+
+@dataclass(frozen=True, slots=True)
 class DiffusionPagedAttentionContext:
     """One layer's native inputs for an Omni paged-backend invocation."""
 
@@ -215,6 +224,7 @@ class DiffusionPagedAttentionContext:
     value_write: torch.Tensor
     slot_mapping: torch.Tensor
     native_metadata: Any
+    piecewise_segments: tuple[DiffusionPagedAttentionSegmentContext, ...]
     query_token_shape: tuple[int, ...]
     query_has_head_dims: bool
 
@@ -222,6 +232,18 @@ class DiffusionPagedAttentionContext:
         if self.query_has_head_dims:
             return output.reshape(*self.query_token_shape, self.layer.num_heads, self.layer.head_size_v)
         return output.reshape(*self.query_token_shape, self.layer.num_heads * self.layer.head_size_v)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedDiffusionPiecewiseSegment:
+    query_indices: torch.Tensor
+    attn_metadata: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedDiffusionPiecewisePlan:
+    spans: tuple[tuple[tuple[int, int], ...], ...]
+    segments: tuple[_PreparedDiffusionPiecewiseSegment, ...]
 
 
 class DiffusionPagedAttentionAdapter:
@@ -255,6 +277,7 @@ class DiffusionPagedAttentionAdapter:
         self._owner = object()
         self._prepare_generation = 0
         self._active_batch: PreparedDiffusionPagedAttentionBatch | None = None
+        self._active_piecewise_plan: _PreparedDiffusionPiecewisePlan | None = None
         self._causal_by_group = self._resolve_group_causality()
         self._reorder_batch_threshold = self._resolve_reorder_batch_threshold()
 
@@ -325,6 +348,46 @@ class DiffusionPagedAttentionAdapter:
                         f"row contains only {installed_kernel_blocks // block_multiplier} blocks"
                     )
 
+    def _build_native_metadata(
+        self,
+        *,
+        query_lens: Sequence[int],
+        query_start_loc: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        positions: torch.Tensor,
+        block_tables: Sequence[torch.Tensor],
+        slot_mappings: torch.Tensor,
+        causal: bool | Mapping[int, bool],
+    ) -> dict[str, Any]:
+        dcp_local_seq_lens = None
+        if self.block_tables.cp_size > 1:
+            dcp_local_seq_lens = get_dcp_local_seq_lens(
+                seq_lens,
+                dcp_size=self.block_tables.cp_size,
+                dcp_rank=self.block_tables.cp_rank,
+                cp_kv_cache_interleave_size=self.block_tables.cp_interleave,
+            )
+        with set_current_vllm_config(self.vllm_config):
+            return build_attn_metadata(
+                attn_groups=self.attn_groups,
+                num_reqs=len(query_lens),
+                num_tokens=sum(query_lens),
+                query_start_loc_gpu=query_start_loc,
+                query_start_loc_cpu=query_start_loc_cpu,
+                max_query_len=max(query_lens),
+                seq_lens=seq_lens,
+                max_seq_len=max(int(seq_len) for seq_len in seq_lens_cpu),
+                block_tables=block_tables,
+                slot_mappings=slot_mappings,
+                kv_cache_config=self.kv_cache_config,
+                seq_lens_cpu_upper_bound=seq_lens_cpu,
+                dcp_local_seq_lens=dcp_local_seq_lens,
+                positions=positions,
+                causal=causal,
+            )
+
     def prepare_batch(
         self,
         rows: Sequence[DiffusionPagedAttentionRow],
@@ -380,14 +443,6 @@ class DiffusionPagedAttentionAdapter:
         query_start_loc = query_start_loc_cpu.to(self.device)
         seq_lens_cpu = torch.tensor([row.seq_len for row in rows], dtype=torch.int32)
         seq_lens = seq_lens_cpu.to(self.device)
-        dcp_local_seq_lens = None
-        if self.block_tables.cp_size > 1:
-            dcp_local_seq_lens = get_dcp_local_seq_lens(
-                seq_lens,
-                dcp_size=self.block_tables.cp_size,
-                dcp_rank=self.block_tables.cp_rank,
-                cp_kv_cache_interleave_size=self.block_tables.cp_interleave,
-            )
         positions = torch.cat(
             [
                 torch.arange(
@@ -413,24 +468,17 @@ class DiffusionPagedAttentionAdapter:
         causal: bool | Mapping[int, bool]
         causal_values = set(self._causal_by_group.values())
         causal = causal_values.pop() if len(causal_values) == 1 else self._causal_by_group
-        with set_current_vllm_config(self.vllm_config):
-            attn_metadata = build_attn_metadata(
-                attn_groups=self.attn_groups,
-                num_reqs=len(rows),
-                num_tokens=num_tokens,
-                query_start_loc_gpu=query_start_loc,
-                query_start_loc_cpu=query_start_loc_cpu,
-                max_query_len=max(query_lens),
-                seq_lens=seq_lens,
-                max_seq_len=max(row.seq_len for row in rows),
-                block_tables=block_tables,
-                slot_mappings=slot_mappings,
-                kv_cache_config=self.kv_cache_config,
-                seq_lens_cpu_upper_bound=seq_lens_cpu,
-                dcp_local_seq_lens=dcp_local_seq_lens,
-                positions=positions,
-                causal=causal,
-            )
+        attn_metadata = self._build_native_metadata(
+            query_lens=query_lens,
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            positions=positions,
+            block_tables=block_tables,
+            slot_mappings=slot_mappings,
+            causal=causal,
+        )
         slot_mappings_by_layer = build_slot_mappings_by_layer(
             slot_mappings,
             self.kv_cache_config,
@@ -469,10 +517,12 @@ class DiffusionPagedAttentionAdapter:
         if self._active_batch is not None:
             raise RuntimeError("Paged attention adapter already has an active forward")
         self._active_batch = batch
+        self._active_piecewise_plan = None
         try:
             with override_paged_kv_adapter(self), set_current_vllm_config(self.vllm_config):
                 yield self
         finally:
+            self._active_piecewise_plan = None
             self._active_batch = None
 
     @staticmethod
@@ -589,6 +639,153 @@ class DiffusionPagedAttentionAdapter:
             )
         return result
 
+    @staticmethod
+    def _normalize_piecewise_spans(
+        full_attn_spans: list[list[tuple[int, int]]],
+        batch: PreparedDiffusionPagedAttentionBatch,
+    ) -> tuple[tuple[tuple[int, int], ...], ...]:
+        """Validate model metadata and return an immutable cache key."""
+
+        if len(full_attn_spans) != len(batch.rows):
+            raise ValueError(
+                "Paged piecewise attention requires one full_attn_spans entry per prepared row: "
+                f"spans={len(full_attn_spans)}, rows={len(batch.rows)}"
+            )
+
+        normalized_rows: list[tuple[tuple[int, int], ...]] = []
+        for row, row_spans in zip(batch.rows, full_attn_spans, strict=True):
+            if not isinstance(row_spans, list):
+                raise TypeError(f"Paged piecewise spans for row {row.identity!r} must be a list")
+            normalized_row: list[tuple[int, int]] = []
+            previous_end = 0
+            for span_index, span in enumerate(row_spans):
+                if not isinstance(span, (tuple, list)) or len(span) != 2:
+                    raise TypeError(
+                        f"Paged piecewise span {span_index} for row {row.identity!r} must be a (start, end) pair"
+                    )
+                start, end = span
+                if type(start) is not int or type(end) is not int or start < 0 or start >= end:
+                    raise ValueError(
+                        f"Paged piecewise span {span!r} for row {row.identity!r} must satisfy 0 <= start < end"
+                    )
+                if start < previous_end:
+                    raise ValueError(
+                        f"Paged piecewise spans for row {row.identity!r} must be sorted and non-overlapping"
+                    )
+                if end > row.seq_len:
+                    raise ValueError(
+                        f"Paged piecewise span {span!r} exceeds row {row.identity!r} seq_len={row.seq_len}"
+                    )
+                normalized_row.append((start, end))
+                previous_end = end
+            normalized_rows.append(tuple(normalized_row))
+
+        normalized_spans = tuple(normalized_rows)
+        reference_spans = normalized_spans[0]
+        for row_index, row_spans in enumerate(normalized_spans[1:], start=1):
+            if row_spans != reference_spans:
+                raise ValueError(
+                    "Paged piecewise attention requires homogeneous batch spans: "
+                    f"row 0 has {reference_spans!r}, row {row_index} has {row_spans!r}"
+                )
+        return normalized_spans
+
+    @staticmethod
+    def _build_piecewise_row_segments(
+        spans: tuple[tuple[tuple[int, int], ...], ...],
+        batch: PreparedDiffusionPagedAttentionBatch,
+    ) -> tuple[tuple[Segment, ...], ...]:
+        """Partition every row's current query into causal/full segments."""
+
+        non_suffix_rows = [row.identity for row in batch.rows if row.kv_start_pos + row.query_len != row.seq_len]
+        if non_suffix_rows:
+            raise ValueError(
+                "Paged piecewise attention requires each query/write span to end at seq_len; "
+                f"invalid rows={non_suffix_rows!r}"
+            )
+
+        segments_by_row = tuple(
+            tuple(build_segments(row_spans, row.kv_start_pos, row.query_len))
+            for row, row_spans in zip(batch.rows, spans, strict=True)
+        )
+        segment_count = len(segments_by_row[0])
+        if any(len(row_segments) != segment_count for row_segments in segments_by_row[1:]):
+            raise ValueError("Paged piecewise attention requires rows to produce the same segment count")
+        return segments_by_row
+
+    def _prepare_piecewise_segment(
+        self,
+        batch: PreparedDiffusionPagedAttentionBatch,
+        row_query_offsets: Sequence[int],
+        row_segments: Sequence[Segment],
+    ) -> _PreparedDiffusionPiecewiseSegment:
+        """Build one native batch from the corresponding segment of each row."""
+
+        segment_mode = row_segments[0].mode
+        if any(segment.mode != segment_mode for segment in row_segments[1:]):
+            raise ValueError("Paged piecewise attention requires segment causality to match across rows")
+
+        query_lens: list[int] = []
+        seq_lens_values: list[int] = []
+        query_indices_values: list[int] = []
+        query_offsets = [0]
+        for row_index, (row, segment) in enumerate(zip(batch.rows, row_segments, strict=True)):
+            local_start = segment.q_start - row.kv_start_pos
+            query_len = segment.q_end - segment.q_start
+            query_lens.append(query_len)
+            seq_lens_values.append(segment.kv_end)
+            query_offsets.append(query_offsets[-1] + query_len)
+            packed_start = row_query_offsets[row_index] + local_start
+            query_indices_values.extend(range(packed_start, packed_start + query_len))
+
+        query_indices = torch.tensor(query_indices_values, dtype=torch.long, device=self.device)
+        query_start_loc_cpu = torch.tensor(query_offsets, dtype=torch.int32)
+        seq_lens_cpu = torch.tensor(seq_lens_values, dtype=torch.int32)
+        attn_metadata = self._build_native_metadata(
+            query_lens=query_lens,
+            query_start_loc=query_start_loc_cpu.to(self.device),
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_lens_cpu.to(self.device),
+            seq_lens_cpu=seq_lens_cpu,
+            positions=batch.positions.index_select(0, query_indices),
+            block_tables=batch.block_tables,
+            slot_mappings=batch.slot_mappings.index_select(-1, query_indices),
+            causal=(segment_mode == "causal"),
+        )
+        return _PreparedDiffusionPiecewiseSegment(
+            query_indices=query_indices,
+            attn_metadata=attn_metadata,
+        )
+
+    def _get_piecewise_plan(
+        self,
+        full_attn_spans: list[list[tuple[int, int]]],
+    ) -> _PreparedDiffusionPiecewisePlan:
+        batch = self._active_batch
+        if batch is None:
+            raise RuntimeError("Piecewise paged attention requires an active prepared batch")
+        normalized_spans = self._normalize_piecewise_spans(full_attn_spans, batch)
+
+        cached_plan = self._active_piecewise_plan
+        if cached_plan is not None:
+            if cached_plan.spans != normalized_spans:
+                raise ValueError("Paged piecewise attention metadata changed between layers in one active batch")
+            return cached_plan
+
+        segments_by_row = self._build_piecewise_row_segments(normalized_spans, batch)
+        row_query_offsets = [0]
+        for row in batch.rows:
+            row_query_offsets.append(row_query_offsets[-1] + row.query_len)
+        plan = _PreparedDiffusionPiecewisePlan(
+            spans=normalized_spans,
+            segments=tuple(
+                self._prepare_piecewise_segment(batch, row_query_offsets, row_segments)
+                for row_segments in zip(*segments_by_row, strict=True)
+            ),
+        )
+        self._active_piecewise_plan = plan
+        return plan
+
     def prepare_layer_context(
         self,
         layer_name: str,
@@ -605,7 +802,7 @@ class DiffusionPagedAttentionAdapter:
         except KeyError as exc:
             raise KeyError(f"Unknown diffusion paged attention layer {layer_name!r}") from exc
         batch = self._active_batch
-        self._validate_omni_attn_metadata(omni_attn_metadata)
+        full_attn_spans = self._validate_omni_attn_metadata(omni_attn_metadata)
 
         query_flat, query_token_shape, query_has_head_dims = self._flatten_tensor(
             query,
@@ -675,6 +872,21 @@ class DiffusionPagedAttentionAdapter:
             native_metadata = batch.attn_metadata[layer_name]
         except KeyError as exc:
             raise KeyError(f"No native attention metadata was built for diffusion layer {layer_name!r}") from exc
+        piecewise_segments: tuple[DiffusionPagedAttentionSegmentContext, ...] = ()
+        if full_attn_spans is not None:
+            plan = self._get_piecewise_plan(full_attn_spans)
+            try:
+                piecewise_segments = tuple(
+                    DiffusionPagedAttentionSegmentContext(
+                        query_indices=segment.query_indices,
+                        native_metadata=segment.attn_metadata[layer_name],
+                    )
+                    for segment in plan.segments
+                )
+            except KeyError as exc:
+                raise KeyError(
+                    f"No piecewise native attention metadata was built for diffusion layer {layer_name!r}"
+                ) from exc
         return DiffusionPagedAttentionContext(
             layer=layer,
             query=query_flat.contiguous(),
@@ -682,25 +894,33 @@ class DiffusionPagedAttentionAdapter:
             value_write=value_write,
             slot_mapping=slot_mapping,
             native_metadata=native_metadata,
+            piecewise_segments=piecewise_segments,
             query_token_shape=query_token_shape,
             query_has_head_dims=query_has_head_dims,
         )
 
     @staticmethod
-    def _validate_omni_attn_metadata(metadata: Any | None) -> None:
+    def _validate_omni_attn_metadata(
+        metadata: Any | None,
+    ) -> list[list[tuple[int, int]]] | None:
         if metadata is None:
-            return
+            return None
+        full_attn_spans = getattr(metadata, "full_attn_spans", None)
+        attn_mask = getattr(metadata, "attn_mask", None)
         unsupported_fields = [
             field_name
             for field_name in (
-                "attn_mask",
                 "joint_attn_mask",
-                "full_attn_spans",
                 "query_ranges",
                 "video_layout",
             )
             if getattr(metadata, field_name, None) is not None
         ]
+        if attn_mask is not None:
+            if full_attn_spans is None:
+                unsupported_fields.append("attn_mask")
+            elif not isinstance(attn_mask, torch.Tensor) or attn_mask.ndim != 4:
+                unsupported_fields.append("attn_mask (piecewise paging requires a 4D tensor)")
         extra = getattr(metadata, "extra", None)
         if extra:
             unsupported_fields.append(f"extra={sorted(extra)}")
@@ -709,3 +929,4 @@ class DiffusionPagedAttentionAdapter:
                 "Diffusion paged attention cannot translate Omni attention metadata fields "
                 f"{unsupported_fields!r} to native FlashAttention metadata"
             )
+        return full_attn_spans

@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
@@ -180,6 +181,33 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
     with adapter.activate(suffix_batch):
         suffix_context = adapter.prepare_layer_context(_LAYER_NAME, query[17:], key, value)
         suffix_output = omni_backend.forward_paged(suffix_context)
+    suffix_slot_mappings = suffix_batch.slot_mappings.clone()
+
+    piecewise_batch = adapter.prepare_batch(
+        [
+            DiffusionPagedAttentionRow(
+                request_id="req-0",
+                sequence_id=0,
+                query_len=19,
+                seq_len=19,
+            )
+        ]
+    )
+    mixed_mask = torch.ones(19, 19, dtype=torch.bool, device=device).tril()
+    mixed_mask[5:10, 5:10] = True
+    mixed_metadata = AttentionMetadata(
+        attn_mask=mixed_mask.unsqueeze(0).unsqueeze(0),
+        full_attn_spans=[[(5, 10)]],
+    )
+    with adapter.activate(piecewise_batch):
+        piecewise_context = adapter.prepare_layer_context(
+            _LAYER_NAME,
+            query,
+            key,
+            value,
+            omni_attn_metadata=mixed_metadata,
+        )
+        piecewise_output = omni_backend.forward_paged(piecewise_context)
 
     prefix_reference = (
         F.scaled_dot_product_attention(
@@ -203,9 +231,21 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
         .squeeze(0)
         .transpose(0, 1)
     )
+    piecewise_reference = (
+        F.scaled_dot_product_attention(
+            query.transpose(0, 1).unsqueeze(0),
+            key.transpose(0, 1).unsqueeze(0),
+            value.transpose(0, 1).unsqueeze(0),
+            attn_mask=mixed_mask.unsqueeze(0).unsqueeze(0),
+            scale=diffusion_layer.softmax_scale,
+        )
+        .squeeze(0)
+        .transpose(0, 1)
+    )
     torch.accelerator.synchronize(device)
 
     assert prefix_slot_mappings.cpu().tolist() == [list(range(3 * _BLOCK_SIZE, 4 * _BLOCK_SIZE)) + [_BLOCK_SIZE]]
-    assert suffix_batch.slot_mappings.cpu().tolist() == [[_BLOCK_SIZE + 1, _BLOCK_SIZE + 2]]
+    assert suffix_slot_mappings.cpu().tolist() == [[_BLOCK_SIZE + 1, _BLOCK_SIZE + 2]]
     torch.testing.assert_close(prefix_output, prefix_reference, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(suffix_output, suffix_reference, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(piecewise_output, piecewise_reference, rtol=2e-2, atol=2e-2)

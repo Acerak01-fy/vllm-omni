@@ -273,20 +273,52 @@ class FlashAttentionImpl(AttentionImpl):
             kv_cache,
             paged_kv_context.slot_mapping,
         )
-        output = torch.empty(
-            (paged_kv_context.query.shape[0], layer.num_heads, layer.head_size_v),
-            dtype=paged_kv_context.query.dtype,
-            device=paged_kv_context.query.device,
-        )
-        output = native_impl.forward(
-            layer,
-            paged_kv_context.query,
-            paged_kv_context.key_write,
-            paged_kv_context.value_write,
-            kv_cache,
-            paged_kv_context.native_metadata,
-            output,
-        )
+
+        def run_native_attention(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            native_metadata,
+        ) -> torch.Tensor:
+            output = torch.empty(
+                (query.shape[0], layer.num_heads, layer.head_size_v),
+                dtype=query.dtype,
+                device=query.device,
+            )
+            return native_impl.forward(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                native_metadata,
+                output,
+            )
+
+        if paged_kv_context.piecewise_segments:
+            output = torch.empty(
+                (paged_kv_context.query.shape[0], layer.num_heads, layer.head_size_v),
+                dtype=paged_kv_context.query.dtype,
+                device=paged_kv_context.query.device,
+            )
+            for segment in paged_kv_context.piecewise_segments:
+                segment_query = paged_kv_context.query.index_select(0, segment.query_indices)
+                segment_key = paged_kv_context.key_write.index_select(0, segment.query_indices)
+                segment_value = paged_kv_context.value_write.index_select(0, segment.query_indices)
+                segment_output = run_native_attention(
+                    segment_query,
+                    segment_key,
+                    segment_value,
+                    segment.native_metadata,
+                )
+                output.index_copy_(0, segment.query_indices, segment_output)
+        else:
+            output = run_native_attention(
+                paged_kv_context.query,
+                paged_kv_context.key_write,
+                paged_kv_context.value_write,
+                paged_kv_context.native_metadata,
+            )
         return paged_kv_context.restore_output(output)
 
     def forward_cuda(
