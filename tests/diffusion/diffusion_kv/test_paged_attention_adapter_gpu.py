@@ -179,7 +179,7 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
         ]
     )
     with adapter.activate(suffix_batch):
-        suffix_context = adapter.prepare_layer_context(_LAYER_NAME, query[17:], key, value)
+        suffix_context = adapter.prepare_layer_context(_LAYER_NAME, query[17:], key[17:], value[17:])
         suffix_output = omni_backend.forward_paged(suffix_context)
     suffix_slot_mappings = suffix_batch.slot_mappings.clone()
 

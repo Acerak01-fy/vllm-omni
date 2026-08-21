@@ -377,6 +377,11 @@ class Attention(nn.Module):
             return None
         return getattr(get_forward_context(), "paged_kv_adapter", None)
 
+    def is_paged_kv_active(self) -> bool:
+        """Return whether this layer will use Scheduler-managed paged KV."""
+
+        return self.paged_kv_cache_role is not None and self._active_paged_kv_adapter() is not None
+
     def _run_local_attention(self, query, key, value, attn_metadata):
         self._assert_piecewise_compatible(attn_metadata)
 

@@ -87,12 +87,12 @@ def test_build_segments_full_span_retains_global_kv_end():
 
 
 def test_paged_piecewise_runner_uses_packed_indices_and_kv_endpoints():
-    full_attn_spans = [[(2, 5)], [(2, 5)]]
+    full_attn_spans = [[(2, 5)], [(4, 7)]]
     plan = build_paged_piecewise_plan(
         full_attn_spans,
-        query_offsets=[0, 0],
+        query_offsets=[0, 2],
         query_lens=[6, 6],
-        seq_lens=[6, 6],
+        seq_lens=[6, 8],
         device=DEVICE,
     )
     query = torch.arange(12 * 2 * 4, dtype=torch.float32).reshape(12, 2, 4)
@@ -123,9 +123,9 @@ def test_paged_piecewise_runner_uses_packed_indices_and_kv_endpoints():
 
     torch.testing.assert_close(output, query)
     assert calls == [
-        (["causal", "causal"], [2, 2], [0, 1, 6, 7]),
-        (["full", "full"], [5, 5], [2, 3, 4, 8, 9, 10]),
-        (["causal", "causal"], [6, 6], [5, 11]),
+        (["causal", "causal"], [2, 4], [0, 1, 6, 7]),
+        (["full", "full"], [5, 7], [2, 3, 4, 8, 9, 10]),
+        (["causal", "causal"], [6, 8], [5, 11]),
     ]
 
 

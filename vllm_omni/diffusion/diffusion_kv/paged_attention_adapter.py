@@ -534,7 +534,7 @@ class DiffusionPagedAttentionAdapter:
         head_size: int,
         name: str,
     ) -> tuple[torch.Tensor, tuple[int, ...], bool]:
-        if tensor.ndim >= 2 and tensor.shape[-2:] == (num_heads, head_size):
+        if tensor.ndim >= 3 and tensor.shape[-2:] == (num_heads, head_size):
             return tensor.reshape(-1, num_heads, head_size), tuple(tensor.shape[:-2]), True
         hidden_size = num_heads * head_size
         if tensor.ndim >= 1 and tensor.shape[-1] == hidden_size:
@@ -545,100 +545,32 @@ class DiffusionPagedAttentionAdapter:
         )
 
     @staticmethod
-    def _validate_query_layout(
+    def _validate_token_layout(
         token_shape: tuple[int, ...],
         batch: PreparedDiffusionPagedAttentionBatch,
+        *,
+        name: str,
     ) -> None:
         if len(token_shape) == 1:
-            return
+            if token_shape[0] == batch.num_tokens:
+                return
+            raise ValueError(
+                f"Paged attention {name} token count must match the prepared write batch: "
+                f"tokens={token_shape[0]}, prepared={batch.num_tokens}"
+            )
         if len(token_shape) == 2:
             batch_size, tokens_per_row = token_shape
             query_lens = tuple(row.query_len for row in batch.rows)
             if batch_size == len(batch.rows) and all(query_len == tokens_per_row for query_len in query_lens):
                 return
             raise ValueError(
-                "Paged attention batched Q/K/V layout must match prepared rows: "
+                f"Paged attention batched {name} layout must match prepared rows for the current write: "
                 f"shape={token_shape}, row_query_lens={query_lens}"
             )
         raise ValueError(
-            "Paged attention supports packed [T, ...] or uniform batched [B, T, ...] token layouts; "
+            f"Paged attention {name} supports packed [T, ...] or uniform batched [B, T, ...] token layouts; "
             f"got token shape={token_shape}"
         )
-
-    @staticmethod
-    def _extract_write_tokens(
-        tensor: torch.Tensor,
-        token_shape: tuple[int, ...],
-        batch: PreparedDiffusionPagedAttentionBatch,
-        *,
-        name: str,
-    ) -> torch.Tensor:
-        """Return the K/V tokens covered by the current page-table write.
-
-        A diffusion step commonly passes ``K/V=[prefix | current image]``
-        while the query contains only ``current image``.  The native cache
-        writer must receive only the write span, and that span may begin in
-        the middle of a physical block.  This helper accepts both packed and
-        per-row full-sequence layouts and slices with the logical
-        ``kv_start_pos`` from the prepared rows.
-        """
-
-        query_tokens = batch.num_tokens
-        if tensor.shape[0] == query_tokens:
-            if len(token_shape) == 2:
-                batch_size, tokens_per_row = token_shape
-                if batch_size != len(batch.rows) or any(row.query_len != tokens_per_row for row in batch.rows):
-                    raise ValueError(
-                        f"Paged attention {name} query-aligned layout does not match prepared rows: "
-                        f"shape={token_shape}, row_query_lens={tuple(row.query_len for row in batch.rows)}"
-                    )
-            return tensor
-
-        full_tokens = sum(row.seq_len for row in batch.rows)
-        if tensor.shape[0] != full_tokens:
-            raise ValueError(
-                f"Paged attention {name} must contain either {query_tokens} write tokens or "
-                f"{full_tokens} full-sequence tokens; got {tensor.shape[0]}"
-            )
-
-        pieces: list[torch.Tensor] = []
-        if len(token_shape) == 2:
-            batch_size, tokens_per_row = token_shape
-            if batch_size != len(batch.rows):
-                raise ValueError(
-                    f"Paged attention {name} batch dimension {batch_size} does not match rows {len(batch.rows)}"
-                )
-            row_seq_lens = tuple(row.seq_len for row in batch.rows)
-            if any(seq_len != tokens_per_row for seq_len in row_seq_lens):
-                raise ValueError(
-                    f"Paged attention {name} full-sequence layout does not match prepared rows: "
-                    f"shape={token_shape}, row_seq_lens={row_seq_lens}"
-                )
-            row_offset = 0
-            for row in batch.rows:
-                if tokens_per_row < row.kv_start_pos + row.query_len:
-                    raise ValueError(
-                        f"Paged attention {name} row {row.identity!r} has only {tokens_per_row} tokens, "
-                        f"but write span ends at {row.kv_start_pos + row.query_len}"
-                    )
-                pieces.append(tensor[row_offset + row.kv_start_pos : row_offset + row.kv_start_pos + row.query_len])
-                row_offset += tokens_per_row
-        elif len(token_shape) == 1:
-            row_offset = 0
-            for row in batch.rows:
-                pieces.append(tensor[row_offset + row.kv_start_pos : row_offset + row.kv_start_pos + row.query_len])
-                row_offset += row.seq_len
-        else:
-            raise ValueError(
-                f"Paged attention {name} supports packed [T, ...] or batched [B, S, ...] layouts; "
-                f"got token shape={token_shape}"
-            )
-        result = torch.cat(pieces, dim=0)
-        if result.shape[0] != query_tokens:
-            raise RuntimeError(
-                f"Paged attention {name} write extraction produced {result.shape[0]} tokens; expected {query_tokens}"
-            )
-        return result
 
     def _get_piecewise_plan(
         self,
@@ -746,12 +678,9 @@ class DiffusionPagedAttentionAdapter:
             head_size=layer.head_size_v,
             name="value",
         )
-        self._validate_query_layout(query_token_shape, batch)
-        if query_flat.shape[0] != batch.num_tokens:
-            raise ValueError(
-                "Paged attention query token count must match the prepared batch: "
-                f"query={query_flat.shape[0]}, prepared={batch.num_tokens}"
-            )
+        self._validate_token_layout(query_token_shape, batch, name="query")
+        self._validate_token_layout(key_token_shape, batch, name="key")
+        self._validate_token_layout(value_token_shape, batch, name="value")
         if query.device != self.device or key.device != self.device or value.device != self.device:
             raise ValueError(
                 f"Paged attention Q/K/V must be on {self.device}; "
@@ -772,12 +701,6 @@ class DiffusionPagedAttentionAdapter:
                     f"invalid rows={non_suffix_rows!r}"
                 )
 
-        key_write = self._extract_write_tokens(key_flat, key_token_shape, batch, name="key")
-        value_write = self._extract_write_tokens(value_flat, value_token_shape, batch, name="value")
-        if key_write.shape[0] != value_write.shape[0]:
-            raise ValueError(
-                f"Paged attention key/value write lengths differ: {key_write.shape[0]} vs {value_write.shape[0]}"
-            )
         slot_mapping = batch.slot_mappings_by_layer.get(layer_name)
         if slot_mapping is None:
             raise KeyError(f"No native slot mapping was built for diffusion layer {layer_name!r}")
@@ -790,8 +713,8 @@ class DiffusionPagedAttentionAdapter:
 
         # vLLM's writer consumes slot_mapping directly, so a span that starts
         # inside a physical block naturally writes only the requested suffix.
-        key_write = key_write.contiguous()
-        value_write = value_write.contiguous()
+        key_flat = key_flat.contiguous()
+        value_flat = value_flat.contiguous()
         try:
             native_metadata = batch.attn_metadata[layer_name]
         except KeyError as exc:
@@ -812,8 +735,8 @@ class DiffusionPagedAttentionAdapter:
         return DiffusionPagedAttentionContext(
             layer=layer,
             query=query_flat.contiguous(),
-            key_write=key_write,
-            value_write=value_write,
+            key_write=key_flat,
+            value_write=value_flat,
             slot_mapping=slot_mapping,
             native_metadata=native_metadata,
             piecewise_plan=piecewise_plan,

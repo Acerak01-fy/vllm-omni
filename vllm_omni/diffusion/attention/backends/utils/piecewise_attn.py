@@ -165,8 +165,6 @@ def build_paged_piecewise_plan(
         raise ValueError("Paged piecewise inputs must have one entry per row")
 
     spans = tuple(tuple(tuple(span) for span in row_spans) for row_spans in full_attn_spans)
-    if any(row_spans != spans[0] for row_spans in spans[1:]):
-        raise ValueError("Paged piecewise attention requires homogeneous batch spans")
 
     packed_offsets = [0]
     for row_spans, query_offset, query_len, seq_len in zip(spans, query_offsets, query_lens, seq_lens, strict=True):
