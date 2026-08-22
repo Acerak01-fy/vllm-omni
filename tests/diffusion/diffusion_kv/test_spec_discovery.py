@@ -42,16 +42,16 @@ class _RunnerKVBackend:
         self.kv_cache_config = config
 
 
-def _attention(*, enabled: bool, prefix: str | None = None) -> Attention:
+def _attention(*, enabled: bool, prefix: str = "image_attention") -> Attention:
     attention = Attention.__new__(Attention)
     nn.Module.__init__(attention)
+    attention.prefix = prefix
     attention.paged_kv_cache_role = "primary" if enabled else None
     attention.paged_kv_cache_dtype = torch.bfloat16
     attention.num_kv_heads = 2
     attention.head_size = 8
     attention.causal = False
     attention.attn_backend = _Backend
-    attention.prefix = prefix
     return attention
 
 
@@ -83,19 +83,21 @@ def test_runner_discovers_native_spec_from_loaded_attention() -> None:
     assert spec.non_causal is True
 
 
-def test_runner_uses_attention_prefix_for_nested_pipeline() -> None:
-    runner = _runner(_attention(enabled=True, prefix="layers.0.image_attention"))
-    runner.pipeline = nn.Module()
-    model = nn.Module()
-    model.image_attention = _attention(
-        enabled=True,
-        prefix="layers.0.image_attention",
-    )
-    runner.pipeline.model = model
+def test_runner_uses_attention_prefix_as_canonical_layer_name() -> None:
+    runner = _runner(_attention(enabled=True, prefix="layers.0.self_attn.image_attn.attn"))
 
     specs = runner.get_kv_cache_spec()
 
-    assert set(specs) == {"layers.0.image_attention"}
+    assert set(specs) == {"layers.0.self_attn.image_attn.attn"}
+
+
+def test_runner_rejects_duplicate_attention_prefixes() -> None:
+    runner = _runner(_attention(enabled=True, prefix="shared"))
+    second_attention = _attention(enabled=True, prefix="shared")
+    runner.pipeline.second_image_attention = second_attention
+
+    with pytest.raises(RuntimeError, match="Duplicate canonical paged Diffusion Attention prefix 'shared'"):
+        runner.get_kv_cache_spec()
 
 
 def test_runner_rejects_paged_mode_without_cache_enabled_attention() -> None:

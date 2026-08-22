@@ -37,16 +37,19 @@ class MockAttention(nn.Module):
         super().__init__()
         self.paged_kv_active = False
         self.calls = []
-        self.metadata_calls = []
+        self.paged_calls = []
+        self.paged_metadata = []
 
     def is_paged_kv_active(self):
         return self.paged_kv_active
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
         self.calls.append((query, key, value))
-        self.metadata_calls.append(attn_metadata)
-        if attn_metadata is not None and attn_metadata.joint_query is not None:
-            return torch.cat([attn_metadata.joint_query, query], dim=1)
+        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+        if is_forward_context_available() and get_forward_context().paged_kv_adapter is not None:
+            self.paged_calls.append((query, key, value))
+            self.paged_metadata.append(attn_metadata)
         return query
 
 
@@ -109,19 +112,10 @@ def _call_mgr(
     shard_image_size=None,
     gen_timestep_scatter_index=None,
     position_ids=None,
-    paged=False,
+    full_attn_spans=None,
 ):
     query = torch.randn(bs * q_len, NUM_HEADS, HEAD_DIM)
     attn_mask = torch.zeros(bs, 1, seq_len, seq_len)
-    paged_kwargs = (
-        {
-            "paged_query_lens": [q_len] * bs,
-            "paged_seq_lens": [seq_len] * bs,
-            "full_attn_spans": [[] for _ in range(bs)],
-        }
-        if paged
-        else {}
-    )
     mgr(
         query,
         key_flat,
@@ -135,7 +129,7 @@ def _call_mgr(
         shard_image_size=shard_image_size,
         gen_timestep_scatter_index=gen_timestep_scatter_index,
         position_ids=position_ids,
-        **paged_kwargs,
+        full_attn_spans=full_attn_spans,
     )
 
 
@@ -145,6 +139,128 @@ def test_cache_manager_registers_attention_without_adding_dense_state() -> None:
     assert isinstance(mgr, nn.Module)
     assert dict(mgr.named_modules())["attn"] is mgr.attn
     assert mgr.state_dict() == {}
+
+
+def test_scheduler_paged_kv_runs_piecewise_for_first_and_later_steps() -> None:
+    from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
+
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = True
+    bs = 2
+    prefix_lens = torch.tensor([[2], [4]], dtype=torch.long)
+    first_q_len = 12
+    first_k, first_v = _make_known_kv(bs * first_q_len, base=1.0)
+    full_attn_spans = [[(2, 12)], [(2, 12)]]
+
+    with set_forward_context(), override_paged_kv_adapter(object()):
+        _call_mgr(
+            mgr,
+            bs,
+            q_len=first_q_len,
+            seq_len=first_q_len,
+            key_flat=first_k,
+            value_flat=first_v,
+            first_step=True,
+            gen_timestep_scatter_index=prefix_lens,
+            full_attn_spans=full_attn_spans,
+        )
+
+        assert mgr.image_kv_cache_map is None
+        assert mgr.image_kv_cache_lens is None
+        assert len(mgr.attn.paged_calls) == 1
+        assert mgr.attn.paged_calls[0][0].shape == (bs, first_q_len, NUM_HEADS, HEAD_DIM)
+        assert mgr.attn.paged_calls[0][1].shape == (bs, first_q_len, NUM_KV_HEADS, HEAD_DIM)
+        assert mgr.attn.paged_calls[0][2].shape == (bs, first_q_len, NUM_KV_HEADS, HEAD_DIM)
+        assert mgr.attn.paged_metadata[0].full_attn_spans == full_attn_spans
+
+        current_q_len = IMAGE_TOKEN_LEN
+        current_k, current_v = _make_known_kv(bs * current_q_len, base=50.0)
+        _call_mgr(
+            mgr,
+            bs,
+            q_len=current_q_len,
+            seq_len=prefix_lens[-1].item() + current_q_len,
+            key_flat=current_k,
+            value_flat=current_v,
+            position_ids=torch.arange(4, 4 + current_q_len).repeat(bs, 1),
+            full_attn_spans=full_attn_spans,
+        )
+
+    assert len(mgr.attn.paged_calls) == 2
+    assert mgr.attn.paged_calls[1][0].shape == (bs, current_q_len, NUM_HEADS, HEAD_DIM)
+    assert mgr.attn.paged_calls[1][1].shape == (bs, current_q_len, NUM_KV_HEADS, HEAD_DIM)
+    assert mgr.attn.paged_calls[1][2].shape == (bs, current_q_len, NUM_KV_HEADS, HEAD_DIM)
+    assert mgr.attn.paged_metadata[1].full_attn_spans == full_attn_spans
+
+
+def test_hunyuan_model_builds_cfg_paged_rows_from_runtime_geometry() -> None:
+    from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model
+
+    class FakeAdapter:
+        def __init__(self):
+            self.rows = None
+
+        def prepare_batch(self, rows):
+            self.rows = tuple(rows)
+            return self.rows
+
+        @contextmanager
+        def activate(self, batch):
+            assert batch is self.rows
+            with override_paged_kv_adapter(self):
+                yield self
+
+    adapter = FakeAdapter()
+    identities = [("req", 0), ("req", 1)]
+    with patched_mgr_env(sp_size=1), set_forward_context(paged_kv_runtime=adapter):
+        with HunyuanImage3Model._paged_attention_context(
+            mode="gen_image",
+            first_step=True,
+            query_lens=[12, 12],
+            seq_lens=[12, 12],
+            position_ids=torch.arange(12).repeat(2, 1),
+            gen_timestep_scatter_index=torch.tensor([[2], [4]]),
+            ar_kv_reuse_len=0,
+            row_identities=identities,
+        ):
+            pass
+
+        assert [
+            (row.request_id, row.sequence_id, row.query_len, row.seq_len, row.kv_start_pos) for row in adapter.rows
+        ] == [("req", 0, 12, 12, 0), ("req", 1, 12, 12, 0)]
+
+        with HunyuanImage3Model._paged_attention_context(
+            mode="gen_image",
+            first_step=False,
+            query_lens=[3, 3],
+            seq_lens=[8, 9],
+            position_ids=torch.tensor([[4, 5, 6], [5, 6, 7]]),
+            gen_timestep_scatter_index=None,
+            ar_kv_reuse_len=0,
+            row_identities=identities,
+        ):
+            pass
+
+    assert [(row.kv_start_pos, row.query_len, row.seq_len) for row in adapter.rows] == [(4, 3, 7), (5, 3, 8)]
+
+
+def test_hunyuan_model_rejects_partial_first_step_paged_rows() -> None:
+    from vllm_omni.diffusion.forward_context import set_forward_context
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model
+
+    with patched_mgr_env(sp_size=1), set_forward_context(paged_kv_runtime=object()):
+        with pytest.raises(ValueError, match="complete sequence as the query"):
+            HunyuanImage3Model._paged_attention_context(
+                mode="gen_image",
+                first_step=True,
+                query_lens=[8],
+                seq_lens=[12],
+                position_ids=torch.arange(8).reshape(1, -1),
+                gen_timestep_scatter_index=torch.tensor([[2]]),
+                ar_kv_reuse_len=0,
+                row_identities=[("req", 0)],
+            )
 
 
 @pytest.mark.parametrize(
@@ -170,256 +286,13 @@ def test_gqa_kv_stays_compressed_for_paged_attention(
         first_step=True,
         num_image_tokens=0,
         gen_timestep_scatter_index=_gen_timestep_index(1, 0),
-        paged=paged_kv_active,
+        full_attn_spans=[[(0, q_len)]] if paged_kv_active else None,
     )
 
     _, key_input, value_input = mgr.attn.calls[-1]
-    # Dense compatibility keeps a batched layout. The Scheduler-paged path
-    # packs each row before handing Q/K/V to the native #6102 adapter.
-    expected_shape = (
-        (q_len, expected_kv_heads, HEAD_DIM) if paged_kv_active else (1, q_len, expected_kv_heads, HEAD_DIM)
-    )
+    expected_shape = (1, q_len, expected_kv_heads, HEAD_DIM)
     assert key_input.shape == expected_shape
     assert value_input.shape == expected_shape
-
-
-def test_paged_forward_packs_heterogeneous_valid_rows() -> None:
-    mgr = _make_cache_mgr()
-    mgr.attn.paged_kv_active = True
-    batch_size = 2
-    padded_len = 5
-    key, value = _make_known_kv(batch_size * padded_len)
-    query = torch.randn(batch_size * padded_len, NUM_HEADS, HEAD_DIM)
-
-    output = mgr(
-        query,
-        key,
-        value,
-        attention_mask=torch.zeros(batch_size, 1, padded_len, padded_len),
-        query_lens=[padded_len] * batch_size,
-        seq_lens=[padded_len] * batch_size,
-        paged_query_lens=[3, 5],
-        paged_seq_lens=[4, 7],
-        full_attn_spans=[[], []],
-        first_step=True,
-        num_image_tokens=0,
-    )
-
-    assert output.shape == query.shape
-    _, packed_key, packed_value = mgr.attn.calls[-1]
-    assert packed_key.shape == (8, NUM_KV_HEADS, HEAD_DIM)
-    assert packed_value.shape == (8, NUM_KV_HEADS, HEAD_DIM)
-    assert torch.count_nonzero(output[3:5]) == 0
-
-
-def test_paged_forward_rejects_missing_physical_query_lengths() -> None:
-    mgr = _make_cache_mgr(sp_size=2)
-    mgr.attn.paged_kv_active = True
-    query = torch.randn(4, NUM_HEADS, HEAD_DIM)
-    key, value = _make_known_kv(4)
-
-    with pytest.raises(ValueError, match="requires query_lens metadata"):
-        mgr(
-            query,
-            key,
-            value,
-            attention_mask=None,
-            query_lens=None,
-            paged_query_lens=[8],
-            paged_seq_lens=[8],
-            full_attn_spans=[[]],
-            first_step=False,
-            shard_image_size=4,
-            num_image_tokens=8,
-        )
-
-
-def test_paged_forward_accepts_projection_native_batched_value_layout() -> None:
-    """Hunyuan's Q/K are rope-flattened while V remains [B, S, KV*D]."""
-
-    mgr = _make_cache_mgr()
-    mgr.attn.paged_kv_active = True
-    batch_size = 2
-    padded_len = 4
-    query = torch.randn(batch_size * padded_len, NUM_HEADS, HEAD_DIM)
-    key, value = _make_known_kv(batch_size * padded_len)
-    value_batched = value.reshape(batch_size, padded_len, NUM_KV_HEADS * HEAD_DIM)
-
-    output = mgr(
-        query,
-        key,
-        value_batched,
-        attention_mask=None,
-        query_lens=[padded_len] * batch_size,
-        seq_lens=[padded_len] * batch_size,
-        paged_query_lens=[padded_len, padded_len],
-        paged_seq_lens=[padded_len, padded_len],
-        full_attn_spans=[[], []],
-        first_step=True,
-        num_image_tokens=0,
-    )
-
-    assert output.shape == query.shape
-    _, _, packed_value = mgr.attn.calls[-1]
-    assert packed_value.shape == (batch_size * padded_len, NUM_KV_HEADS, HEAD_DIM)
-
-
-@pytest.mark.parametrize("sp_size", [2, 4])
-def test_paged_sp_first_step_keeps_joint_prompt_and_4d_image_shard(sp_size: int) -> None:
-    mgr = _make_cache_mgr(sp_size=sp_size)
-    mgr.attn.paged_kv_active = True
-    prompt_len = 3
-    local_image_len = 4
-    local_len = prompt_len + local_image_len
-    key, value = _make_known_kv(local_len)
-    query = torch.randn(local_len, NUM_HEADS, HEAD_DIM)
-
-    output = mgr(
-        query,
-        key,
-        value,
-        attention_mask=None,
-        query_lens=[local_len],
-        seq_lens=[local_len],
-        paged_query_lens=[prompt_len + local_image_len * sp_size],
-        paged_seq_lens=[prompt_len + local_image_len * sp_size],
-        full_attn_spans=[[(prompt_len, prompt_len + local_image_len * sp_size)]],
-        first_step=True,
-        shard_image_size=local_image_len,
-        num_image_tokens=local_image_len * sp_size,
-    )
-
-    assert output.shape == query.shape
-    captured_query, captured_key, captured_value = mgr.attn.calls[-1]
-    assert captured_query.shape == (1, local_image_len, NUM_HEADS, HEAD_DIM)
-    assert captured_key.shape == (1, local_image_len, NUM_KV_HEADS, HEAD_DIM)
-    assert captured_value.shape == (1, local_image_len, NUM_KV_HEADS, HEAD_DIM)
-    metadata = mgr.attn.metadata_calls[-1]
-    assert metadata.joint_query.shape == (1, prompt_len, NUM_HEADS, HEAD_DIM)
-    assert metadata.joint_key.shape == (1, prompt_len, NUM_KV_HEADS, HEAD_DIM)
-    assert metadata.joint_value.shape == (1, prompt_len, NUM_KV_HEADS, HEAD_DIM)
-    assert metadata.full_attn_spans == [[(prompt_len, prompt_len + local_image_len * sp_size)]]
-
-
-def test_paged_sp_first_step_accepts_heterogeneous_cfg_rows_with_packed_indices() -> None:
-    mgr = _make_cache_mgr(sp_size=2)
-    mgr.attn.paged_kv_active = True
-    padded_prompt_len = 14
-    local_image_len = 10
-    local_len = padded_prompt_len + local_image_len
-    key, value = _make_known_kv(2 * local_len)
-    query = torch.randn(2 * local_len, NUM_HEADS, HEAD_DIM)
-    packed_indices = torch.tensor([*range(12), *range(14, 34), *range(34, 68)])
-
-    output = mgr(
-        query,
-        key,
-        value,
-        attention_mask=None,
-        query_lens=[local_len, local_len],
-        seq_lens=[local_len, local_len],
-        paged_query_lens=[32, 34],
-        paged_seq_lens=[32, 34],
-        paged_query_indices=packed_indices,
-        full_attn_spans=[[(13, 29)], [(15, 31)]],
-        first_step=True,
-        shard_image_size=local_image_len,
-        num_image_tokens=17,
-    )
-
-    assert output.shape == query.shape
-    metadata = mgr.attn.metadata_calls[-1]
-    assert metadata.joint_query.shape == (2, padded_prompt_len, NUM_HEADS, HEAD_DIM)
-    assert torch.equal(metadata.paged_query_indices, packed_indices)
-
-
-@pytest.mark.parametrize("sp_size", [2, 4])
-def test_paged_sp_later_step_uses_only_image_shard(sp_size: int) -> None:
-    mgr = _make_cache_mgr(sp_size=sp_size)
-    mgr.attn.paged_kv_active = True
-    local_image_len = 4
-    key, value = _make_known_kv(local_image_len)
-    query = torch.randn(local_image_len, NUM_HEADS, HEAD_DIM)
-
-    output = mgr(
-        query,
-        key,
-        value,
-        attention_mask=None,
-        query_lens=[local_image_len],
-        seq_lens=[local_image_len * sp_size + 3],
-        paged_query_lens=[local_image_len * sp_size],
-        paged_seq_lens=[local_image_len * sp_size + 3],
-        full_attn_spans=[[(3, 3 + local_image_len * sp_size)]],
-        first_step=False,
-        shard_image_size=local_image_len,
-        num_image_tokens=local_image_len * sp_size,
-    )
-
-    assert output.shape == query.shape
-    captured_query, captured_key, captured_value = mgr.attn.calls[-1]
-    assert captured_query.shape == (1, local_image_len, NUM_HEADS, HEAD_DIM)
-    assert captured_key.shape == (1, local_image_len, NUM_KV_HEADS, HEAD_DIM)
-    assert captured_value.shape == (1, local_image_len, NUM_KV_HEADS, HEAD_DIM)
-    metadata = mgr.attn.metadata_calls[-1]
-    assert metadata.joint_query is None
-    assert metadata.joint_key is None
-    assert metadata.joint_value is None
-
-
-def test_paged_forward_clears_stale_dense_prompt_cache() -> None:
-    """Scheduler pages must be the only persistent KV source when active."""
-
-    mgr = _make_cache_mgr()
-    mgr.attn.paged_kv_active = True
-    stale_key, stale_value = _make_known_kv(2, base=999.0)
-    mgr.image_kv_cache_map = (
-        stale_key.reshape(1, 2, NUM_KV_HEADS, HEAD_DIM),
-        stale_value.reshape(1, 2, NUM_KV_HEADS, HEAD_DIM),
-    )
-    mgr.image_kv_cache_lens = torch.tensor([2])
-
-    q_len = 3
-    query = torch.randn(q_len, NUM_HEADS, HEAD_DIM)
-    key, value = _make_known_kv(q_len)
-    mgr(
-        query,
-        key,
-        value,
-        attention_mask=None,
-        query_lens=[q_len],
-        seq_lens=[q_len],
-        paged_query_lens=[q_len],
-        paged_seq_lens=[q_len],
-        full_attn_spans=[[]],
-        first_step=True,
-        num_image_tokens=0,
-    )
-
-    assert mgr.image_kv_cache_map is None
-    assert mgr.image_kv_cache_lens is None
-
-
-def test_paged_forward_rejects_missing_scheduler_metadata_without_dense_fallback() -> None:
-    mgr = _make_cache_mgr()
-    mgr.attn.paged_kv_active = True
-    q_len = 3
-    query = torch.randn(q_len, NUM_HEADS, HEAD_DIM)
-    key, value = _make_known_kv(q_len)
-
-    with pytest.raises(RuntimeError, match="requires native row metadata"):
-        mgr(
-            query,
-            key,
-            value,
-            attention_mask=None,
-            query_lens=[q_len],
-            seq_lens=[q_len],
-            first_step=True,
-            num_image_tokens=0,
-        )
-
-    assert mgr.attn.calls == []
 
 
 # ============================================================
