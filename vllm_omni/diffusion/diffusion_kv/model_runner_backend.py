@@ -77,6 +77,13 @@ class DiffusionKVModelRunnerBackend:
         if self.kv_cache_config is not None:
             raise RuntimeError("Diffusion KV cache layers cannot be changed after physical initialization")
 
+        if layers:
+            current_omni_platform.get_diffusion_kv_block_tables_cls()
+            if not callable(current_omni_platform.build_diffusion_kv_attn_metadata):
+                raise NotImplementedError(
+                    "Diffusion paged KV requires platform-native BlockTables and attention metadata hooks"
+                )
+
         forward_context = self.vllm_config.compilation_config.static_forward_context
         previous_adapters = self._kv_cache_layer_adapters
         for layer_name, (layer, spec) in layers.items():
@@ -84,6 +91,11 @@ class DiffusionKVModelRunnerBackend:
                 raise TypeError(
                     f"Diffusion KV layer {layer_name!r} produced unsupported spec {type(spec).__name__}; "
                     "only native attention specs are supported"
+                )
+            if not layer.attn_backend.supports_paged_kv:
+                raise NotImplementedError(
+                    f"Diffusion paged KV layer {layer_name!r} requires an Omni backend with paged support; "
+                    f"selected {layer.attn_backend.get_name()}"
                 )
             existing = forward_context.get(layer_name)
             if existing is not None and existing is not layer and existing is not previous_adapters.get(layer_name):

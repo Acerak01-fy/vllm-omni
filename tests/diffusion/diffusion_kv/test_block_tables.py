@@ -54,7 +54,12 @@ def test_cache_layer_registration_installs_adapters_with_ulysses_local_geometry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend, vllm_config, model_config = _registration_backend(_parallel_config(ulysses_degree=2))
-    layer = SimpleNamespace(num_heads=8, softmax_scale=0.125, skip_sequence_parallel=False)
+    layer = SimpleNamespace(
+        num_heads=8,
+        softmax_scale=0.125,
+        skip_sequence_parallel=False,
+        attn_backend=SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN"),
+    )
     unrelated = object()
     vllm_config.compilation_config.static_forward_context.update({"layer-0": layer, "unrelated": unrelated})
     spec = FullAttentionSpec(
@@ -90,6 +95,38 @@ def test_cache_layer_registration_installs_adapters_with_ulysses_local_geometry(
         head_size=8,
     )
     assert vllm_config.attention_config.use_non_causal is True
+
+
+def test_cache_layer_registration_rejects_backend_without_paged_support() -> None:
+    backend, _, _ = _registration_backend(_parallel_config())
+    layer = SimpleNamespace(
+        attn_backend=SimpleNamespace(supports_paged_kv=False, get_name=lambda: "SDPA"),
+    )
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=8,
+        dtype=torch.float16,
+    )
+
+    with pytest.raises(NotImplementedError, match="layer-0.*paged support.*SDPA"):
+        backend.register_kv_cache_layers({"layer-0": (layer, spec)})
+
+
+def test_cache_layer_registration_resolves_platform_paged_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend, _, _ = _registration_backend(_parallel_config())
+
+    def unsupported_block_tables():
+        raise NotImplementedError("platform has no paged BlockTables")
+
+    monkeypatch.setattr(
+        model_runner_backend_module.current_omni_platform,
+        "get_diffusion_kv_block_tables_cls",
+        unsupported_block_tables,
+    )
+
+    with pytest.raises(NotImplementedError, match="no paged BlockTables"):
+        backend.register_kv_cache_layers({"layer-0": (object(), Mock(spec=FullAttentionSpec))})
 
 
 @pytest.mark.parametrize(
