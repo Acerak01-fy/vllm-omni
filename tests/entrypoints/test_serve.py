@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import argparse
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from pytest_mock import MockerFixture
 
+from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.stage_config import (
+    DeployConfig,
+    PipelineConfig,
+    StageDeployConfig,
+    StageExecutionType,
+    StagePipelineConfig,
+)
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand, run_headless
-from vllm_omni.entrypoints.utils import parse_stage_overrides
+from vllm_omni.entrypoints.utils import ResolvedStageConfigs, parse_stage_overrides
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser, TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -166,10 +175,7 @@ def test_parse_stage_overrides_invalid_json_raises() -> None:
 
 
 def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture) -> None:
-    """Regression: the headless path must parse ``--stage-overrides`` (a JSON
-    string) and forward the parsed dict to ``load_and_resolve_stage_configs``,
-    mirroring the standard engine path. Previously it was dropped entirely,
-    silently producing a different per-stage device layout."""
+    """Headless forwards parsed overrides through the shared typed resolver."""
     captured: dict = {}
 
     def _fake_resolve(*args, **kwargs):
@@ -177,10 +183,10 @@ def test_run_headless_parses_and_forwards_stage_overrides(mocker: MockerFixture)
         captured.update(kwargs)
         # Return a stage that does NOT match stage_id=0 so run_headless stops
         # right after the resolver call (we only care about how it was called).
-        return ("/fake/stages.yaml", [SimpleNamespace(stage_id=99)], None)
+        return _resolved_stage_configs([SimpleNamespace(stage_id=99)])
 
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_config_views",
         side_effect=_fake_resolve,
     )
 
@@ -203,8 +209,8 @@ def test_run_headless_invalid_stage_overrides_raises(mocker: MockerFixture) -> N
     """Invalid ``--stage-overrides`` JSON in headless mode fails fast with the
     shared ValueError instead of being silently ignored."""
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [SimpleNamespace(stage_id=0)], None),
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_config_views",
+        return_value=_resolved_stage_configs([SimpleNamespace(stage_id=0)]),
     )
 
     args = _make_headless_args(stage_id=0, stage_overrides="{not valid json}")
@@ -217,8 +223,8 @@ def test_run_headless_raises_when_stage_id_not_in_configs(mocker: MockerFixture)
     fails fast when the launcher's --stage-id doesn't match any entry."""
     other_stage = SimpleNamespace(stage_id=99)
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [other_stage], None),
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_config_views",
+        return_value=_resolved_stage_configs([other_stage]),
     )
 
     args = _make_headless_args(stage_id=0)
@@ -248,6 +254,43 @@ def _make_stage_cfg(stage_id: int, stage_type: str) -> SimpleNamespace:
     )
 
 
+def _make_typed_diffusion_config(stage_id: int) -> VllmOmniConfig:
+    topology = StagePipelineConfig(
+        stage_id=stage_id,
+        model_stage="diffusion",
+        execution_type=StageExecutionType.DIFFUSION,
+        final_output=True,
+        final_output_type="image",
+        model_arch="TestDiffusion",
+    )
+    pipeline = PipelineConfig(
+        model_type=f"test_headless_diffusion_{stage_id}",
+        model_arch="TestDiffusion",
+        stages=(topology,),
+    )
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=stage_id)])
+    return VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"model": "fake-model"},
+    )
+
+
+def _resolved_stage_configs(
+    stage_configs: list[Any],
+    *,
+    omni_config: VllmOmniConfig | None = None,
+    config_path: str = "/fake/stages.yaml",
+) -> ResolvedStageConfigs:
+    return ResolvedStageConfigs(
+        config_path=config_path,
+        omni_config=omni_config,
+        stage_configs=stage_configs,
+        deploy_config=None,
+        omni_lb_policy=None,
+    )
+
+
 def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: MockerFixture) -> None:
     """LLM headless: each loop iteration registers with auto-assigned
     replica_id (master picks a free slot) and spawns one
@@ -266,8 +309,8 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     engine_manager = mocker.Mock()
 
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg], None),
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_config_views",
+        return_value=_resolved_stage_configs([stage_cfg]),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -346,8 +389,8 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
     manager_b = mocker.Mock()
 
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg], None),
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_config_views",
+        return_value=_resolved_stage_configs([stage_cfg]),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -405,8 +448,11 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
     proc.is_alive.return_value = False
 
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg], None),
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_config_views",
+        return_value=_resolved_stage_configs(
+            [stage_cfg],
+            omni_config=_make_typed_diffusion_config(stage_cfg.stage_id),
+        ),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -414,12 +460,11 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
     )
-    mocker.patch(
-        "vllm_omni.engine.stage_init_utils.extract_legacy_stage_metadata",
-        return_value=SimpleNamespace(stage_id=1, stage_type="diffusion"),
-    )
     mock_inject = mocker.patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info")
-    mocker.patch("vllm_omni.engine.stage_init_utils.build_diffusion_config", return_value=od_config)
+    mock_build = mocker.patch(
+        "vllm_omni.engine.stage_init_utils.build_diffusion_config_from_omni_stage_config",
+        return_value=od_config,
+    )
     mock_register = mocker.patch(
         "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
         return_value=StageRegistrationResponse(
@@ -452,10 +497,9 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
 
     run_headless(_make_headless_args(stage_id=1))
 
-    mock_inject.assert_called_once()
-    assert mock_inject.call_args.args[0] is stage_cfg
-    assert mock_inject.call_args.args[1] == 1
-    assert mock_inject.call_args.args[2] == [stage_cfg]
+    mock_inject.assert_not_called()
+    mock_build.assert_called_once()
+    assert mock_build.call_args.args[1].stage_id == 1
 
     reg_kwargs = mock_register.call_args.kwargs
     assert reg_kwargs["omni_master_address"] == "127.0.0.1"
@@ -485,8 +529,11 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
     proc.is_alive.return_value = False
 
     mocker.patch(
-        "vllm_omni.entrypoints.utils.load_and_resolve_stage_configs",
-        return_value=("/fake/stages.yaml", [stage_cfg], None),
+        "vllm_omni.entrypoints.utils.load_and_resolve_stage_config_views",
+        return_value=_resolved_stage_configs(
+            [stage_cfg],
+            omni_config=_make_typed_diffusion_config(stage_cfg.stage_id),
+        ),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.prepare_engine_environment")
     mocker.patch("vllm_omni.engine.stage_init_utils.load_omni_transfer_config_for_model", return_value=None)
@@ -494,12 +541,11 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
         "vllm_omni.distributed.omni_connectors.utils.initialization.resolve_omni_kv_config_for_stage",
         return_value=(None, None, None),
     )
-    mocker.patch(
-        "vllm_omni.engine.stage_init_utils.extract_legacy_stage_metadata",
-        return_value=SimpleNamespace(stage_id=1, stage_type="diffusion"),
-    )
     mocker.patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info")
-    mocker.patch("vllm_omni.engine.stage_init_utils.build_diffusion_config", return_value=mocker.Mock())
+    mocker.patch(
+        "vllm_omni.engine.stage_init_utils.build_diffusion_config_from_omni_stage_config",
+        return_value=mocker.Mock(),
+    )
     mocker.patch(
         "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
         return_value=StageRegistrationResponse(

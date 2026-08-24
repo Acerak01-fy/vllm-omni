@@ -15,9 +15,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import janus
-from omegaconf import OmegaConf
 from vllm.logger import init_logger
 
+from vllm_omni.config.omni_config import (
+    BaseVllmOmniStageConfig,
+    VllmOmniConfig,
+    VllmOmniDiffusionStageConfig,
+)
+from vllm_omni.config.stage_config import StageType
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
@@ -52,21 +57,27 @@ from vllm_omni.engine.stage_init_utils import (
     build_vllm_config,
     compute_replica_layout,
     extract_legacy_stage_metadata,
+    extract_stage_metadata_from_omni_stage_config,
     get_stage_connector_spec,
-    inject_kv_stage_info,
     inject_omni_kv_connector_config,
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
     stage_runtime_env,
 )
+from vllm_omni.engine.stage_init_utils import (
+    inject_kv_stage_info as _legacy_inject_kv_stage_info,
+)
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
-from vllm_omni.entrypoints.utils import inject_omni_kv_config
 from vllm_omni.outputs.output_metadata import FinalOutputModalityType
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+# Compatibility symbol for integrations that still patch the legacy diffusion
+# metadata mutator. Typed diffusion startup does not call this helper.
+inject_kv_stage_info = _legacy_inject_kv_stage_info
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +134,7 @@ class StageRuntime:
         model: str,
         config_path: str,
         *,
+        omni_config: VllmOmniConfig | None = None,
         stage_init_timeout: int,
         diffusion_batch_size: int,
         async_chunk: bool,
@@ -130,6 +142,8 @@ class StageRuntime:
         log_stats: bool = False,
     ) -> None:
         self._stage_configs = stage_configs
+        self._omni_config = omni_config
+        self._omni_stage_configs = tuple(omni_config.stage_configs) if omni_config is not None else ()
         self._model = model
         self._config_path = config_path
         self._stage_init_timeout = stage_init_timeout
@@ -342,12 +356,18 @@ class StageRuntime:
         """Build startup plans for every logical stage and replica."""
         stage_plans: list[LogicalStageInitPlan] = []
 
-        # RFC #4021 transition boundary: stage planning still relies on legacy
-        # StageConfig.runtime and StageConfig.engine_args for replica and engine
-        # setup. Keep metadata extraction on the legacy path until the
-        # coordinated stage-init cutover.
         for stage_idx, stage_cfg in enumerate(self._stage_configs):
-            base_metadata = extract_legacy_stage_metadata(stage_cfg)
+            legacy_stage_id = int(stage_cfg.stage_id)
+            omni_stage_config = None
+            if self._omni_config is not None:
+                omni_stage_config = self._omni_config.stage_by_id(legacy_stage_id)
+
+            if isinstance(omni_stage_config, VllmOmniDiffusionStageConfig):
+                base_metadata = extract_stage_metadata_from_omni_stage_config(omni_stage_config)
+            else:
+                if StageType(getattr(stage_cfg, "stage_type", StageType.LLM)) is StageType.DIFFUSION:
+                    raise TypeError(f"Diffusion stage {legacy_stage_id} has no typed VllmOmniDiffusionStageConfig")
+                base_metadata = extract_legacy_stage_metadata(stage_cfg)
             stage_id = int(base_metadata.stage_id)
             if stage_id != stage_idx:
                 raise ValueError(
@@ -356,6 +376,16 @@ class StageRuntime:
                     "Stage ids must be contiguous and zero-based because the "
                     "orchestrator indexes stage pools by stage_id."
                 )
+
+            if isinstance(omni_stage_config, BaseVllmOmniStageConfig) and not isinstance(
+                omni_stage_config,
+                VllmOmniDiffusionStageConfig,
+            ):
+                # PR9 keeps AR/generation consumers on the compatibility path,
+                # but the typed stage travels with every plan for PR8 parity.
+                typed_plan_config = copy.deepcopy(omni_stage_config)
+            else:
+                typed_plan_config = omni_stage_config
 
             stage_connector_spec = get_stage_connector_spec(
                 omni_transfer_config=omni_transfer_config,
@@ -399,10 +429,19 @@ class StageRuntime:
 
             for replica_id in range(num_replicas):
                 replica_cfg = copy.deepcopy(stage_cfg) if replica_id > 0 else stage_cfg
+                replica_omni_config = (
+                    copy.deepcopy(omni_stage_config) if isinstance(omni_stage_config, BaseVllmOmniStageConfig) else None
+                )
                 if stage_idx in replica_devices_map:
-                    replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
+                    replica_devices = replica_devices_map[stage_idx][replica_id]
+                    replica_cfg.runtime.devices = replica_devices
+                    if replica_omni_config is not None:
+                        replica_omni_config.runtime_config.devices = replica_devices
 
-                replica_metadata = extract_legacy_stage_metadata(replica_cfg)
+                if isinstance(replica_omni_config, VllmOmniDiffusionStageConfig):
+                    replica_metadata = extract_stage_metadata_from_omni_stage_config(replica_omni_config)
+                else:
+                    replica_metadata = extract_legacy_stage_metadata(replica_cfg)
                 replica_metadata.replica_id = replica_id
                 if launch_mode == "remote" and replica_metadata.stage_type != "diffusion":
                     replica_metadata.runtime_cfg = None
@@ -415,6 +454,9 @@ class StageRuntime:
                         metadata=replica_metadata,
                         stage_connector_spec=stage_connector_spec,
                         omni_kv_connector=omni_kv_connector,
+                        omni_stage_config=(
+                            replica_omni_config if replica_omni_config is not None else typed_plan_config
+                        ),
                         stage_vllm_config=stage_vllm_config,
                         executor_class=executor_class,
                         engine_args_dict=copy.deepcopy(engine_args_dict) if engine_args_dict is not None else None,
@@ -650,14 +692,18 @@ class StageRuntime:
                 stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg),
                 self._stage_device_scope(plan.metadata.stage_id, plan.metadata.runtime_cfg),
             ):
-                omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
-                if omni_conn_cfg:
-                    inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self._stage_configs)
+                if not isinstance(plan.omni_stage_config, VllmOmniDiffusionStageConfig):
+                    raise TypeError(
+                        f"Stage {plan.metadata.stage_id} diffusion startup is missing its typed stage config"
+                    )
                 client, resources = launch_diffusion_stage_replica(
                     model=self._model,
-                    stage_config=plan.stage_cfg,
+                    stage_config=plan.omni_stage_config,
+                    legacy_registration_config=plan.stage_cfg,
                     metadata=plan.metadata,
+                    stage_connector_spec=plan.stage_connector_spec,
+                    omni_kv_connector=plan.omni_kv_connector,
+                    stage_configs=self._omni_stage_configs,
                     stage_init_timeout=stage_init_timeout,
                     batch_size=self._diffusion_batch_size,
                     use_inline=self._num_stages == 1 and plan.num_replicas == 1,
@@ -753,6 +799,7 @@ class DistStageRuntime(StageRuntime):
         model: str,
         config_path: str,
         *,
+        omni_config: VllmOmniConfig | None = None,
         stage_init_timeout: int,
         diffusion_batch_size: int,
         async_chunk: bool,
@@ -770,6 +817,7 @@ class DistStageRuntime(StageRuntime):
             stage_configs=stage_configs,
             model=model,
             config_path=config_path,
+            omni_config=omni_config,
             stage_init_timeout=stage_init_timeout,
             diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
@@ -822,12 +870,14 @@ class DistStageRuntime(StageRuntime):
                 except (AttributeError, TypeError):
                     if hasattr(runtime_cfg, "__setitem__"):
                         runtime_cfg["num_replicas"] = self._omni_dp_size_local
-                        continue
-                    logger.warning(
-                        "[DistStageRuntime] Failed to apply omni_dp_size_local=%s to stage %s runtime config",
-                        self._omni_dp_size_local,
-                        stage_id,
-                    )
+                    else:
+                        logger.warning(
+                            "[DistStageRuntime] Failed to apply omni_dp_size_local=%s to stage %s runtime config",
+                            self._omni_dp_size_local,
+                            stage_id,
+                        )
+                if self._omni_config is not None:
+                    self._omni_config.stage_by_id(stage_id).runtime_config.num_replicas = self._omni_dp_size_local
 
     def _before_initialize_stage_replicas(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         self._start_omni_master_server(stage_plans)
@@ -885,13 +935,9 @@ class DistStageRuntime(StageRuntime):
         if registered_stage_cfg is None:
             raise ValueError(f"Remote stage {plan.metadata.stage_id} registered without stage config")
 
-        # Remote diffusion registration still transports the legacy mapping
-        # shape. Reconstruct and project that shape until its RFC #4021 cutover.
-        metadata = (
-            extract_legacy_stage_metadata(OmegaConf.create(registered_stage_cfg))
-            if plan.metadata.stage_type == "diffusion"
-            else copy.deepcopy(plan.metadata)
-        )
+        # Registration transports a compatibility payload for the wire
+        # protocol. Runtime metadata always comes from the local startup plan.
+        metadata = copy.deepcopy(plan.metadata)
         metadata.replica_id = plan.replica_id
         ctx = StageRemoteFactoryContext(
             stage_id=plan.metadata.stage_id,
@@ -1093,6 +1139,7 @@ def create_stage_runtime(
     model: str,
     config_path: str,
     *,
+    omni_config: VllmOmniConfig | None = None,
     single_stage_mode: bool,
     stage_init_timeout: int,
     diffusion_batch_size: int,
@@ -1116,6 +1163,7 @@ def create_stage_runtime(
             stage_configs=stage_configs,
             model=model,
             config_path=config_path,
+            omni_config=omni_config,
             stage_init_timeout=stage_init_timeout,
             diffusion_batch_size=diffusion_batch_size,
             async_chunk=async_chunk,
@@ -1133,6 +1181,7 @@ def create_stage_runtime(
         stage_configs=stage_configs,
         model=model,
         config_path=config_path,
+        omni_config=omni_config,
         stage_init_timeout=stage_init_timeout,
         diffusion_batch_size=diffusion_batch_size,
         async_chunk=async_chunk,

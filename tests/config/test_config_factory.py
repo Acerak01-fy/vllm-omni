@@ -15,6 +15,14 @@ from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
 from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
 from vllm_omni.config import config_factory as config_factory_module
+from vllm_omni.config.composable_parallel import (
+    Broadcast,
+    FanInByStage,
+    MeshAxisSpec,
+    RouteByStage,
+    StrategySpec,
+    TakeRank,
+)
 from vllm_omni.config.config_factory import StageConfigFactory, _materialize_object_storage_configs
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.omni_config import VllmOmniConfig
@@ -996,6 +1004,133 @@ class TestPipelineRegistration:
         assert legacy_configs is not None
         assert len(legacy_configs) == 1
         assert legacy_configs[0].yaml_engine_args["model_arch"] == "DeployOnlyArch"
+
+    def test_shared_resolver_aligns_effective_stage_views(self, clean_pipeline_registry, monkeypatch, tmp_path):
+        from vllm_omni.config import omni_config as omni_config_module
+        from vllm_omni.config import stage_config as stage_config_module
+
+        pipeline_key = "shared_stage_views"
+        pipeline = PipelineConfig(
+            model_type=pipeline_key,
+            model_arch="SharedViewsModel",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="ar",
+                    execution_type=StageExecutionType.LLM_AR,
+                ),
+                StagePipelineConfig(
+                    stage_id=1,
+                    model_stage="generation",
+                    execution_type=StageExecutionType.LLM_GENERATION,
+                    input_sources=(0,),
+                ),
+                StagePipelineConfig(
+                    stage_id=2,
+                    model_stage="dit",
+                    execution_type=StageExecutionType.DIFFUSION,
+                    input_sources=(1,),
+                    final_output=True,
+                    final_output_type="image",
+                    model_arch="SharedViewsDiT",
+                ),
+            ),
+        )
+        register_pipeline(pipeline)
+        deploy_path = tmp_path / "shared_views.yaml"
+        deploy_path.write_text(
+            f"pipeline: {pipeline_key}\n"
+            "async_chunk: false\n"
+            "stages:\n"
+            "  - stage_id: 0\n"
+            "    runtime:\n"
+            '      devices: "0"\n'
+            "  - stage_id: 1\n"
+            "    runtime:\n"
+            '      devices: "1"\n'
+            "  - stage_id: 2\n"
+            "    runtime:\n"
+            '      devices: "2,3"\n'
+            "      env:\n"
+            "        BASE_ENV: base\n"
+            "platforms:\n"
+            "  cpu:\n"
+            "    stages:\n"
+            "      - stage_id: 2\n"
+            "        engine_args: {}\n"
+            "        runtime:\n"
+            '          devices: "4,5"\n'
+            "          env:\n"
+            "            PLATFORM_ENV: cpu\n",
+            encoding="utf-8",
+        )
+
+        # Standalone builders retain their own platform resolution. In the
+        # shared path only the factory receives a deploy with an unmaterialized
+        # platform block; both downstream views receive effective copies.
+        apply_platform_overrides = stage_config_module._apply_platform_overrides
+        platform_block_seen: list[bool] = []
+
+        def tracked_platform_overrides(deploy, platform=None):
+            platform_block_seen.append(deploy.platforms is not None)
+            return apply_platform_overrides(deploy, platform)
+
+        monkeypatch.setattr(config_factory_module, "_apply_platform_overrides", tracked_platform_overrides)
+        monkeypatch.setattr(stage_config_module, "_apply_platform_overrides", tracked_platform_overrides)
+        monkeypatch.setattr(omni_config_module, "_apply_platform_overrides", tracked_platform_overrides)
+
+        tp = StrategySpec("tp", MeshAxisSpec("tp", 2), Broadcast(), TakeRank())
+        stage_replica = StrategySpec(
+            "stage_replica",
+            MeshAxisSpec("stage_replica", 2),
+            RouteByStage("round_robin"),
+            FanInByStage(),
+        )
+
+        class FakeConfig(PretrainedConfig):
+            model_type = "unregistered"
+
+        with patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()):
+            resolved = StageConfigFactory.create_config_views_from_model(
+                "fake/model",
+                trust_remote_code=False,
+                cli_overrides={
+                    "stage_0_max_num_seqs": 7,
+                    "stage_2_num_gpus": 4,
+                    "stage_2_diffusion_quantization_config": "fp8",
+                },
+                deploy_config_path=str(deploy_path),
+                strategy_specs={"dit": [tp, stage_replica]},
+            )
+
+        assert resolved.omni_config is not None
+        assert resolved.legacy_stage_configs is not None
+        typed_stages = resolved.omni_config.stage_configs
+        legacy_stages = resolved.legacy_stage_configs
+        assert [(stage.stage_id, StageType(stage.stage_type), stage.model_stage) for stage in typed_stages] == [
+            (stage.stage_id, StageType(stage.stage_type), stage.model_stage) for stage in legacy_stages
+        ]
+        assert [stage.worker_type for stage in legacy_stages[:2]] == ["ar", "generation"]
+        assert legacy_stages[0].to_omegaconf().engine_args.max_num_seqs == 7
+
+        typed_dit = resolved.omni_config.stage_by_id(2)
+        legacy_dit = legacy_stages[2].to_omegaconf()
+        assert typed_dit.runtime_config.devices == legacy_dit.runtime.devices == "4,5"
+        assert (
+            typed_dit.runtime_config.env
+            == legacy_dit.runtime.env
+            == {
+                "BASE_ENV": "base",
+                "PLATFORM_ENV": "cpu",
+            }
+        )
+        assert typed_dit.runtime_config.num_replicas == legacy_dit.runtime.num_replicas == 2
+        assert typed_dit.parallel_config.tensor_parallel_size == legacy_dit.engine_args.tensor_parallel_size == 2
+        assert typed_dit.runtime_config.num_gpus == legacy_dit.engine_args.num_gpus == 4
+        assert typed_dit.quantization_config == legacy_dit.engine_args.quantization_config == "fp8"
+        assert resolved.omni_lb_policy == "round-robin"
+        assert resolved.deploy_config is not None and resolved.deploy_config.platforms is not None
+        assert platform_block_seen == [True, False, False]
 
     def test_structured_path_loads_explicit_deploy_config_once(self, clean_pipeline_registry, tmp_path):
         pipeline_key = "single_load_pipeline"

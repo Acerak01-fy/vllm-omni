@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import janus
 import torch
-from omegaconf import OmegaConf
 from vllm import envs as vllm_envs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
@@ -29,10 +28,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
-from vllm_omni.config.stage_config import (
-    DuplexSessionRuntimeConfig,
-    load_deploy_config,
-)
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, load_deploy_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.engine.async_engine_utils import (
@@ -66,13 +62,22 @@ from vllm_omni.engine.stage_runtime import (
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import (
-    load_and_resolve_stage_configs,
+    ResolvedStageConfigs,
+    load_and_resolve_stage_config_views,
     parse_stage_overrides,
+)
+from vllm_omni.entrypoints.utils import (
+    load_and_resolve_stage_configs as _legacy_stage_config_resolver,
 )
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
+
+# Kept as a module-level compatibility symbol for downstream tests and
+# integrations that patched the pre-Phase-3 resolver. Runtime startup uses the
+# typed view resolver below.
+load_and_resolve_stage_configs = _legacy_stage_config_resolver
 
 if TYPE_CHECKING:
     from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlClient
@@ -104,6 +109,7 @@ class AsyncOmniEngine:
     _coordinator_runtime: Any = None
     _transfer_emitter: Any = None
     _enable_orch_monitor: bool = False
+    vllm_omni_config: Any = None
 
     def __init__(
         self,
@@ -173,14 +179,12 @@ class AsyncOmniEngine:
                 self._omni_master_port,
             )
 
-        # Stage resolution pops deploy_config, so get pipeline-wide settings beforehand.
+        # Resolve pipeline-wide metadata before stage resolution.  The typed
+        # resolver normally supplies the same values, but this early lookup is
+        # intentionally retained as a compatibility/fallback boundary for
+        # callers that override or mock stage resolution (and for deploy files
+        # that contain no registered stage pipeline).
         deploy_config_path = kwargs.get("deploy_config")
-        # ``trust_remote_code`` is tri-state (bool | None): ``None`` means "not
-        # specified" so stage-config resolution can defer to the deploy yaml's
-        # per-stage value (see ``with_trust_remote_code_override``). The
-        # restriction path below loads the top-level HF config via vLLM's
-        # ``get_config``, which needs a real bool, so collapse ``None`` to the
-        # default ``False`` here (#5495).
         pipeline_config = StageConfigFactory.get_pipeline_config(
             model=model,
             trust_remote_code=bool(trust_remote_code),
@@ -196,7 +200,22 @@ class AsyncOmniEngine:
         self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
         self.duplex_session_config = DuplexSessionRuntimeConfig()
         if deploy_config_path is not None:
-            self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session
+            # This is an early compatibility read used for endpoint/session
+            # metadata. Reuse the factory's bare-name lookup (``deploy/foo``)
+            # and let the canonical resolver remain the source of truth. A
+            # missing path is intentionally deferred so patched resolvers and
+            # the eventual typed resolution can decide how to handle it.
+            try:
+                # Keep the legacy module-level hook for integrations that
+                # patch it, then fall back to the factory's bare-name lookup.
+                early_deploy_config = load_deploy_config(deploy_config_path)
+            except FileNotFoundError:
+                try:
+                    early_deploy_config = StageConfigFactory._load_user_deploy_config(deploy_config_path)
+                except FileNotFoundError:
+                    early_deploy_config = None
+            if early_deploy_config is not None:
+                self.duplex_session_config = early_deploy_config.duplex_session
 
         # Tri-state: None means "not specified" — the deploy yaml's per-stage
         # trust_remote_code stays in effect. An explicit True/False here is a
@@ -208,6 +227,26 @@ class AsyncOmniEngine:
             kwargs,
             trust_remote_code=trust_remote_code,
         )
+
+        resolved = getattr(self, "_resolved_stage_configs", None)
+        resolved_pipeline_config = (
+            resolved.omni_config.pipeline_config if resolved is not None and resolved.omni_config is not None else None
+        )
+        if resolved_pipeline_config is not None:
+            pipeline_config = resolved_pipeline_config
+            self.endpoint_restrictions = pipeline_config.endpoint_restrictions
+        self._duplex_runtime_extension_path = (
+            pipeline_config.duplex_runtime_extension
+            if pipeline_config is not None
+            else self._duplex_runtime_extension_path
+        )
+        self.duplex_serving_adapter_path = (
+            pipeline_config.duplex_serving_adapter if pipeline_config is not None else self.duplex_serving_adapter_path
+        )
+        if pipeline_config is not None:
+            self._duplex_control_enabled = bool(pipeline_config.duplex_control_enabled)
+        if resolved is not None and resolved.deploy_config is not None:
+            self.duplex_session_config = resolved.deploy_config.duplex_session
 
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
@@ -293,6 +332,7 @@ class AsyncOmniEngine:
         """Initialize stage clients/processors via StageRuntime and assign to self."""
         self._runtime = create_stage_runtime(
             stage_configs=self.stage_configs,
+            omni_config=self.vllm_omni_config,
             model=self.model,
             config_path=self.config_path,
             single_stage_mode=self.single_stage_mode,
@@ -1007,6 +1047,13 @@ class AsyncOmniEngine:
         num_gpus = normalized_kwargs.get("num_gpus")
         if num_gpus is not None:
             num_gpus = int(num_gpus)
+            if num_gpus < 1:
+                raise ValueError(f"num_gpus must be >= 1, got {num_gpus}")
+            # The unregistered single-stage fallback has historically
+            # materialized its device layout before creating the legacy stage.
+            # Keep that behavior (including WORLD-derived DP) while the
+            # registered-pipeline typed path defers the same validation to the
+            # terminal OmniDiffusionConfig consumer.
             parallel_config.resolve_data_parallel_size(num_gpus)
 
         num_devices = max(1, int(parallel_config.world_size))
@@ -1072,7 +1119,7 @@ class AsyncOmniEngine:
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
-            "quantization_config": kwargs.get("quantization_config", None),
+            "quantization_config": kwargs.get("diffusion_quantization_config") or kwargs.get("quantization_config"),
             "diffusion_kv_cache_dtype": kwargs.get("diffusion_kv_cache_dtype", None),
             "diffusion_kv_cache_skip_steps": kwargs.get("diffusion_kv_cache_skip_steps", None),
             "diffusion_kv_cache_skip_layers": kwargs.get("diffusion_kv_cache_skip_layers", None),
@@ -1160,7 +1207,7 @@ class AsyncOmniEngine:
         kwargs: dict[str, Any],
         *,
         trust_remote_code: bool | None,
-    ) -> tuple[str, list[Any]]:
+    ) -> tuple[str | None, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
         for legacy_arg in ("stage_configs_path", "stage_configs"):
@@ -1174,7 +1221,7 @@ class AsyncOmniEngine:
         # Parse --stage-overrides JSON string if provided
         stage_overrides = parse_stage_overrides(stage_overrides_json)
 
-        config_path, stage_configs, strategy_lb_policy = load_and_resolve_stage_configs(
+        resolved: ResolvedStageConfigs = load_and_resolve_stage_config_views(
             model,
             kwargs,
             trust_remote_code=trust_remote_code,
@@ -1183,103 +1230,14 @@ class AsyncOmniEngine:
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
         )
+        self.vllm_omni_config = resolved.omni_config
+        self._resolved_stage_configs = resolved
 
         # A strategy.yaml may derive a pipeline-wide load-balancer policy. It is
         # an orchestrator-level knob (read once at construction), so apply it here
         # rather than as a per-stage config field.
-        self._apply_strategy_lb_policy(strategy_lb_policy, kwargs)
-
-        # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
-        for cfg in stage_configs:
-            try:
-                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
-                    cfg.engine_args = OmegaConf.create({})
-                global_sleep_mode = kwargs.get("enable_sleep_mode")
-                if global_sleep_mode is not None:
-                    if not hasattr(cfg.engine_args, "enable_sleep_mode") or cfg.engine_args.enable_sleep_mode is None:
-                        cfg.engine_args.enable_sleep_mode = global_sleep_mode
-                if getattr(cfg, "stage_type", None) != "diffusion":
-                    continue
-                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
-                    cfg.engine_args = OmegaConf.create({})
-                additional_config = kwargs.get("additional_config")
-                if additional_config is not None:
-                    current_additional_config = getattr(cfg.engine_args, "additional_config", None)
-                    if current_additional_config in (None, {}):
-                        cfg.engine_args.additional_config = additional_config
-                if kwargs.get("lora_path") is not None:
-                    if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
-                        cfg.engine_args.lora_path = kwargs["lora_path"]
-                lora_scale = kwargs.get("lora_scale")
-                if lora_scale is None:
-                    # Backwards compatibility for older callers.
-                    lora_scale = kwargs.get("static_lora_scale")
-                if lora_scale is not None:
-                    if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
-                        cfg.engine_args.lora_scale = lora_scale
-                if kwargs.get("lora_backend") is not None:
-                    if not hasattr(cfg.engine_args, "lora_backend") or cfg.engine_args.lora_backend is None:
-                        cfg.engine_args.lora_backend = kwargs["lora_backend"]
-                if (
-                    kwargs.get("diffusion_attention_config") is not None
-                    or kwargs.get("diffusion_attention_backend") is not None
-                ):
-                    has_stage_attention = (
-                        hasattr(cfg.engine_args, "diffusion_attention_config")
-                        and cfg.engine_args.diffusion_attention_config is not None
-                    )
-                    if not has_stage_attention:
-                        cfg.engine_args.diffusion_attention_config = parse_attention_config(
-                            kwargs.get("diffusion_attention_config"),
-                            attention_backend=kwargs.get("diffusion_attention_backend"),
-                        )
-                quantization_config = kwargs.get("diffusion_quantization_config") or kwargs.get("quantization_config")
-                if quantization_config is not None:
-                    if (
-                        not hasattr(cfg.engine_args, "quantization_config")
-                        or cfg.engine_args.quantization_config is None
-                    ):
-                        cfg.engine_args.quantization_config = quantization_config
-                # Inject profiler flags for diffusion stages
-                for profiler_key in (
-                    "enable_diffusion_pipeline_profiler",
-                    "enable_ar_profiler",
-                ):
-                    val = kwargs.get(profiler_key)
-                    if val:
-                        if not hasattr(cfg.engine_args, profiler_key) or not getattr(
-                            cfg.engine_args, profiler_key, False
-                        ):
-                            setattr(cfg.engine_args, profiler_key, val)
-                quantization = kwargs.get("quantization")
-                if quantization is not None:
-                    if not hasattr(cfg.engine_args, "quantization") or cfg.engine_args.quantization is None:
-                        cfg.engine_args.quantization = quantization
-                diffusion_kv_cache_dtype = kwargs.get("diffusion_kv_cache_dtype")
-                if diffusion_kv_cache_dtype is not None:
-                    if (
-                        not hasattr(cfg.engine_args, "diffusion_kv_cache_dtype")
-                        or cfg.engine_args.diffusion_kv_cache_dtype is None
-                    ):
-                        cfg.engine_args.diffusion_kv_cache_dtype = diffusion_kv_cache_dtype
-                diffusion_kv_cache_skip_steps = kwargs.get("diffusion_kv_cache_skip_steps")
-                if diffusion_kv_cache_skip_steps is not None:
-                    if (
-                        not hasattr(cfg.engine_args, "diffusion_kv_cache_skip_steps")
-                        or cfg.engine_args.diffusion_kv_cache_skip_steps is None
-                    ):
-                        cfg.engine_args.diffusion_kv_cache_skip_steps = diffusion_kv_cache_skip_steps
-                diffusion_kv_cache_skip_layers = kwargs.get("diffusion_kv_cache_skip_layers")
-                if diffusion_kv_cache_skip_layers is not None:
-                    if (
-                        not hasattr(cfg.engine_args, "diffusion_kv_cache_skip_layers")
-                        or cfg.engine_args.diffusion_kv_cache_skip_layers is None
-                    ):
-                        cfg.engine_args.diffusion_kv_cache_skip_layers = diffusion_kv_cache_skip_layers
-            except Exception as e:
-                logger.warning("Failed to inject LoRA config for stage: %s", e)
-
-        return config_path, stage_configs
+        self._apply_strategy_lb_policy(resolved.omni_lb_policy, kwargs)
+        return resolved.config_path, resolved.stage_configs
 
     # ==================== Public API ====================
 

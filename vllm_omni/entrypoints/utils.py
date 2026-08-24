@@ -2,7 +2,7 @@ import json
 import os
 import types
 from collections import Counter
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any, get_args, get_origin
 
@@ -13,12 +13,22 @@ from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.config.config_factory import (
     StageConfigFactory,
+    StageConfigResolution,
     _materialize_object_storage_configs,
     _name_match_candidate,
     with_trust_remote_code_override,
 )
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES
-from vllm_omni.config.stage_config import _DEPLOY_DIR
+from vllm_omni.config.stage_config import (
+    _DEPLOY_DIR,
+    DeployConfig,
+    PipelineConfig,
+    StageDeployConfig,
+    StageExecutionType,
+    StagePipelineConfig,
+    StageType,
+)
 from vllm_omni.config.yaml_util import create_config, load_yaml_config
 from vllm_omni.diffusion.utils.hf_utils import (
     _looks_like_dreamzero,
@@ -32,6 +42,28 @@ from vllm_omni.platforms import current_omni_platform
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class ResolvedStageConfigs:
+    """Canonical typed config plus the aligned Phase-3 compatibility view."""
+
+    config_path: str | None
+    omni_config: VllmOmniConfig | None
+    stage_configs: list[Any]
+    deploy_config: DeployConfig | None
+    omni_lb_policy: str | None
+
+    def typed_stage_by_id(self, stage_id: int) -> Any:
+        if self.omni_config is None:
+            raise KeyError(f"no structured config for stage {stage_id}")
+        return self.omni_config.stage_by_id(stage_id)
+
+    def legacy_stage_by_id(self, stage_id: int) -> Any:
+        for stage in self.stage_configs:
+            if int(stage.stage_id) == stage_id:
+                return stage
+        raise KeyError(f"no legacy compatibility stage {stage_id}")
 
 
 _DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
@@ -358,6 +390,31 @@ def resolve_model_config_path(model: str) -> str | None:
     return _registry_default_deploy_path(model)
 
 
+def _build_stage_cli_overrides(
+    base_engine_args: dict | None,
+    trust_remote_code: bool | None,
+    stage_overrides: dict[str, dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Normalize global and per-stage caller inputs for both config views."""
+    cli_overrides = _convert_dataclasses_to_dict(dict(base_engine_args or {}))
+    if not cli_overrides.get("trust_remote_code"):
+        cli_overrides.pop("trust_remote_code", None)
+    cli_overrides = with_trust_remote_code_override(cli_overrides, trust_remote_code)
+    if stage_overrides:
+        for stage_id_str, overrides in stage_overrides.items():
+            for key, val in overrides.items():
+                cli_overrides[f"stage_{stage_id_str}_{key}"] = val
+    return cli_overrides
+
+
+def _load_strategy_specs(strategy_config_path: str | None) -> Any:
+    if strategy_config_path is None:
+        return None
+    from vllm_omni.config.composable_parallel.strategy_loader import load_strategy_specs
+
+    return load_strategy_specs(strategy_config_path)
+
+
 def load_stage_configs_from_model(
     model: str,
     *,
@@ -392,30 +449,17 @@ def load_stage_configs_from_model(
         (``None`` when no strategy set one). The policy is returned rather than
         written into a caller-provided mutable dict.
     """
-    if base_engine_args is None:
-        base_engine_args = {}
-
-    cli_overrides = _convert_dataclasses_to_dict(dict(base_engine_args))
-    # A False inherited from the engine-args dump is the store_true flag's
-    # default, not an explicit choice — drop it so only the tri-state
-    # parameter below decides (see with_trust_remote_code_override).
-    if not cli_overrides.get("trust_remote_code"):
-        cli_overrides.pop("trust_remote_code", None)
-    cli_overrides = with_trust_remote_code_override(cli_overrides, trust_remote_code)
-    if stage_overrides:
-        for stage_id_str, overrides in stage_overrides.items():
-            for key, val in overrides.items():
-                cli_overrides[f"stage_{stage_id_str}_{key}"] = val
+    cli_overrides = _build_stage_cli_overrides(
+        base_engine_args,
+        trust_remote_code,
+        stage_overrides,
+    )
 
     # Current runtime initialization still consumes legacy OmegaConf stage
     # configs. ``StageConfigFactory.create_from_model`` now produces the
     # structured ``VllmOmniConfig`` object; future RFC #4021 changes will
     # migrate the engine/runtime consumers and replace this legacy resolver.
-    strategy_specs = None
-    if strategy_config_path is not None:
-        from vllm_omni.config.composable_parallel.strategy_loader import load_strategy_specs
-
-        strategy_specs = load_strategy_specs(strategy_config_path)
+    strategy_specs = _load_strategy_specs(strategy_config_path)
 
     stages, omni_lb_policy = StageConfigFactory.create_legacy_stage_configs_from_model(
         model,
@@ -439,6 +483,152 @@ def load_stage_configs_from_model(
         strategy_note,
     )
     return [], None
+
+
+def load_stage_config_views_from_model(
+    model: str,
+    *,
+    trust_remote_code: bool | None,
+    base_engine_args: dict | None = None,
+    deploy_config_path: str | None = None,
+    stage_overrides: dict[str, dict[str, Any]] | None = None,
+    strategy_config_path: str | None = None,
+) -> ResolvedStageConfigs:
+    """Resolve aligned typed and legacy views in one factory pass."""
+    cli_overrides = _build_stage_cli_overrides(
+        base_engine_args,
+        trust_remote_code,
+        stage_overrides,
+    )
+    resolution: StageConfigResolution = StageConfigFactory.create_config_views_from_model(
+        model,
+        trust_remote_code=trust_remote_code,
+        cli_overrides=cli_overrides,
+        deploy_config_path=deploy_config_path,
+        strategy_specs=_load_strategy_specs(strategy_config_path),
+    )
+    if resolution.legacy_stage_configs is None:
+        strategy_note = ""
+        if strategy_config_path is not None:
+            strategy_note = f" Strategy config {strategy_config_path!r} was not applied."
+        logger.warning(
+            "No registered PipelineConfig resolved for model %r. Legacy `stage_args` "
+            "YAMLs are no longer supported; register the pipeline and provide deployment "
+            "overrides through `deploy_config`.%s",
+            model,
+            strategy_note,
+        )
+        legacy_stages: list[Any] = []
+    else:
+        legacy_stages = [stage.to_omegaconf() for stage in resolution.legacy_stage_configs]
+    return ResolvedStageConfigs(
+        config_path=resolution.deploy_config_path,
+        omni_config=resolution.omni_config,
+        stage_configs=legacy_stages,
+        deploy_config=resolution.deploy_config,
+        omni_lb_policy=resolution.omni_lb_policy,
+    )
+
+
+def _build_default_diffusion_config_views(
+    model: str,
+    default_stage_configs: Any,
+) -> tuple[list[Any], VllmOmniConfig, DeployConfig]:
+    """Build both views from the normalized single-stage diffusion fallback."""
+    raw_stages = _convert_dataclasses_to_dict(default_stage_configs)
+    if not isinstance(raw_stages, list) or len(raw_stages) != 1:
+        raise ValueError("The unregistered-model fallback must define exactly one diffusion stage")
+
+    raw_stage = dict(raw_stages[0])
+    stage_type = raw_stage.get("stage_type")
+    if stage_type not in {StageType.DIFFUSION, StageType.DIFFUSION.value}:
+        raise ValueError("The unregistered-model fallback only supports a diffusion stage")
+
+    engine_args = dict(raw_stage.get("engine_args") or {})
+    runtime = dict(raw_stage.get("runtime") or {})
+    stage_id = int(raw_stage.get("stage_id", 0))
+    if stage_id != 0:
+        raise ValueError(f"The single-stage diffusion fallback must use stage_id=0, got {stage_id}")
+
+    topology = StagePipelineConfig(
+        stage_id=stage_id,
+        model_stage=str(engine_args.get("model_stage") or "diffusion"),
+        execution_type=StageExecutionType.DIFFUSION,
+        input_sources=tuple(int(source) for source in raw_stage.get("engine_input_source", ())),
+        final_output=bool(raw_stage.get("final_output", True)),
+        final_output_type=raw_stage.get("final_output_type"),
+        model_arch=engine_args.get("model_arch"),
+        custom_process_input_func=raw_stage.get("custom_process_input_func"),
+        cfg_kv_collect_func=raw_stage.get("cfg_kv_collect_func") or engine_args.get("cfg_kv_collect_func"),
+    )
+    for topology_owned_field in (
+        "cfg_kv_collect_func",
+        "model_stage",
+    ):
+        engine_args.pop(topology_owned_field, None)
+    # Historical no-op accepted only because OmniDiffusionConfig.from_kwargs
+    # silently discarded unknown fields. It has no typed config owner.
+    engine_args.pop("enable_ar_profiler", None)
+    pipeline = PipelineConfig(
+        model_type="__single_stage_diffusion__",
+        model_arch=str(engine_args.get("model_arch") or ""),
+        stages=(topology,),
+    )
+    stage_deploy = StageDeployConfig(
+        stage_id=stage_id,
+        devices=runtime.get("devices"),
+        num_replicas=int(runtime.get("num_replicas", 1)),
+        env=runtime.get("env"),
+        default_sampling_params=dict(raw_stage.get("default_sampling_params") or {}),
+        engine_extras=engine_args,
+    )
+    deploy = DeployConfig(
+        async_chunk=bool(engine_args.get("async_chunk", False)),
+        stages=[stage_deploy],
+    )
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"model": model},
+    )
+    legacy_stages = list(create_config(raw_stages))
+    return legacy_stages, omni_config, deploy
+
+
+def _filter_resolved_stage_views(
+    resolved: ResolvedStageConfigs,
+    kwargs: dict | None,
+) -> ResolvedStageConfigs:
+    """Apply mode filtering once and mirror the selected IDs to the typed view."""
+    filtered_legacy = filter_stages(resolved.config_path, resolved.stage_configs, kwargs)
+    if resolved.omni_config is None:
+        return ResolvedStageConfigs(
+            config_path=resolved.config_path,
+            omni_config=None,
+            stage_configs=filtered_legacy,
+            deploy_config=resolved.deploy_config,
+            omni_lb_policy=resolved.omni_lb_policy,
+        )
+
+    selected_ids = [int(stage.stage_id) for stage in filtered_legacy]
+    typed_stages = tuple(resolved.omni_config.stage_by_id(stage_id) for stage_id in selected_ids)
+    omni_config = VllmOmniConfig(
+        pipeline_config=resolved.omni_config.pipeline_config,
+        stage_configs=typed_stages,
+        orchestrator_config=resolved.omni_config.orchestrator_config,
+    )
+    typed_ids = [stage.stage_id for stage in omni_config.stage_configs]
+    if typed_ids != selected_ids:
+        raise ValueError(
+            f"Structured and legacy stage views diverged after mode filtering: typed={typed_ids}, legacy={selected_ids}"
+        )
+    return ResolvedStageConfigs(
+        config_path=resolved.config_path,
+        omni_config=omni_config,
+        stage_configs=filtered_legacy,
+        deploy_config=resolved.deploy_config,
+        omni_lb_policy=resolved.omni_lb_policy,
+    )
 
 
 def filter_stages(
@@ -554,6 +744,71 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
     return value
 
 
+def load_and_resolve_stage_config_views(
+    model: str,
+    kwargs: dict | None,
+    *,
+    trust_remote_code: bool | None,
+    default_stage_cfg_factory: Any = None,
+    deploy_config_path: str | None = None,
+    stage_overrides: dict[str, dict[str, Any]] | None = None,
+    strategy_config_path: str | None = None,
+) -> ResolvedStageConfigs:
+    """Resolve aligned typed and compatibility stage views for runtime startup."""
+    resolved = load_stage_config_views_from_model(
+        model,
+        trust_remote_code=trust_remote_code,
+        base_engine_args=kwargs,
+        deploy_config_path=deploy_config_path,
+        stage_overrides=stage_overrides,
+        strategy_config_path=strategy_config_path,
+    )
+    config_path = resolved.config_path
+    # A registered pipeline may omit a default deploy file; retain the legacy
+    # path lookup for that case.  An unresolved model is intentionally handled
+    # by the single-stage diffusion fallback (when supplied), so do not perform
+    # a second HF/model-index lookup merely to populate a compatibility path.
+    if config_path is None and resolved.omni_config is not None:
+        if deploy_config_path is not None:
+            config_path = deploy_config_path
+        else:
+            # A registry entry may intentionally omit a default deploy file
+            # (and callers/tests often use a synthetic model key). Path lookup
+            # is only ancillary for transfer/mode discovery; never make a
+            # successful structured resolution fail because that lookup cannot
+            # infer a local/HF config path.
+            try:
+                config_path = resolve_model_config_path(model)
+            except Exception as exc:
+                logger.debug("Could not resolve ancillary config path for %r: %s", model, exc)
+                config_path = None
+
+    if not resolved.stage_configs and default_stage_cfg_factory is not None:
+        legacy_stages, omni_config, deploy_config = _build_default_diffusion_config_views(
+            model,
+            default_stage_cfg_factory(),
+        )
+        resolved = ResolvedStageConfigs(
+            config_path=config_path,
+            omni_config=omni_config,
+            stage_configs=legacy_stages,
+            deploy_config=deploy_config,
+            omni_lb_policy=resolved.omni_lb_policy,
+        )
+    else:
+        resolved = ResolvedStageConfigs(
+            config_path=config_path,
+            omni_config=resolved.omni_config,
+            stage_configs=resolved.stage_configs,
+            deploy_config=resolved.deploy_config,
+            omni_lb_policy=resolved.omni_lb_policy,
+        )
+
+    resolved = _filter_resolved_stage_views(resolved, kwargs)
+    logger.debug("stage_configs: %s", resolved.stage_configs)
+    return resolved
+
+
 def load_and_resolve_stage_configs(
     model: str,
     kwargs: dict | None,
@@ -563,7 +818,7 @@ def load_and_resolve_stage_configs(
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
     strategy_config_path: str | None = None,
-) -> tuple[str, list, str | None]:
+) -> tuple[str | None, list, str | None]:
     """Load stage configurations from a deploy YAML or model defaults.
 
     Args:
@@ -594,14 +849,12 @@ def load_and_resolve_stage_configs(
     )
     if not stage_configs:
         if default_stage_cfg_factory is not None:
-            default_stage_cfg = default_stage_cfg_factory()
-            stage_configs = create_config(_convert_dataclasses_to_dict(default_stage_cfg))
+            stage_configs = create_config(_convert_dataclasses_to_dict(default_stage_cfg_factory()))
         else:
             stage_configs = []
 
     stage_configs = filter_stages(config_path, stage_configs, kwargs)
-    logger.debug(f"stage_configs: {stage_configs}")
-
+    logger.debug("stage_configs: %s", stage_configs)
     return config_path, stage_configs, omni_lb_policy
 
 

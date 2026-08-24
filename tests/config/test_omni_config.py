@@ -50,7 +50,10 @@ from vllm_omni.config.stage_config import (
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
-from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
+from vllm_omni.engine.stage_init_utils import (
+    build_engine_args_dict_from_omni_stage_config,
+    build_legacy_engine_args_dict,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -302,17 +305,31 @@ def test_runtime_num_gpus_is_derived_from_parallel_world_size():
     assert stage.runtime_config.num_gpus == 4
 
 
-def test_runtime_num_gpus_ignores_stale_runtime_override():
+def test_diffusion_runtime_preserves_explicit_num_gpus_for_terminal_dp_resolution():
     omni_config = _from_pipeline_key(
-        "hunyuan_image3_dit",
+        "hunyuan_video_15",
         cli_overrides={
-            "stage_0_num_gpus": 1,
+            "stage_0_num_gpus": 8,
         },
     )
     stage = omni_config.stage_by_id(0)
 
-    assert stage.parallel_config.world_size == 4
-    assert stage.runtime_config.num_gpus == 4
+    assert stage.parallel_config.world_size == 1
+    assert stage.parallel_config.data_parallel_size == 1
+    assert "data_parallel_size" not in stage.parallel_config._omni_explicit_fields
+    assert stage.runtime_config.num_gpus == 8
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, "/tmp")
+    assert engine_args["num_gpus"] == 8
+    assert "data_parallel_size" not in engine_args["parallel_config"]
+
+
+def test_diffusion_quantization_cli_alias_maps_to_structured_owner():
+    stage = _from_pipeline_key(
+        "hunyuan_image3_dit",
+        cli_overrides={"diffusion_quantization_config": "fp8"},
+    ).stage_by_id(0)
+
+    assert stage.quantization_config == "fp8"
 
 
 def test_from_pipeline_config_does_not_route_server_cli_keys_to_diffusion_stage():
