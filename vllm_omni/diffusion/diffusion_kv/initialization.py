@@ -15,7 +15,10 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.config import (
+    DiffusionKVCacheMode,
+    validate_scheduler_paged_kv_step_execution,
+)
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.platforms import current_omni_platform
 
@@ -47,10 +50,11 @@ def initialize_diffusion_kv_control_plane(
 ) -> tuple[KVCacheConfig, int, int, VllmConfig] | None:
     """Run the native Worker-spec to Scheduler-config initialization chain."""
 
-    if (
-        getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-        is not DiffusionKVCacheMode.PAGED_SCHEDULER
-    ):
+    mode = validate_scheduler_paged_kv_step_execution(
+        getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY),
+        step_execution=bool(getattr(od_config, "step_execution", False)),
+    )
+    if mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
         return None
     if not profile_requests:
         raise ValueError("paged_scheduler Diffusion KV initialization requires prepared memory profile requests")

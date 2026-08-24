@@ -787,8 +787,22 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         pass
                 else:
                     setattr(self.pipeline, "_paged_kv_runtime_enabled", previous_pipeline_runtime_mode)
+                # The bootstrap profile intentionally runs dense attention
+                # before native Scheduler pages exist.  Its prompt snapshots
+                # are model-owned compatibility state, not Scheduler KV;
+                # release both the per-request clones and the layer-local
+                # tensors before page sizing/initialization proceeds.
+                clear_legacy_cache = getattr(self.pipeline, "clear_legacy_prompt_kv_cache", None)
+                if callable(clear_legacy_cache):
+                    clear_legacy_cache()
             for request_id in request_ids:
-                self.state_cache.pop(request_id, None)
+                state = self.state_cache.pop(request_id, None)
+                if state is not None:
+                    # Drop any captured prompt/AR tensors before releasing the
+                    # last state reference. This is deliberately scoped to
+                    # profile request IDs so an unrelated in-flight request
+                    # cannot lose its dense compatibility state.
+                    state.extra.clear()
             self.input_batch = None
             del runner_output
             gc.collect()

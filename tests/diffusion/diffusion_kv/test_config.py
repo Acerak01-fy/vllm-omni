@@ -42,6 +42,7 @@ def test_paged_scheduler_rejects_dense_legacy_kv_receive() -> None:
             diffusion_kv_mode="paged_scheduler",
             diffusion_kv_max_rows_per_request=1,
             max_num_batched_tokens=1,
+            step_execution=True,
             omni_kv_config={"need_recv_cache": True},
         )
 
@@ -52,6 +53,7 @@ def test_paged_scheduler_does_not_depend_on_model_registry() -> None:
         diffusion_kv_mode="paged_scheduler",
         diffusion_kv_max_rows_per_request=1,
         max_num_batched_tokens=1,
+        step_execution=True,
     )
 
     assert config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
@@ -62,6 +64,7 @@ def test_paged_scheduler_mode_is_platform_agnostic(config_cls) -> None:
     config = config_cls.from_kwargs(
         diffusion_kv_mode="paged_scheduler",
         diffusion_kv_max_rows_per_request=1,
+        step_execution=True,
     )
 
     assert config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
@@ -72,6 +75,15 @@ def test_paged_scheduler_requires_a_worker_row_limit() -> None:
         OmniDiffusionConfig.from_kwargs(diffusion_kv_mode="paged_scheduler")
     with pytest.raises(ValueError, match="requires diffusion_kv_max_rows_per_request"):
         _DiffusionConfigProjection.from_kwargs(diffusion_kv_mode="paged_scheduler")
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+def test_paged_scheduler_requires_step_execution(config_cls) -> None:
+    with pytest.raises(ValueError, match="paged_scheduler requires step_execution=True"):
+        config_cls.from_kwargs(
+            diffusion_kv_mode="paged_scheduler",
+            diffusion_kv_max_rows_per_request=1,
+        )
 
 
 @pytest.mark.parametrize("invalid_limit", [0, -1, True, 1.5])

@@ -47,7 +47,11 @@ from vllm_omni.config.stage_config import (
     build_stage_runtime_overrides,
     load_deploy_config,
 )
-from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.diffusion_kv.config import (
+    DiffusionKVCacheMode,
+    parse_diffusion_kv_cache_mode,
+    validate_scheduler_paged_kv_step_execution,
+)
 
 _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str | None]] = {
     StageExecutionType.LLM_AR: (StageType.LLM, "ar"),
@@ -754,7 +758,6 @@ class _DiffusionConfigProjection:
             build_attention_config,
             parse_kv_cache_skip_selector,
         )
-        from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
 
         if self.tf_model_config is None:
@@ -822,6 +825,10 @@ class _DiffusionConfigProjection:
             and self.diffusion_kv_max_rows_per_request is None
         ):
             raise ValueError("paged_scheduler requires diffusion_kv_max_rows_per_request to be set")
+        self.diffusion_kv_mode = validate_scheduler_paged_kv_step_execution(
+            self.diffusion_kv_mode,
+            step_execution=self.step_execution,
+        )
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 

@@ -854,7 +854,8 @@ class HunyuanImage3Pipeline(
             merged["paged_kv_start_pos"] = paged_starts
             # The model still receives a padded [B, S, H] tensor. These fields
             # describe that physical tensor; the paged fields above describe
-            # the valid per-row write spans consumed by ImageKVCacheManager.
+            # the valid per-row write spans consumed by the Scheduler-paged
+            # ImageAttentionAdapter.
             if "position_ids" in merged and isinstance(merged["position_ids"], torch.Tensor):
                 padded_query_len = int(merged["position_ids"].shape[-1])
             elif input_values[0] is not None:
@@ -877,6 +878,8 @@ class HunyuanImage3Pipeline(
         row_state_indexes: list[int],
         row_branches: list[int],
     ) -> None:
+        # This is the dense_legacy compatibility path. Scheduler-paged
+        # execution reads the Worker-installed native pages instead.
         if self._is_paged_kv_mode():
             return
         if states[0].step_index == 0:
@@ -900,12 +903,34 @@ class HunyuanImage3Pipeline(
             )
             mgr.image_kv_cache_lens = torch.cat(lens, dim=0).to(device=mgr.image_kv_cache_map[0].device)
 
+    def clear_legacy_prompt_kv_cache(self) -> None:
+        """Drop dense prompt KV left by the pre-page memory profile.
+
+        ``DiffusionKVCacheManager`` owns the persistent allocation in the
+        production paged path.  The model-owned prompt tensors are used only
+        by the dense bootstrap profile and must not reduce the native page
+        capacity after profiling completes.
+        """
+
+        for layer in getattr(self.model, "layers", ()):
+            attention_adapter = getattr(getattr(layer, "self_attn", None), "image_attn", None)
+            clear = getattr(attention_adapter, "clear_legacy_prompt_kv_cache", None)
+            if callable(clear):
+                clear()
+            elif attention_adapter is not None:
+                # Keep cleanup compatible with a downstream adapter that has
+                # not adopted the explicit helper yet.
+                attention_adapter.image_kv_cache_map = None
+                attention_adapter.image_kv_cache_lens = None
+
     def _capture_prompt_kv_cache(
         self,
         states: list["StepRequestState"],
         row_state_indexes: list[int],
         row_branches: list[int],
     ) -> None:
+        # Never snapshot native Scheduler pages into model-owned Python
+        # tensors. Only dense_legacy needs this per-request prompt cache.
         if self._is_paged_kv_mode():
             return
         by_state: dict[int, list[dict[str, torch.Tensor]]] = {i: [] for i in range(len(states))}
@@ -1841,9 +1866,11 @@ class HunyuanImage3Pipeline(
         ar_kv_data: dict[int, dict[str, torch.Tensor]],
         positive_reuse_len: int,
     ) -> None:
-        """Inject AR-stage KV cache into each layer's ImageKVCacheManager.
+        """Inject AR-stage KV into the dense compatibility adapter.
 
-        Truncates to positive_reuse_len and sets image_kv_cache_map directly.
+        This path is intentionally outside Scheduler-owned paged KV. Paged
+        requests reject AR injection until a scheduler context-import contract
+        is implemented.
         """
         for layer in self.model.layers:
             layer_idx = layer.layer_idx

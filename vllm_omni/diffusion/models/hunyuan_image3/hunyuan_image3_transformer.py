@@ -882,9 +882,15 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
-class ImageKVCacheManager(nn.Module):
-    """
-    Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
+class ImageAttentionAdapter(nn.Module):
+    """Hunyuan image-attention adapter for dense and Scheduler-paged paths.
+
+    The ``Attention`` child is the only cache-enabled module.  In
+    ``paged_scheduler`` mode the Scheduler's ``DiffusionKVCacheManager`` owns
+    admission and block allocation, while the Worker-installed paged adapter
+    owns the physical pages.  The prompt fields kept on this wrapper are a
+    legacy dense-only compatibility path and must never be consulted while a
+    native paged adapter is active.
     """
 
     def __init__(
@@ -928,6 +934,18 @@ class ImageKVCacheManager(nn.Module):
             # bfloat16 autocast, independent of the weight-loading dtype.
             paged_kv_cache_dtype=torch.bfloat16,
         )
+
+    def clear_legacy_prompt_kv_cache(self) -> None:
+        """Release model-owned dense prompt KV state.
+
+        Startup memory profiling temporarily runs the model with dense inputs
+        before native pages exist.  Those tensors are not part of the
+        Scheduler allocation and must be dropped before the physical paged
+        cache is initialized.
+        """
+
+        self.image_kv_cache_map = None
+        self.image_kv_cache_lens = None
 
     @staticmethod
     def _get_current_starts(
@@ -1182,9 +1200,23 @@ class ImageKVCacheManager(nn.Module):
         query_lens = kwargs.get("query_lens")
         seq_lens = kwargs.get("seq_lens")
         paged_active = self.attn.is_paged_kv_active()
-        if paged_active and kwargs.get("paged_query_lens") is not None:
+        if paged_active:
             if uncond_cfg_prefill:
                 raise NotImplementedError("Hunyuan paged KV does not support the AR negative CFG prefill path")
+            missing = [
+                name
+                for name in ("paged_query_lens", "paged_seq_lens", "full_attn_spans")
+                if kwargs.get(name) is None
+            ]
+            if missing:
+                raise RuntimeError(
+                    "Hunyuan Scheduler-paged attention requires native row metadata; "
+                    f"missing={missing}. Refusing to fall back to legacy ImageKV cache."
+                )
+            # A dense startup profile may have populated these fields before
+            # the Worker installs its native adapter. They are unrelated to
+            # Scheduler pages and must not survive into the paged request.
+            self.clear_legacy_prompt_kv_cache()
             return self._forward_paged(
                 query,
                 key,
@@ -1273,6 +1305,11 @@ class ImageKVCacheManager(nn.Module):
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
         return attn_output
+
+
+# Keep the historical import path for downstream tests/tools.  It is an
+# attention adapter now; it is not the Scheduler's KV allocator.
+ImageKVCacheManager = ImageAttentionAdapter
 
 
 @dataclass
@@ -1824,7 +1861,7 @@ class HunYuanAttention(nn.Module):
         )
 
         # default image_token_len = timestamp + 4096*image_tokes
-        self.image_attn = ImageKVCacheManager(
+        self.image_attn = ImageAttentionAdapter(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
             num_kv_heads=self.num_kv_heads,

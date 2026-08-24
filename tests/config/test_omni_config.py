@@ -1104,6 +1104,7 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
         static_lora_scale=0.25,
         diffusion_kv_mode="paged_scheduler",
         diffusion_kv_max_rows_per_request=2,
+        step_execution=True,
         diffusers_load_kwargs=None,
         diffusers_call_kwargs=None,
     )
@@ -1136,6 +1137,7 @@ def test_from_pipeline_config_normalizes_diffusion_config_aliases_from_engine_ar
                 "    fa_deterministic: true",
                 "    diffusion_kv_mode: paged_scheduler",
                 "    diffusion_kv_max_rows_per_request: 2",
+                "    step_execution: true",
             ]
         )
     )

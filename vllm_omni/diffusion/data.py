@@ -26,6 +26,7 @@ from vllm.transformers_utils.repo_utils import get_model_path
 from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
     parse_diffusion_kv_cache_mode,
+    validate_scheduler_paged_kv_step_execution,
 )
 from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
@@ -1004,6 +1005,10 @@ class OmniDiffusionConfig:
             and self.diffusion_kv_max_rows_per_request is None
         ):
             raise ValueError("paged_scheduler requires diffusion_kv_max_rows_per_request to be set")
+        self.diffusion_kv_mode = validate_scheduler_paged_kv_step_execution(
+            self.diffusion_kv_mode,
+            step_execution=self.step_execution,
+        )
         if self.kv_cache_memory_bytes is not None and self.kv_cache_memory_bytes < 0:
             raise ValueError("kv_cache_memory_bytes must be non-negative")
         if not 0.0 < self.gpu_memory_utilization <= 1.0:

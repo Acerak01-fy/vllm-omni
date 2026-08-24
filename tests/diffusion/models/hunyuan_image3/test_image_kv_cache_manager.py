@@ -105,9 +105,19 @@ def _call_mgr(
     shard_image_size=None,
     gen_timestep_scatter_index=None,
     position_ids=None,
+    paged=False,
 ):
     query = torch.randn(bs * q_len, NUM_HEADS, HEAD_DIM)
     attn_mask = torch.zeros(bs, 1, seq_len, seq_len)
+    paged_kwargs = (
+        {
+            "paged_query_lens": [q_len] * bs,
+            "paged_seq_lens": [seq_len] * bs,
+            "full_attn_spans": [[] for _ in range(bs)],
+        }
+        if paged
+        else {}
+    )
     mgr(
         query,
         key_flat,
@@ -121,6 +131,7 @@ def _call_mgr(
         shard_image_size=shard_image_size,
         gen_timestep_scatter_index=gen_timestep_scatter_index,
         position_ids=position_ids,
+        **paged_kwargs,
     )
 
 
@@ -155,10 +166,17 @@ def test_gqa_kv_stays_compressed_for_paged_attention(
         first_step=True,
         num_image_tokens=0,
         gen_timestep_scatter_index=_gen_timestep_index(1, 0),
+        paged=paged_kv_active,
     )
 
     _, key_input, value_input = mgr.attn.calls[-1]
-    expected_shape = (1, q_len, expected_kv_heads, HEAD_DIM)
+    # Dense compatibility keeps a batched layout. The Scheduler-paged path
+    # packs each row before handing Q/K/V to the native #6102 adapter.
+    expected_shape = (
+        (q_len, expected_kv_heads, HEAD_DIM)
+        if paged_kv_active
+        else (1, q_len, expected_kv_heads, HEAD_DIM)
+    )
     assert key_input.shape == expected_shape
     assert value_input.shape == expected_shape
 
@@ -220,6 +238,61 @@ def test_paged_forward_accepts_projection_native_batched_value_layout() -> None:
     assert output.shape == query.shape
     _, _, packed_value = mgr.attn.calls[-1]
     assert packed_value.shape == (batch_size * padded_len, NUM_KV_HEADS, HEAD_DIM)
+
+
+def test_paged_forward_clears_stale_dense_prompt_cache() -> None:
+    """Scheduler pages must be the only persistent KV source when active."""
+
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = True
+    stale_key, stale_value = _make_known_kv(2, base=999.0)
+    mgr.image_kv_cache_map = (
+        stale_key.reshape(1, 2, NUM_KV_HEADS, HEAD_DIM),
+        stale_value.reshape(1, 2, NUM_KV_HEADS, HEAD_DIM),
+    )
+    mgr.image_kv_cache_lens = torch.tensor([2])
+
+    q_len = 3
+    query = torch.randn(q_len, NUM_HEADS, HEAD_DIM)
+    key, value = _make_known_kv(q_len)
+    mgr(
+        query,
+        key,
+        value,
+        attention_mask=None,
+        query_lens=[q_len],
+        seq_lens=[q_len],
+        paged_query_lens=[q_len],
+        paged_seq_lens=[q_len],
+        full_attn_spans=[[]],
+        first_step=True,
+        num_image_tokens=0,
+    )
+
+    assert mgr.image_kv_cache_map is None
+    assert mgr.image_kv_cache_lens is None
+
+
+def test_paged_forward_rejects_missing_scheduler_metadata_without_dense_fallback() -> None:
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = True
+    q_len = 3
+    query = torch.randn(q_len, NUM_HEADS, HEAD_DIM)
+    key, value = _make_known_kv(q_len)
+
+    with pytest.raises(RuntimeError, match="requires native row metadata"):
+        mgr(
+            query,
+            key,
+            value,
+            attention_mask=None,
+            query_lens=[q_len],
+            seq_lens=[q_len],
+            first_step=True,
+            num_image_tokens=0,
+        )
+
+    assert mgr.attn.calls == []
 
 
 # ============================================================
