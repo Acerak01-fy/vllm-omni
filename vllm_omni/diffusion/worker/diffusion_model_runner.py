@@ -402,7 +402,14 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 continue
             spec = module.get_kv_cache_spec(self.vllm_config)
             if spec is not None:
-                cache_layers[layer_name] = (module, spec)
+                # Attention.prefix is the identity used by its native
+                # forward-context dispatch.  A pipeline wrapper may add an
+                # outer attribute (for example ``model.``), so the
+                # named_modules path is not necessarily the runtime name.
+                cache_layer_name = getattr(module, "prefix", None) or layer_name
+                if cache_layer_name in cache_layers and cache_layers[cache_layer_name][0] is not module:
+                    raise RuntimeError(f"Duplicate Diffusion KV attention layer name {cache_layer_name!r}")
+                cache_layers[cache_layer_name] = (module, spec)
         if not cache_layers:
             raise RuntimeError(
                 "paged_scheduler Diffusion KV found no cache-enabled Attention modules "
@@ -729,8 +736,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         runner_output: BatchRunnerOutput | None = None
         request_ids = [request.request_id for request in requests]
+        profile_kv_mode = getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+        profile_uses_dense_inputs = (
+            getattr(self.od_config, "step_execution", False)
+            and profile_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+        )
+        previous_pipeline_runtime_mode = getattr(self.pipeline, "_paged_kv_runtime_enabled", None)
         try:
             if getattr(self.od_config, "step_execution", False):
+                if profile_uses_dense_inputs:
+                    # Native KV pages do not exist until this profile has
+                    # sized them. Profile the same model with dense inputs,
+                    # then restore paged mode before Scheduler execution.
+                    setattr(self.pipeline, "_paged_kv_runtime_enabled", False)
                 scheduler_output = DiffusionSchedulerOutput(
                     step_id=0,
                     scheduled_new_reqs=[
@@ -745,6 +763,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     scheduler_output,
                     validate_kv_metadata=False,
                     record_output_peak_memory=False,
+                    use_paged_attention=not profile_uses_dense_inputs,
                 )
             else:
                 runner_output = self._execute_request_list(
@@ -760,6 +779,14 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 )
             current_omni_platform.synchronize()
         finally:
+            if profile_uses_dense_inputs:
+                if previous_pipeline_runtime_mode is None:
+                    try:
+                        delattr(self.pipeline, "_paged_kv_runtime_enabled")
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(self.pipeline, "_paged_kv_runtime_enabled", previous_pipeline_runtime_mode)
             for request_id in request_ids:
                 self.state_cache.pop(request_id, None)
             self.input_batch = None
@@ -903,6 +930,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             scheduler_output,
             validate_kv_metadata=True,
             record_output_peak_memory=True,
+            use_paged_attention=True,
         )
 
     def _execute_stepwise(
@@ -911,6 +939,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         *,
         validate_kv_metadata: bool,
         record_output_peak_memory: bool,
+        use_paged_attention: bool = True,
     ) -> BatchRunnerOutput:
         """Execute one step with explicit validation and profiling policy."""
 
@@ -950,6 +979,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return self._execute_stepwise_core(
                 scheduler_output,
                 record_output_peak_memory=record_output_peak_memory,
+                use_paged_attention=use_paged_attention,
             )
         except Exception:
             if installed_request_ids:
@@ -961,6 +991,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         scheduler_output: DiffusionSchedulerOutput,
         *,
         record_output_peak_memory: bool,
+        use_paged_attention: bool = True,
     ) -> BatchRunnerOutput:
         """Run the denoise step after metadata admission and row installation."""
 
@@ -981,13 +1012,34 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             input_batch = self._prepare_batch_inputs(states, new_request_ids)
             attn_metadata = {}
 
+            paged_batch: PreparedDiffusionPagedAttentionBatch | None = None
+            if (
+                use_paged_attention
+                and
+                getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+                is DiffusionKVCacheMode.PAGED_SCHEDULER
+            ):
+                prepare_rows = getattr(self.pipeline, "prepare_paged_attention_rows", None)
+                if not callable(prepare_rows):
+                    raise NotImplementedError(
+                        f"{type(self.pipeline).__name__} does not expose model-specific paged attention rows"
+                    )
+                rows = tuple(prepare_rows(states))
+                if not rows:
+                    raise ValueError("Paged diffusion execution produced no native attention rows")
+                paged_batch = self.prepare_paged_attention_batch(rows)
+
             with set_forward_context(
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
             ):
                 clear_pipeline_stage_durations(self.pipeline)
-                noise_pred = self.pipeline.denoise_step(input_batch, states=states)
+                if paged_batch is None:
+                    noise_pred = self.pipeline.denoise_step(input_batch, states=states)
+                else:
+                    with self.activate_paged_attention(paged_batch):
+                        noise_pred = self.pipeline.denoise_step(input_batch, states=states)
                 denoise_stage_durations = consume_pipeline_stage_durations(self.pipeline)
                 for state in states:
                     merge_stage_durations(

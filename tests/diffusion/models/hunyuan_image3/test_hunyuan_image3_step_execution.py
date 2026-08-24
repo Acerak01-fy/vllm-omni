@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -8,9 +9,12 @@ import torch
 
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 import vllm_omni.diffusion.models.hunyuan_image3.request_layout as hy3_layout_module
+import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer as hy3_tokenizer_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,
@@ -101,6 +105,107 @@ def _prepared_layout() -> HunyuanPreparedLayout:
             image_token_length=16,
         ),
     )
+
+
+def _paged_pipeline():
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_kv_mode = DiffusionKVCacheMode.PAGED_SCHEDULER
+    return pipeline
+
+
+def _paged_layout() -> HunyuanPreparedLayout:
+    return HunyuanPreparedLayout(
+        tokenizer_output=TokenizerEncodeOutput(
+            tokens=torch.arange(68).reshape(2, 34),
+            gen_image_mask=torch.ones(2, 34, dtype=torch.bool),
+            gen_timestep_scatter_index=torch.tensor([[12], [14]]),
+            all_image_slices=[[slice(13, 29)], [slice(15, 31)]],
+            joint_image_slices=[[], []],
+            gen_image_slices=[[slice(13, 29)], [slice(15, 31)]],
+            real_pos=torch.tensor([[32], [34]]),
+        ),
+        rope_image_info=[[(slice(13, 29), (4, 4))], [(slice(15, 31), (4, 4))]],
+        generated_image_info=ImageInfo(
+            image_type="gen_image",
+            image_width=512,
+            image_height=512,
+            token_width=4,
+            token_height=4,
+            image_token_length=16,
+        ),
+    )
+
+
+def _paged_state(request_id: str, step_index: int) -> StepRequestState:
+    state = _state(request_id, step_index)
+    state.prepared_layout = _paged_layout()
+    state.extra[_STEP_CFG_FACTOR] = 2
+    state.extra[_STEP_INPUT_IDS] = torch.arange(68).reshape(2, 34) if step_index == 0 else None
+    state.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "full_attn_spans": [[(13, 29)], [(15, 31)]],
+            "position_ids": torch.arange(34 if step_index == 0 else 17).reshape(1, -1).expand(2, -1),
+        }
+    )
+    return state
+
+
+def test_paged_hunyuan_rows_use_full_first_write_and_compact_suffix_write():
+    pipeline = _paged_pipeline()
+    first_state = _paged_state("req", 0)
+    first_rows = pipeline.prepare_paged_attention_rows([first_state])
+    assert [(row.sequence_id, row.query_len, row.seq_len, row.kv_start_pos) for row in first_rows] == [
+        (0, 32, 32, 0),
+        (1, 34, 34, 0),
+    ]
+
+    later_state = _paged_state("req", 1)
+    later_rows = pipeline.prepare_paged_attention_rows([later_state])
+    assert [(row.sequence_id, row.query_len, row.seq_len, row.kv_start_pos) for row in later_rows] == [
+        (0, 17, 29, 12),
+        (1, 17, 31, 14),
+    ]
+
+
+def test_paged_hunyuan_merge_keeps_native_spans_and_omits_dense_mask():
+    pipeline = _paged_pipeline()
+    state = _paged_state("req", 1)
+    state.extra[_STEP_MODEL_KWARGS]["attention_mask"] = torch.ones(2, 1, 17, 21, dtype=torch.bool)
+    _, merged = pipeline._merge_step_model_inputs([state], [0, 0], [0, 1], first_step=False)
+    assert "attention_mask" not in merged
+    assert merged["paged_query_lens"] == [17, 17]
+    assert merged["paged_seq_lens"] == [29, 31]
+    assert merged["paged_kv_start_pos"] == [12, 14]
+    assert merged["full_attn_spans"] == [[(13, 29)], [(15, 31)]]
+
+
+def test_paged_metadata_is_exposed_at_pipeline_and_model_boundaries():
+    expected = {"paged_query_lens", "paged_seq_lens", "paged_kv_start_pos"}
+    assert expected.issubset(inspect.signature(HunyuanImage3Pipeline.forward_call).parameters)
+    assert expected.issubset(inspect.signature(HunyuanImage3Model.forward).parameters)
+
+
+def test_hunyuan_tokenizer_loads_remote_code_non_interactively(monkeypatch):
+    captured = {}
+
+    class _FakeTokenizer:
+        bos_token_id = 1
+        eos_token_id = 2
+        pad_token_id = 0
+        added_tokens_encoder = {}
+
+        def convert_tokens_to_ids(self, token):
+            return hash(token) % 1000
+
+    def fake_from_pretrained(model, **kwargs):
+        captured["model"] = model
+        captured.update(kwargs)
+        return _FakeTokenizer()
+
+    monkeypatch.setattr(hy3_tokenizer_module, "AutoTokenizer", SimpleNamespace(from_pretrained=fake_from_pretrained))
+    hy3_tokenizer_module.TokenizerWrapper("hunyuan-checkpoint")
+
+    assert captured == {"model": "hunyuan-checkpoint", "trust_remote_code": True}
 
 
 def test_prepare_model_inputs_reuses_prepared_layout(monkeypatch):

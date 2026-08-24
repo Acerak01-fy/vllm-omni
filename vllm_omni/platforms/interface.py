@@ -215,6 +215,15 @@ class OmniPlatform(Platform):
         return None
 
     @classmethod
+    def configure_diffusion_vllm_config(
+        cls,
+        vllm_config: Any,
+        od_config: Any,
+    ) -> None:
+        """Apply platform-specific native cache geometry for diffusion."""
+        return None
+
+    @classmethod
     def init_diffusion_model_runner_runtime(
         cls,
         vllm_config: Any,

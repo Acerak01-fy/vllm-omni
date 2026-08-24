@@ -21,6 +21,42 @@ _DIFFUSION_PACKED_MODULES_MAPPING = {
 }
 
 
+def _logical_cache_to_pa_nz(
+    cache: torch.Tensor,
+    block_ids: torch.Tensor,
+    head_size: int,
+    *,
+    last_dim: int = 16,
+) -> torch.Tensor:
+    """Convert selected logical ``[N, B, H, D]`` pages to PA_NZ."""
+
+    selected = cache.index_select(0, block_ids)
+    block_size = selected.shape[1]
+    return (
+        selected.permute(0, 2, 1, 3)
+        .reshape(block_ids.numel(), cache.shape[2], block_size, head_size // last_dim, last_dim)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .reshape(block_ids.numel(), cache.shape[2] * head_size // last_dim, block_size, last_dim)
+    )
+
+
+def _pa_nz_to_logical_cache(
+    cache_nz: torch.Tensor,
+    head_size: int,
+    *,
+    last_dim: int = 16,
+) -> torch.Tensor:
+    """Convert PA_NZ pages back to logical ``[N, B, H, D]`` order."""
+
+    num_heads = cache_nz.shape[1] * last_dim // head_size
+    return (
+        cache_nz.reshape(cache_nz.shape[0], num_heads, head_size // last_dim, cache_nz.shape[2], last_dim)
+        .permute(0, 3, 1, 2, 4)
+        .reshape(cache_nz.shape[0], cache_nz.shape[2], num_heads, head_size)
+    )
+
+
 class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     """NPU/Ascend implementation of OmniPlatform.
 
@@ -77,8 +113,124 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
         from vllm_ascend.ascend_config import init_ascend_config
+        from vllm_ascend.utils import adapt_patch
 
+        # Omni's custom DiffusionWorker does not pass through vLLM-Ascend's
+        # NPUWorker constructor, where worker-local patches are normally
+        # installed.  In particular, AscendBlockTables needs the patched
+        # non-UVA buffer implementation on NPU.
+        adapt_patch()
         init_ascend_config(vllm_config)
+        cls._patch_scatter_cache_mode_compat()
+
+    @staticmethod
+    def _patch_scatter_cache_mode_compat() -> None:
+        """Bridge the 0.27 writer to torch_npu schemas without ``cache_mode``.
+
+        vLLM-Ascend 0.27 passes ``cache_mode=\"Norm\"`` to
+        ``npu_scatter_pa_kv_cache``.  Some torch_npu 2.10 builds expose the
+        same normal-layout operator without that keyword; the normal layout
+        is the operator default, so only the unsupported argument is removed.
+        """
+
+        import torch_npu
+        from vllm_ascend.device import device_op
+
+        op = getattr(getattr(torch.ops, "npu", None), "npu_scatter_pa_kv_cache", None)
+        schema = getattr(getattr(op, "default", None), "_schema", None)
+        if schema is None or "cache_mode" in str(schema):
+            return
+        device_operator = device_op.DeviceOperator
+        if getattr(device_operator, "_omni_cache_mode_compat", False):
+            return
+
+        def reshape_and_cache(cls, key, value, key_cache, value_cache, slot_mapping):
+            del cls
+            # CANN 8.5.1 selects the ND scenario for the vLLM logical cache
+            # view (N, B, H, D), but the torch_npu build shipped with the
+            # target image rejects that scenario for BF16/FP16.  The same
+            # operator accepts the PA_NZ view (N, H*D/16, B, 16).  Convert
+            # only the physical blocks touched by this write so we do not
+            # duplicate a complete per-layer cache.
+            if (
+                key_cache.dim() == 4
+                and value_cache.dim() == 4
+                and key.dim() == 3
+                and key_cache.shape[2] == key.shape[1]
+                and key_cache.shape[3] == key.shape[2]
+                and value_cache.shape[2] == value.shape[1]
+                and value_cache.shape[3] == value.shape[2]
+            ):
+                block_size = key_cache.shape[1]
+                last_dim = 16
+                if key.shape[-1] % last_dim or value.shape[-1] % last_dim:
+                    raise RuntimeError(
+                        "Ascend cache-writer compatibility requires key/value head sizes divisible by 16"
+                    )
+                block_ids = torch.unique(slot_mapping // block_size, sorted=True)
+
+                key_cache_nz = _logical_cache_to_pa_nz(key_cache, block_ids, key.shape[-1], last_dim=last_dim)
+                value_cache_nz = _logical_cache_to_pa_nz(value_cache, block_ids, value.shape[-1], last_dim=last_dim)
+                local_slots = (
+                    torch.searchsorted(block_ids, slot_mapping // block_size) * block_size
+                    + slot_mapping % block_size
+                ).to(dtype=slot_mapping.dtype)
+                torch_npu.npu_scatter_pa_kv_cache(
+                    key=key.contiguous(),
+                    value=value.contiguous(),
+                    key_cache=key_cache_nz,
+                    value_cache=value_cache_nz,
+                    slot_mapping=local_slots.contiguous(),
+                )
+
+                key_cache.index_copy_(
+                    0,
+                    block_ids,
+                    _pa_nz_to_logical_cache(key_cache_nz, key.shape[-1], last_dim=last_dim),
+                )
+                value_cache.index_copy_(
+                    0,
+                    block_ids,
+                    _pa_nz_to_logical_cache(value_cache_nz, value.shape[-1], last_dim=last_dim),
+                )
+                return
+            torch_npu.npu_scatter_pa_kv_cache(
+                key=key.contiguous(),
+                value=value.contiguous(),
+                key_cache=key_cache,
+                value_cache=value_cache,
+                slot_mapping=slot_mapping.contiguous(),
+            )
+
+        device_operator.reshape_and_cache = classmethod(reshape_and_cache)
+        device_operator._omni_cache_mode_compat = True
+        logger.warning_once(
+            "Applied narrow vLLM-Ascend cache-writer compatibility: "
+            "torch_npu.npu_scatter_pa_kv_cache does not accept cache_mode."
+        )
+
+    @classmethod
+    def configure_diffusion_vllm_config(cls, vllm_config: Any, od_config: Any) -> None:
+        """Use the block geometry required by Ascend's native paged kernel."""
+        if getattr(od_config, "diffusion_kv_mode", None) is None:
+            return
+        from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+
+        if od_config.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+            return
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+
+        supported_sizes = [
+            size
+            for size in AscendAttentionBackend.get_supported_kernel_block_sizes()
+            if type(size) is int and size > 0
+        ]
+        if not supported_sizes:
+            raise RuntimeError("Ascend paged attention did not expose an integer kernel block size")
+        # vLLM's generic default is 16, while the 0.27 Ascend FIA backend
+        # stores cache pages as 128-token blocks.  Set the Manager geometry
+        # before KV specs are collected so Scheduler and Worker agree.
+        vllm_config.cache_config.block_size = supported_sizes[0]
 
     @classmethod
     def get_diffusion_kv_block_tables_cls(cls) -> type:
@@ -238,7 +390,12 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         """
         try:
             torch.npu.current_stream().synchronize()
-            event = torch.npu.Event()
+            # The async output worker uses the public ``torch.Stream`` API.
+            # With torch_npu 2.10, a native ``torch.npu.Event`` cannot be
+            # consumed by that wrapper stream (the reverse direction is
+            # supported), while ``torch.Event`` is dispatched to the active
+            # NPU backend and remains cross-stream compatible.
+            event = torch.Event()
             event.record()
             return event
         except Exception:

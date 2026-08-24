@@ -23,6 +23,7 @@ from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
 from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
 from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
@@ -111,6 +112,42 @@ class Attention(nn.Module):
             role_category=role_category,
             allow_trtllm_default=allow_trtllm_default,
         )
+        scheduler_paged_kv = (
+            config is not None
+            and getattr(config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+        )
+        if (
+            scheduler_paged_kv
+            and paged_kv_cache_role is not None
+            and spec is None
+            and not attn_backend_cls.supports_paged_kv
+        ):
+            # Scheduler-owned paging is executed by the platform-native vLLM
+            # implementation.  A platform may legitimately default dense
+            # attention to SDPA (for example when an optional diffusion FA
+            # package is absent), but a paged layer must advertise the
+            # capability so the Worker can register its native cache view.
+            # Resolve the portable Flash backend only for this marked layer;
+            # unmarked dense attention keeps the platform default unchanged.
+            from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+
+            dense_backend_name = attn_backend_cls.get_name()
+            paged_attention_config = AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN"))
+            attn_backend_cls, spec = get_attn_backend_for_role(
+                role=role,
+                head_size=head_size,
+                attention_config=paged_attention_config,
+                role_category=role_category,
+                allow_trtllm_default=allow_trtllm_default,
+            )
+            logger.info(
+                "Resolved marked paged diffusion attention role=%r to %r because the platform default %r "
+                "does not support Scheduler-owned KV",
+                role,
+                attn_backend_cls.get_name(),
+                dense_backend_name,
+            )
         parallel_config = getattr(config, "parallel_config", None)
         allgather_degree = getattr(parallel_config, "allgather_degree", 1)
         # TODO: Move AllGather-KV compatibility into an AttentionBackend capability
@@ -392,8 +429,21 @@ class Attention(nn.Module):
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
-        # Fallback to standard attention
-        return self.attention.forward(query, key, value, attn_metadata)
+        # A paged-capable backend may have an optional dense-only dependency
+        # (MindIE-SD on Ascend).  Memory profiling runs before the Worker has
+        # installed the native page-table adapter, so use the local SDPA
+        # implementation for that probe.  Once paging is active, execution
+        # takes ``forward_paged`` above and never reaches this fallback.
+        try:
+            return self.attention.forward(query, key, value, attn_metadata)
+        except ImportError:
+            if self.paged_kv_cache_role is None or self.is_paged_kv_active():
+                raise
+            logger.warning_once(
+                "Dense profiling for paged diffusion attention is falling back to SDPA because "
+                "the selected backend's optional dense kernel is unavailable."
+            )
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
     def _assert_piecewise_compatible(self, attn_metadata: AttentionMetadata | None) -> None:
         if attn_metadata is None or attn_metadata.full_attn_spans is None:

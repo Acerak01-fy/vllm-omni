@@ -1069,6 +1069,104 @@ class ImageKVCacheManager(nn.Module):
         )
         return key, value
 
+    def _forward_paged(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        query_lens: list[int] | None,
+        paged_query_lens: list[int] | None,
+        paged_seq_lens: list[int] | None,
+        full_attn_spans: list[list[tuple[int, int]]] | None,
+    ) -> torch.Tensor:
+        """Run native paged attention on only the valid tokens of each row."""
+
+        if paged_query_lens is None or paged_seq_lens is None:
+            raise ValueError("Paged Hunyuan attention requires paged_query_lens and paged_seq_lens metadata")
+        if len(paged_query_lens) != len(paged_seq_lens):
+            raise ValueError("Paged Hunyuan query and sequence length metadata must have equal row counts")
+        if full_attn_spans is None or len(full_attn_spans) != len(paged_query_lens):
+            raise ValueError("Paged Hunyuan attention requires one full_attn_spans row per native KV row")
+        if self._injected_ar_kv is not None:
+            raise NotImplementedError(
+                "Hunyuan Scheduler paged KV does not support AR-stage KV injection; "
+                "the native cache must be populated by the DiT write itself."
+            )
+
+        batch_size = len(paged_query_lens)
+        if batch_size == 0:
+            raise ValueError("Paged Hunyuan attention received an empty batch")
+        if query_lens is None:
+            padded_query_len = max(paged_query_lens)
+        else:
+            if len(query_lens) != batch_size:
+                raise ValueError("Hunyuan query_lens and paged row metadata have different batch sizes")
+            padded_query_len = int(query_lens[0])
+        if padded_query_len <= 0:
+            raise ValueError("Hunyuan paged attention requires a positive padded query length")
+
+        def _to_padded_rows(tensor: torch.Tensor, num_heads: int, name: str) -> torch.Tensor:
+            """Normalize flattened and projection-native [B, S, H*D] layouts."""
+
+            if tensor.ndim == 4:
+                rows = tensor
+            elif tensor.ndim == 3 and tensor.shape[-2:] == (num_heads, self.head_dim):
+                rows = tensor.reshape(batch_size, -1, num_heads, self.head_dim)
+            elif tensor.ndim == 3 and tensor.shape[-1] == num_heads * self.head_dim:
+                rows = tensor.reshape(batch_size, -1, num_heads, self.head_dim)
+            elif tensor.ndim == 2 and tensor.shape[-1] == num_heads * self.head_dim:
+                rows = tensor.reshape(batch_size, -1, num_heads, self.head_dim)
+            else:
+                raise ValueError(
+                    f"Unsupported Hunyuan paged {name} layout: shape={tuple(tensor.shape)}, "
+                    f"expected token/head dimensions ({num_heads}, {self.head_dim})"
+                )
+            if rows.shape[0] != batch_size or rows.shape[2:] != (num_heads, self.head_dim):
+                raise ValueError(
+                    f"Invalid Hunyuan paged {name} rows: shape={tuple(rows.shape)}, batch={batch_size}, "
+                    f"heads={num_heads}, head_dim={self.head_dim}"
+                )
+            return rows
+
+        query_rows = _to_padded_rows(query, self.num_heads, "query")
+        key_rows = _to_padded_rows(key, self.num_kv_heads, "key")
+        value_rows = _to_padded_rows(value, self.num_kv_heads, "value")
+        key_padded_len = key_rows.shape[1]
+        value_padded_len = value_rows.shape[1]
+        if key_padded_len < max(paged_query_lens) or value_padded_len < max(paged_query_lens):
+            raise ValueError(
+                "Hunyuan paged K/V tensors are shorter than the requested write spans: "
+                f"key={key_padded_len}, value={value_padded_len}, requested={max(paged_query_lens)}"
+            )
+
+        query_packed = torch.cat(
+            [row[:query_len] for row, query_len in zip(query_rows, paged_query_lens, strict=True)], dim=0
+        ).contiguous()
+        key_packed = torch.cat(
+            [row[:query_len] for row, query_len in zip(key_rows, paged_query_lens, strict=True)], dim=0
+        ).contiguous()
+        value_packed = torch.cat(
+            [row[:query_len] for row, query_len in zip(value_rows, paged_query_lens, strict=True)], dim=0
+        ).contiguous()
+
+        # The adapter validates the logical sequence lengths and write starts
+        # against the Worker-prepared rows. Keep this local check to catch a
+        # model/pipeline mismatch before entering a native kernel.
+        if any(seq_len < query_len for seq_len, query_len in zip(paged_seq_lens, paged_query_lens, strict=True)):
+            raise ValueError(
+                f"Hunyuan paged logical sequence lengths must cover each write: {paged_seq_lens} vs {paged_query_lens}"
+            )
+        attn_metadata = AttentionMetadata(attn_mask=None, full_attn_spans=full_attn_spans)
+        output_packed = self.attn(query_packed, key_packed, value_packed, attn_metadata)
+        output_packed = output_packed.reshape(-1, self.num_heads, self.head_dim)
+        output_rows = query.new_zeros((batch_size, padded_query_len, self.num_heads, self.head_dim))
+        offset = 0
+        for row_index, query_len in enumerate(paged_query_lens):
+            output_rows[row_index, :query_len] = output_packed[offset : offset + query_len]
+            offset += query_len
+        return output_rows.reshape(batch_size * padded_query_len, self.num_heads, self.head_dim)
+
     def forward(
         self,
         query: torch.Tensor,
@@ -1083,6 +1181,19 @@ class ImageKVCacheManager(nn.Module):
 
         query_lens = kwargs.get("query_lens")
         seq_lens = kwargs.get("seq_lens")
+        paged_active = self.attn.is_paged_kv_active()
+        if paged_active and kwargs.get("paged_query_lens") is not None:
+            if uncond_cfg_prefill:
+                raise NotImplementedError("Hunyuan paged KV does not support the AR negative CFG prefill path")
+            return self._forward_paged(
+                query,
+                key,
+                value,
+                query_lens=query_lens,
+                paged_query_lens=kwargs.get("paged_query_lens"),
+                paged_seq_lens=kwargs.get("paged_seq_lens"),
+                full_attn_spans=kwargs.get("full_attn_spans"),
+            )
         shard_image_size = kwargs.get("shard_image_size") if self.sp_size > 1 else None
         bs = len(query_lens)
         q_len = query_lens[0]
@@ -2350,6 +2461,9 @@ class HunyuanImage3Model(nn.Module):
         first_step: bool | None = None,
         query_lens: list[int] | None = None,
         seq_lens: list[int] | None = None,
+        paged_query_lens: list[int] | None = None,
+        paged_seq_lens: list[int] | None = None,
+        paged_kv_start_pos: list[int] | None = None,
         num_image_tokens: int | None = None,
         gen_timestep_scatter_index: torch.Tensor | None = None,
         uncond_cfg_prefill: bool = False,
@@ -2457,6 +2571,9 @@ class HunyuanImage3Model(nn.Module):
                 first_step=first_step,
                 query_lens=query_lens,
                 seq_lens=seq_lens,
+                paged_query_lens=paged_query_lens,
+                paged_seq_lens=paged_seq_lens,
+                paged_kv_start_pos=paged_kv_start_pos,
                 num_image_tokens=num_image_tokens,
                 gen_timestep_scatter_index=gen_timestep_scatter_index,
                 shard_image_size=shard_image_size,

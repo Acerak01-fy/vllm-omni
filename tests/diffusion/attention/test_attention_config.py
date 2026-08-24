@@ -419,6 +419,77 @@ class TestCurrentDiffusionConfig:
 
 
 class TestAttentionInitUsesCurrentDiffusionConfig:
+    def test_paged_profile_falls_back_when_dense_optional_kernel_is_missing(self, monkeypatch):
+        attention = Attention.__new__(Attention)
+        attention.paged_kv_cache_role = "primary"
+        attention.backend_pref = "FLASH_ATTN"
+        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
+        attention.attention = SimpleNamespace(forward=lambda *args: (_ for _ in ()).throw(ImportError("optional")))
+        expected = torch.zeros(1)
+        attention.sdpa_fallback = SimpleNamespace(forward=lambda *args: expected)
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+
+        result = attention._run_local_attention(
+            torch.zeros(1, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.bfloat16),
+            AttentionMetadata(),
+        )
+
+        assert result is expected
+
+    def test_paged_marker_does_not_change_dense_backend(self, monkeypatch):
+        class _FakeAttentionImpl:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def forward(self, query, key, value, attn_metadata=None):
+                return query
+
+        class _DenseBackend:
+            supports_paged_kv = False
+
+            @staticmethod
+            def get_name() -> str:
+                return "TORCH_SDPA"
+
+            @staticmethod
+            def get_impl_cls():
+                return _FakeAttentionImpl
+
+        calls = []
+
+        def _fake_get_attn_backend_for_role(*args, **kwargs):
+            calls.append((args, kwargs))
+            return _DenseBackend, None
+
+        monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", _fake_get_attn_backend_for_role)
+        monkeypatch.setattr(layer_mod.SDPABackend, "get_impl_cls", staticmethod(lambda: _FakeAttentionImpl))
+        monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: object())
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
+
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(),
+            diffusion_kv_mode=layer_mod.DiffusionKVCacheMode.DENSE_LEGACY,
+            parallel_config=SimpleNamespace(ring_degree=1),
+            diffusion_kv_cache_dtype=None,
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
+        )
+
+        with set_current_diffusion_config(od_config):
+            attention = Attention(
+                num_heads=4,
+                head_size=64,
+                causal=False,
+                softmax_scale=1.0,
+                paged_kv_cache_role="primary",
+            )
+
+        assert len(calls) == 1
+        assert attention.attn_backend is _DenseBackend
+        assert attention.backend_pref is None
+
     def test_attention_init_uses_current_diffusion_config_without_forward_context(self, monkeypatch):
         class _FakeAttentionImpl:
             def __init__(self, **kwargs):

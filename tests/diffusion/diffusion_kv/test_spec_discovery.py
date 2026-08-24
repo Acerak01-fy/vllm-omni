@@ -42,7 +42,7 @@ class _RunnerKVBackend:
         self.kv_cache_config = config
 
 
-def _attention(*, enabled: bool) -> Attention:
+def _attention(*, enabled: bool, prefix: str | None = None) -> Attention:
     attention = Attention.__new__(Attention)
     nn.Module.__init__(attention)
     attention.paged_kv_cache_role = "primary" if enabled else None
@@ -51,6 +51,7 @@ def _attention(*, enabled: bool) -> Attention:
     attention.head_size = 8
     attention.causal = False
     attention.attn_backend = _Backend
+    attention.prefix = prefix
     return attention
 
 
@@ -80,6 +81,21 @@ def test_runner_discovers_native_spec_from_loaded_attention() -> None:
     assert spec.dtype is torch.bfloat16
     assert spec.indexes_kv_by_block_stride is True
     assert spec.non_causal is True
+
+
+def test_runner_uses_attention_prefix_for_nested_pipeline() -> None:
+    runner = _runner(_attention(enabled=True, prefix="layers.0.image_attention"))
+    runner.pipeline = nn.Module()
+    model = nn.Module()
+    model.image_attention = _attention(
+        enabled=True,
+        prefix="layers.0.image_attention",
+    )
+    runner.pipeline.model = model
+
+    specs = runner.get_kv_cache_spec()
+
+    assert set(specs) == {"layers.0.image_attention"}
 
 
 def test_runner_rejects_paged_mode_without_cache_enabled_attention() -> None:

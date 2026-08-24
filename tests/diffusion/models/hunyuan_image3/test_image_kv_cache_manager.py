@@ -163,6 +163,65 @@ def test_gqa_kv_stays_compressed_for_paged_attention(
     assert value_input.shape == expected_shape
 
 
+def test_paged_forward_packs_heterogeneous_valid_rows() -> None:
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = True
+    batch_size = 2
+    padded_len = 5
+    key, value = _make_known_kv(batch_size * padded_len)
+    query = torch.randn(batch_size * padded_len, NUM_HEADS, HEAD_DIM)
+
+    output = mgr(
+        query,
+        key,
+        value,
+        attention_mask=torch.zeros(batch_size, 1, padded_len, padded_len),
+        query_lens=[padded_len] * batch_size,
+        seq_lens=[padded_len] * batch_size,
+        paged_query_lens=[3, 5],
+        paged_seq_lens=[4, 7],
+        full_attn_spans=[[], []],
+        first_step=True,
+        num_image_tokens=0,
+    )
+
+    assert output.shape == query.shape
+    _, packed_key, packed_value = mgr.attn.calls[-1]
+    assert packed_key.shape == (8, NUM_KV_HEADS, HEAD_DIM)
+    assert packed_value.shape == (8, NUM_KV_HEADS, HEAD_DIM)
+    assert torch.count_nonzero(output[3:5]) == 0
+
+
+def test_paged_forward_accepts_projection_native_batched_value_layout() -> None:
+    """Hunyuan's Q/K are rope-flattened while V remains [B, S, KV*D]."""
+
+    mgr = _make_cache_mgr()
+    mgr.attn.paged_kv_active = True
+    batch_size = 2
+    padded_len = 4
+    query = torch.randn(batch_size * padded_len, NUM_HEADS, HEAD_DIM)
+    key, value = _make_known_kv(batch_size * padded_len)
+    value_batched = value.reshape(batch_size, padded_len, NUM_KV_HEADS * HEAD_DIM)
+
+    output = mgr(
+        query,
+        key,
+        value_batched,
+        attention_mask=None,
+        query_lens=[padded_len] * batch_size,
+        seq_lens=[padded_len] * batch_size,
+        paged_query_lens=[padded_len, padded_len],
+        paged_seq_lens=[padded_len, padded_len],
+        full_attn_spans=[[], []],
+        first_step=True,
+        num_image_tokens=0,
+    )
+
+    assert output.shape == query.shape
+    _, _, packed_value = mgr.attn.calls[-1]
+    assert packed_value.shape == (batch_size * padded_len, NUM_KV_HEADS, HEAD_DIM)
+
+
 # ============================================================
 # Test 1: No AR KV — basic cache → reuse
 # ============================================================

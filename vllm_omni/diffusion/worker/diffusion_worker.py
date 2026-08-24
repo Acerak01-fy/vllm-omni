@@ -190,8 +190,8 @@ class DiffusionWorker:
         self.stage_id = getattr(od_config, "stage_id", 0)
         if self.od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER:
             logger.warning_once(
-                "paged_scheduler initializes native paged KV storage, but no production diffusion model uses the "
-                "paged-attention adapter yet; model attention remains on the dense path."
+                "paged_scheduler initializes native paged KV storage; each diffusion model must provide its "
+                "model-specific paged attention rows."
             )
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
