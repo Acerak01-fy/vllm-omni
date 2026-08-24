@@ -42,25 +42,3 @@ def parse_diffusion_kv_cache_mode(value: object) -> DiffusionKVCacheMode:
 def is_scheduler_paged_kv_mode(mode: DiffusionKVCacheMode) -> bool:
     """Return whether a parsed cache mode uses Scheduler-owned paging."""
     return mode is DiffusionKVCacheMode.PAGED_SCHEDULER
-
-
-def validate_scheduler_paged_kv_step_execution(
-    mode: DiffusionKVCacheMode | str,
-    *,
-    step_execution: bool,
-) -> DiffusionKVCacheMode:
-    """Validate the execution contract for Scheduler-owned Diffusion KV.
-
-    Native page-table metadata is prepared around one explicit denoise step.
-    Request-mode execution has no active ``DiffusionPagedAttentionAdapter``;
-    allowing it with ``paged_scheduler`` would allocate pages that the model
-    cannot consume and silently fall back to the legacy dense cache.
-    """
-
-    parsed_mode = parse_diffusion_kv_cache_mode(mode)
-    if parsed_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and not step_execution:
-        raise ValueError(
-            "paged_scheduler requires step_execution=True; "
-            "request-mode execution cannot activate Scheduler-owned paged attention"
-        )
-    return parsed_mode

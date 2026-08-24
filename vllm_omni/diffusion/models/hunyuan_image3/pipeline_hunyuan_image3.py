@@ -855,7 +855,7 @@ class HunyuanImage3Pipeline(
             # The model still receives a padded [B, S, H] tensor. These fields
             # describe that physical tensor; the paged fields above describe
             # the valid per-row write spans consumed by the Scheduler-paged
-            # ImageAttentionAdapter.
+            # ImageKVCacheManager adapter.
             if "position_ids" in merged and isinstance(merged["position_ids"], torch.Tensor):
                 padded_query_len = int(merged["position_ids"].shape[-1])
             elif input_values[0] is not None:

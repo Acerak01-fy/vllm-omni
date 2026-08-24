@@ -882,15 +882,16 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
-class ImageAttentionAdapter(nn.Module):
+class ImageKVCacheManager(nn.Module):
     """Hunyuan image-attention adapter for dense and Scheduler-paged paths.
 
     The ``Attention`` child is the only cache-enabled module.  In
     ``paged_scheduler`` mode the Scheduler's ``DiffusionKVCacheManager`` owns
     admission and block allocation, while the Worker-installed paged adapter
     owns the physical pages.  The prompt fields kept on this wrapper are a
-    legacy dense-only compatibility path and must never be consulted while a
-    native paged adapter is active.
+    legacy dense-only compatibility path; this class is not the Scheduler's
+    KV allocator and must not be consulted while a native paged adapter is
+    active.
     """
 
     def __init__(
@@ -1305,11 +1306,6 @@ class ImageAttentionAdapter(nn.Module):
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
         return attn_output
-
-
-# Keep the historical import path for downstream tests/tools.  It is an
-# attention adapter now; it is not the Scheduler's KV allocator.
-ImageKVCacheManager = ImageAttentionAdapter
 
 
 @dataclass
@@ -1861,7 +1857,7 @@ class HunYuanAttention(nn.Module):
         )
 
         # default image_token_len = timestamp + 4096*image_tokes
-        self.image_attn = ImageAttentionAdapter(
+        self.image_attn = ImageKVCacheManager(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
             num_kv_heads=self.num_kv_heads,

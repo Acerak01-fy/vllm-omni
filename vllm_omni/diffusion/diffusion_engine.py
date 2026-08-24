@@ -33,7 +33,6 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
     is_scheduler_paged_kv_mode,
-    validate_scheduler_paged_kv_step_execution,
 )
 from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
@@ -301,15 +300,6 @@ class DiffusionEngine:
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
             od_config.step_execution = True
             self.step_execution = True
-
-        # Scheduler-owned pages are consumed by the stepwise Worker adapter.
-        # Keep this runtime check even though structured config validation
-        # performs the same check, because several embedding callers pass a
-        # lightweight config object directly to DiffusionEngine.
-        validate_scheduler_paged_kv_step_execution(
-            getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY),
-            step_execution=self.step_execution,
-        )
 
         if self.step_execution:
             self.supports_request_batch = False

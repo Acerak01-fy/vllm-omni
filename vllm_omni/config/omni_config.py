@@ -50,7 +50,6 @@ from vllm_omni.config.stage_config import (
 from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
     parse_diffusion_kv_cache_mode,
-    validate_scheduler_paged_kv_step_execution,
 )
 
 _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str | None]] = {
@@ -825,10 +824,11 @@ class _DiffusionConfigProjection:
             and self.diffusion_kv_max_rows_per_request is None
         ):
             raise ValueError("paged_scheduler requires diffusion_kv_max_rows_per_request to be set")
-        self.diffusion_kv_mode = validate_scheduler_paged_kv_step_execution(
-            self.diffusion_kv_mode,
-            step_execution=self.step_execution,
-        )
+        if self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and not self.step_execution:
+            raise ValueError(
+                "paged_scheduler requires step_execution=True; "
+                "request-mode execution cannot activate Scheduler-owned paged attention"
+            )
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
