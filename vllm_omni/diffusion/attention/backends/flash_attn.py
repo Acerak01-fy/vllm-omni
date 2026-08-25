@@ -11,7 +11,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
-    OptionalAttentionBackendDependencyError,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
@@ -22,31 +21,6 @@ from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
-
-
-def _load_mindiesd_attention(api_name: str):
-    """Load one MindIE-SD API without hiding transitive import failures."""
-
-    try:
-        import mindiesd
-    except ModuleNotFoundError as exc:
-        if exc.name != "mindiesd":
-            raise
-        raise OptionalAttentionBackendDependencyError(
-            "FlashAttentionBackend NPU implementation requires MindIE-SD. "
-            "Please install MindIE-SD to enable NPU attention support. "
-            "For installation details, see https://gitcode.com/Ascend/MindIE-SD. "
-            "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA."
-        ) from exc
-
-    try:
-        return getattr(mindiesd, api_name)
-    except AttributeError as exc:
-        raise OptionalAttentionBackendDependencyError(
-            f"The installed MindIE-SD package does not expose {api_name}. "
-            "Use a compatible MindIE-SD version or select "
-            "DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA."
-        ) from exc
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -293,28 +267,32 @@ class FlashAttentionImpl(AttentionImpl):
         native_impl = getattr(layer, "impl", None)
         if native_impl is None:
             raise RuntimeError(f"Native attention implementation is not bound for diffusion layer {layer.layer_name!r}")
-        static_paged_kv = (
-            paged_kv_context.write_plan is not None and current_omni_platform.supports_diffusion_paged_kv_write_plan()
-        )
-        read_paged_kv_from_cache = static_paged_kv and layer.attn_backend.forward_includes_kv_cache_update
-        if not layer.attn_backend.forward_includes_kv_cache_update or static_paged_kv:
-            if static_paged_kv and not callable(getattr(native_impl, "do_kv_cache_update", None)):
-                raise RuntimeError(
-                    f"Native attention implementation for {layer.layer_name!r} cannot consume a prepared KV write plan"
+        if paged_kv_context.imported_prefix_key is not None:
+            update_cache = getattr(native_impl, "do_kv_cache_update", None)
+            if not callable(update_cache):
+                raise NotImplementedError(
+                    f"Native paged backend {layer.attn_backend.get_name()!r} cannot import a dense KV prefix"
                 )
-            with current_omni_platform.use_diffusion_paged_kv_write_plan(paged_kv_context.write_plan):
-                native_impl.do_kv_cache_update(
-                    layer,
-                    paged_kv_context.key_write,
-                    paged_kv_context.value_write,
-                    kv_cache,
-                    paged_kv_context.slot_mapping,
-                )
+            update_cache(
+                layer,
+                paged_kv_context.imported_prefix_key,
+                paged_kv_context.imported_prefix_value,
+                kv_cache,
+                paged_kv_context.imported_prefix_slot_mapping,
+            )
+        if not layer.attn_backend.forward_includes_kv_cache_update:
+            native_impl.do_kv_cache_update(
+                layer,
+                paged_kv_context.key_write,
+                paged_kv_context.value_write,
+                kv_cache,
+                paged_kv_context.slot_mapping,
+            )
 
         def run_native_attention(
             query: torch.Tensor,
-            key: torch.Tensor | None,
-            value: torch.Tensor | None,
+            key: torch.Tensor,
+            value: torch.Tensor,
             native_metadata,
         ) -> torch.Tensor:
             output = torch.empty(
@@ -322,16 +300,15 @@ class FlashAttentionImpl(AttentionImpl):
                 dtype=query.dtype,
                 device=query.device,
             )
-            with current_omni_platform.use_diffusion_paged_kv_write_plan(paged_kv_context.write_plan):
-                return native_impl.forward(
-                    layer,
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    native_metadata,
-                    output,
-                )
+            return native_impl.forward(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                native_metadata,
+                output,
+            )
 
         if paged_kv_context.piecewise_plan is not None:
             output = run_paged_piecewise_plan(
@@ -341,15 +318,12 @@ class FlashAttentionImpl(AttentionImpl):
                 paged_kv_context.piecewise_plan,
                 paged_kv_context.piecewise_native_metadata,
                 run_native_attention,
-                read_kv_from_cache=read_paged_kv_from_cache,
             )
         else:
-            native_key = None if read_paged_kv_from_cache else paged_kv_context.key_write
-            native_value = None if read_paged_kv_from_cache else paged_kv_context.value_write
             output = run_native_attention(
                 paged_kv_context.query,
-                native_key,
-                native_value,
+                paged_kv_context.key_write,
+                paged_kv_context.value_write,
                 paged_kv_context.native_metadata,
             )
         return paged_kv_context.restore_output(output)
@@ -525,7 +499,15 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        attention_forward = _load_mindiesd_attention("attention_forward")
+        try:
+            from mindiesd import attention_forward
+        except ImportError:
+            raise ImportError(
+                "FlashAttentionBackend NPU implementation requires MindIE-SD. "
+                "Please install MindIE-SD to enable NPU attention support. "
+                "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
+                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+            )
         # Opt-in mask-free paths (mirror the CUDA cu_seqlens behavior): the
         # model marks extra["npu_attn_varlen"] and carries packed metadata, so
         # the padding document is excluded without reading or materializing
@@ -634,7 +616,15 @@ class FlashAttentionImpl(AttentionImpl):
             return None
         seq_q, seq_k = resolved
 
-        attention_forward_varlen = _load_mindiesd_attention("attention_forward_varlen")
+        try:
+            from mindiesd import attention_forward_varlen
+        except ImportError:
+            raise ImportError(
+                "FlashAttentionBackend NPU implementation requires MindIE-SD. "
+                "Please install MindIE-SD to enable NPU attention support. "
+                "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
+                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+            )
         q = query.squeeze(0)  # [T, N, D] == TND
         k = key.squeeze(0)
         v = value.squeeze(0)
@@ -682,7 +672,15 @@ class FlashAttentionImpl(AttentionImpl):
         _, seq_k = resolved
         used_k = seq_k[0]  # real document length (first cumulative end)
 
-        attention_forward = _load_mindiesd_attention("attention_forward")
+        try:
+            from mindiesd import attention_forward
+        except ImportError:
+            raise ImportError(
+                "FlashAttentionBackend NPU implementation requires MindIE-SD. "
+                "Please install MindIE-SD to enable NPU attention support. "
+                "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
+                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+            )
         # mindiesd always takes BSND input regardless of `layout`; the arg
         # selects the op-internal layout and laser only supports BNSD, so do
         # NOT forward the model's qkv_layout ("BSND" for MiniMax-H3) here.

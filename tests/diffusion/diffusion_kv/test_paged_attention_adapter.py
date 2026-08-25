@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import math
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -15,7 +15,6 @@ import torch
 from torch import nn
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.diffusion_kv import paged_attention_adapter as adapter_module
@@ -23,9 +22,9 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
     DiffusionPagedAttentionRow,
     DiffusionPagedAttentionRowBinding,
-    DiffusionPagedKVWritePlan,
 )
 from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
     override_paged_kv_adapter,
     set_forward_context,
 )
@@ -157,21 +156,6 @@ def _make_adapter(
     capacity: int = 16,
 ) -> tuple[DiffusionPagedAttentionAdapter, _FakeBlockTables, _FakeLayer, list[tuple]]:
     events: list[tuple] = []
-    monkeypatch.setattr(
-        adapter_module.current_omni_platform,
-        "build_diffusion_paged_kv_write_plans",
-        lambda **_kwargs: {},
-    )
-    monkeypatch.setattr(
-        adapter_module.current_omni_platform,
-        "supports_diffusion_paged_kv_write_plan",
-        lambda: False,
-    )
-    monkeypatch.setattr(
-        adapter_module.current_omni_platform,
-        "use_diffusion_paged_kv_write_plan",
-        lambda _plan: nullcontext(),
-    )
     block_tables = _FakeBlockTables()
     block_tables.max_num_batched_tokens = capacity
     block_tables.num_blocks.np.fill(math.ceil(capacity / block_tables.block_sizes[0]))
@@ -299,42 +283,46 @@ def test_omni_paged_backend_consumes_context_and_restores_diffusion_shape(
     assert layer.calls[0][3] is events[0][2]
 
 
-def test_paged_adapter_packs_valid_sp_rows_and_restores_physical_layout(
+def test_omni_paged_backend_imports_dense_prefix_before_current_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    adapter, _, layer, _ = _make_adapter(monkeypatch)
+    adapter, block_tables, layer, _ = _make_adapter(monkeypatch)
     batch = adapter.prepare_batch(
         [
-            DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=3, seq_len=3),
-            DiffusionPagedAttentionRow(request_id="req-1", sequence_id=1, query_len=5, seq_len=5),
+            DiffusionPagedAttentionRow(
+                request_id="req-0",
+                sequence_id=0,
+                query_len=3,
+                seq_len=7,
+                kv_start_pos=4,
+                imported_prefix_len=4,
+            )
         ]
     )
-    query = torch.arange(2 * 5 * 2 * 4, dtype=torch.float32).reshape(2, 5, 2, 4)
-    key = query + 100
-    value = query + 200
-    packed_indices = torch.tensor([0, 1, 2, 5, 6, 7, 8, 9], dtype=torch.long)
-    metadata = AttentionMetadata(
-        full_attn_spans=[[], []],
-        paged_query_indices=packed_indices,
+    query = torch.randn(1, 3, 2, 4)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    prefix_key = torch.randn(1, 4, 2, 4)
+    prefix_value = torch.randn_like(prefix_key)
+    metadata = SimpleNamespace(
+        full_attn_spans=None,
+        paged_kv_prefix_key=prefix_key,
+        paged_kv_prefix_value=prefix_value,
+        extra={},
     )
 
     with adapter.activate(batch):
-        context = adapter.prepare_layer_context(
-            "layer-0",
-            query,
-            key,
-            value,
-            omni_attn_metadata=metadata,
-        )
+        context = adapter.prepare_layer_context("layer-0", query, key, value, omni_attn_metadata=metadata)
         output = _run_omni_paged_backend(context)
 
-    torch.testing.assert_close(context.query, query.reshape(-1, 2, 4).index_select(0, packed_indices))
-    torch.testing.assert_close(context.key_write, key.reshape(-1, 2, 4).index_select(0, packed_indices))
-    assert output.shape == query.shape
-    torch.testing.assert_close(output[0, :3], query[0, :3])
-    assert torch.count_nonzero(output[0, 3:]) == 0
-    torch.testing.assert_close(output[1], query[1])
-    assert layer.updates[0][2].tolist() == batch.positions.tolist()
+    assert torch.equal(output, query)
+    assert [call[2].tolist() for call in block_tables.slot_calls] == [[0, 1, 2, 3], [4, 5, 6]]
+    assert layer.native_events == ["update", "update", "forward"]
+    assert torch.equal(layer.updates[0][0], prefix_key.reshape(4, 2, 4))
+    assert torch.equal(layer.updates[0][1], prefix_value.reshape(4, 2, 4))
+    assert layer.updates[0][2].tolist() == [0, 1, 2, 3]
+    assert torch.equal(layer.updates[1][0], key.reshape(3, 2, 4))
+    assert layer.updates[1][2].tolist() == [4, 5, 6]
 
 
 def test_paged_adapter_accepts_native_gqa_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -405,151 +393,6 @@ def test_omni_piecewise_backend_defers_backend_owned_cache_update(monkeypatch: p
     assert [metadata.query_start_loc_cpu.tolist() for metadata in segment_metadata] == [[0, 1], [0, 2], [0, 1]]
     assert [metadata.positions.tolist() for metadata in segment_metadata] == [[0], [1, 2], [3]]
     assert [metadata.slot_mappings.tolist() for metadata in segment_metadata] == [[[0]], [[1, 2]], [[3]]]
-
-
-def test_omni_piecewise_backend_static_plan_updates_once_then_reads_cache(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter, _, layer, events = _make_adapter(monkeypatch)
-    layer.attn_backend.forward_includes_kv_cache_update = True
-    write_plan = DiffusionPagedKVWritePlan(
-        block_ids=torch.tensor([3]),
-        local_slot_mapping=torch.arange(4),
-    )
-    monkeypatch.setattr(
-        adapter_module.current_omni_platform,
-        "build_diffusion_paged_kv_write_plans",
-        lambda **_kwargs: {"layer-0": write_plan},
-    )
-    monkeypatch.setattr(
-        adapter_module.current_omni_platform,
-        "supports_diffusion_paged_kv_write_plan",
-        lambda: True,
-    )
-    active_plans = []
-
-    @contextmanager
-    def use_write_plan(plan):
-        active_plans.append(plan)
-        yield
-
-    monkeypatch.setattr(
-        adapter_module.current_omni_platform,
-        "use_diffusion_paged_kv_write_plan",
-        use_write_plan,
-    )
-    batch = adapter.prepare_batch(
-        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=4, seq_len=4)]
-    )
-    query = torch.randn(1, 4, 2, 4)
-    key = torch.randn_like(query)
-    value = torch.randn_like(query)
-    metadata = SimpleNamespace(full_attn_spans=[[(1, 3)]], extra={})
-
-    with adapter.activate(batch):
-        context = adapter.prepare_layer_context(
-            "layer-0",
-            query,
-            key,
-            value,
-            omni_attn_metadata=metadata,
-        )
-        output = _run_omni_paged_backend(context)
-
-    assert torch.equal(output, query)
-    assert layer.native_events == ["update", "forward", "forward", "forward"]
-    assert len(layer.updates) == 1
-    assert len(active_plans) == 4
-    assert all(plan is write_plan for plan in active_plans)
-    update_key, update_value, update_slots = layer.updates[0]
-    assert torch.equal(update_key, key.reshape(4, 2, 4))
-    assert torch.equal(update_value, value.reshape(4, 2, 4))
-    assert update_slots.tolist() == [0, 1, 2, 3]
-    assert [call[0].shape[0] for call in layer.calls] == [1, 2, 1]
-    assert all(call[1] is None and call[2] is None for call in layer.calls)
-    assert all(call[3] is event[2] for call, event in zip(layer.calls, events[1:], strict=True))
-
-
-def test_omni_non_piecewise_static_plan_does_not_write_twice(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter, _, layer, _ = _make_adapter(monkeypatch)
-    layer.attn_backend.forward_includes_kv_cache_update = True
-    write_plan = DiffusionPagedKVWritePlan(
-        block_ids=torch.tensor([3]),
-        local_slot_mapping=torch.arange(3),
-    )
-    monkeypatch.setattr(
-        adapter_module.current_omni_platform,
-        "build_diffusion_paged_kv_write_plans",
-        lambda **_kwargs: {"layer-0": write_plan},
-    )
-    monkeypatch.setattr(
-        adapter_module.current_omni_platform,
-        "supports_diffusion_paged_kv_write_plan",
-        lambda: True,
-    )
-    active_plans = []
-
-    @contextmanager
-    def use_write_plan(plan):
-        active_plans.append(plan)
-        yield
-
-    monkeypatch.setattr(adapter_module.current_omni_platform, "use_diffusion_paged_kv_write_plan", use_write_plan)
-    batch = adapter.prepare_batch(
-        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=3, seq_len=3)]
-    )
-    qkv = torch.randn(1, 3, 2, 4)
-
-    with adapter.activate(batch):
-        context = adapter.prepare_layer_context("layer-0", qkv, qkv, qkv)
-        output = _run_omni_paged_backend(context)
-
-    assert torch.equal(output, qkv)
-    assert layer.native_events == ["update", "forward"]
-    assert len(layer.updates) == 1
-    assert len(active_plans) == 2
-    assert all(plan is write_plan for plan in active_plans)
-    assert layer.calls[0][1] is None and layer.calls[0][2] is None
-
-
-def test_static_write_plan_is_reused_until_block_table_changes(monkeypatch: pytest.MonkeyPatch) -> None:
-    adapter, _, _, _ = _make_adapter(monkeypatch)
-    adapter.resolve_row = lambda *_args: DiffusionPagedAttentionRowBinding(
-        row_index=2,
-        max_seq_len=16,
-        block_ids=((3, 7, 9, 11),),
-    )
-    builds = []
-
-    def build_plans(**kwargs):
-        builds.append(kwargs)
-        return {
-            "layer-0": DiffusionPagedKVWritePlan(
-                block_ids=torch.tensor([3]),
-                local_slot_mapping=torch.arange(4),
-            )
-        }
-
-    monkeypatch.setattr(
-        adapter_module.current_omni_platform,
-        "build_diffusion_paged_kv_write_plans",
-        build_plans,
-    )
-    monkeypatch.setattr(
-        adapter_module.current_omni_platform,
-        "supports_diffusion_paged_kv_write_plan",
-        lambda: True,
-    )
-    row = DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=4, seq_len=4)
-
-    first = adapter.prepare_batch([row])
-    second = adapter.prepare_batch([row])
-    assert first.write_plans_by_layer == second.write_plans_by_layer
-    assert len(builds) == 1
-
-    adapter.invalidate_prepared_batches()
-    adapter.prepare_batch([row])
-    assert len(builds) == 2
 
 
 def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1192,7 +1035,7 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     selected_backends = []
-    impl_cls = Mock(return_value=SimpleNamespace(forward=Mock(), do_kv_cache_update=Mock()))
+    impl_cls = Mock(return_value=SimpleNamespace(forward=Mock()))
     native_backend = SimpleNamespace(
         get_name=lambda: "ASCEND",
         indexes_kv_by_block_stride=lambda: True,
@@ -1203,12 +1046,19 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
     original_backend_per_kind = {"full": object()}
     config = SimpleNamespace(
         attention_config=SimpleNamespace(backend=None, backend_per_kind=original_backend_per_kind),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=2),
         model_config=SimpleNamespace(dtype=torch.float16),
         cache_config=SimpleNamespace(cache_dtype="auto"),
     )
 
     def select_backend(**_kwargs):
-        selected_backends.append((config.attention_config.backend, config.attention_config.backend_per_kind))
+        selected_backends.append(
+            (
+                config.attention_config.backend,
+                config.attention_config.backend_per_kind,
+                config.parallel_config.prefill_context_parallel_size,
+            )
+        )
         return native_backend
 
     monkeypatch.setattr(adapter_module, "get_attn_backend", select_backend)
@@ -1231,9 +1081,10 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
         ulysses_degree=2,
     )
 
-    assert selected_backends == [(adapter_module.AttentionBackendEnum.FLASH_ATTN, {})]
+    assert selected_backends == [(adapter_module.AttentionBackendEnum.FLASH_ATTN, {}, 1)]
     assert config.attention_config.backend is None
     assert config.attention_config.backend_per_kind is original_backend_per_kind
+    assert config.parallel_config.prefill_context_parallel_size == 2
     assert native_layer.num_heads == 4
     assert native_layer.num_kv_heads == 2
     assert native_layer.spec.num_kv_heads == 2
@@ -1292,6 +1143,51 @@ def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:
 
     assert events == ["pre", "prepare", "kernel", "post"]
     assert torch.equal(output, torch.full_like(original, 6))
+
+
+def test_omni_attention_strips_paged_ulysses_padding_around_kernel() -> None:
+    events: list[tuple[str, tuple[int, ...]]] = []
+
+    class Strategy:
+        name = "ulysses"
+
+        def pre_attention(self, query, key, value, metadata):
+            return query, key, value, metadata, SimpleNamespace(joint_len=0, joint_strategy="front")
+
+        def post_attention(self, output, _ctx):
+            events.append(("post", tuple(output.shape)))
+            return output
+
+    class Adapter:
+        def prepare_layer_context(self, _layer_name, query, key, value, *, omni_attn_metadata):
+            assert omni_attn_metadata is None
+            events.append(("kernel_input", tuple(query.shape)))
+            assert query[:, -1].tolist() == [[[3.0]]]
+            assert torch.equal(query, key)
+            assert torch.equal(query, value)
+            return SimpleNamespace(query=query)
+
+    class Backend:
+        def forward_paged(self, context):
+            return context.query
+
+    layer = Attention.__new__(Attention)
+    nn.Module.__init__(layer)
+    layer.prefix = "layer-0"
+    layer.paged_kv_cache_role = "primary"
+    layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
+    layer.attention = Backend()
+    layer.use_ring = False
+    layer._no_parallel_strategy = object()
+    layer._get_active_parallel_strategy = lambda: Strategy()
+    tensor = torch.arange(5, dtype=torch.float32).reshape(1, 5, 1, 1)
+
+    with set_forward_context(), override_paged_kv_adapter(Adapter()):
+        get_forward_context().sp_padding_size = 1
+        output = layer._forward_impl(tensor, tensor, tensor)
+
+    assert events == [("kernel_input", (1, 4, 1, 1)), ("post", (1, 5, 1, 1))]
+    assert output.flatten().tolist() == [0.0, 1.0, 2.0, 3.0, 0.0]
 
 
 def test_omni_attention_rejects_paged_request_for_backend_without_paged_support() -> None:
