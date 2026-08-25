@@ -271,6 +271,9 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
             request.diffusion_kv_requests = request_layout_utils.build_hunyuan_diffusion_kv_requests(
                 request,
                 prepared_layout,
+                sequence_parallel_size=int(
+                    getattr(getattr(od_config, "parallel_config", None), "sequence_parallel_size", 1) or 1
+                ),
             )
 
         return request
@@ -476,8 +479,19 @@ class HunyuanImage3Pipeline(
         if sampling.num_outputs_per_prompt not in (None, 0, 1):
             raise ValueError("HunyuanImage3 step execution supports only one output per prompt.")
         parallel_config = self.od_config.parallel_config
-        if parallel_config.sequence_parallel_size > 1:
-            raise ValueError("HunyuanImage3 step execution does not support sequence parallel yet.")
+        if parallel_config.sequence_parallel_size > 1 and self._is_paged_kv_mode():
+            if getattr(parallel_config, "ring_degree", 1) > 1:
+                raise ValueError("HunyuanImage3 Scheduler paged KV supports strict Ulysses only, not Ring SP.")
+            if getattr(parallel_config, "allgather_degree", 1) > 1:
+                raise ValueError("HunyuanImage3 Scheduler paged KV does not support AllGather-KV SP.")
+            if getattr(parallel_config, "ulysses_degree", parallel_config.sequence_parallel_size) != (
+                parallel_config.sequence_parallel_size
+            ):
+                raise ValueError(
+                    "HunyuanImage3 Scheduler paged KV requires sequence_parallel_size == ulysses_degree."
+                )
+            if getattr(parallel_config, "ulysses_mode", "strict") != "strict":
+                raise ValueError("HunyuanImage3 Scheduler paged KV supports only strict Ulysses SP.")
         if parallel_config.cfg_parallel_size > 1:
             raise ValueError("HunyuanImage3 step execution does not support CFG parallel yet.")
         cache_backend = getattr(self.od_config, "cache_backend", "none")
@@ -513,8 +527,8 @@ class HunyuanImage3Pipeline(
         seq_lens: list[int] = []
         starts: list[int] = []
         target_len_by_state: dict[int, int] = {}
+        padded_seq_len_by_state: dict[int, list[int]] = {}
         prefix_by_state: dict[int, list[int]] = {}
-        seq_len_by_state: dict[int, list[int]] = {}
         for state_idx, state in enumerate(states):
             layout = request_layout_utils.get_hunyuan_prepared_layout(state)
             if layout is None:
@@ -532,28 +546,34 @@ class HunyuanImage3Pipeline(
             real_pos = layout.tokenizer_output.real_pos
             if prefix_positions is None or real_pos is None:
                 raise ValueError(f"Hunyuan prepared layout for {state.request_id!r} lacks KV position metadata.")
-            target_len_by_state[state_idx] = request_layout_utils.hunyuan_num_image_tokens(
-                layout.generated_image_info
+            target_len, padded_seq_lens = request_layout_utils.hunyuan_paged_sequence_lengths(
+                layout,
+                sequence_parallel_size=int(
+                    getattr(getattr(self.od_config, "parallel_config", None), "sequence_parallel_size", 1) or 1
+                ),
             )
+            target_len_by_state[state_idx] = target_len
+            padded_seq_len_by_state[state_idx] = padded_seq_lens
             prefix_by_state[state_idx] = [int(value.item()) for value in prefix_positions[:, -1]]
-            seq_len_by_state[state_idx] = [int(value.item()) for value in real_pos[:, -1]]
 
         for state_idx, branch in zip(row_state_indexes, row_branches, strict=True):
             prefix_len = prefix_by_state[state_idx][branch]
-            full_seq_len = seq_len_by_state[state_idx][branch]
             if first_step:
-                query_len = full_seq_len
-                logical_seq_len = full_seq_len
+                # Reserve the same strict-Ulysses image padding as the model
+                # input hook. Real image spans remain unpadded metadata.
+                logical_seq_len = padded_seq_len_by_state[state_idx][branch]
+                query_len = logical_seq_len
                 kv_start_pos = 0
             else:
                 query_len = target_len_by_state[state_idx]
                 logical_seq_len = prefix_len + query_len
                 kv_start_pos = prefix_len
-                if logical_seq_len > full_seq_len:
+                if logical_seq_len > padded_seq_len_by_state[state_idx][branch]:
                     raise ValueError(
                         "Hunyuan paged KV write span exceeds the prepared sequence: "
                         f"request={states[state_idx].request_id!r}, branch={branch}, "
-                        f"start={prefix_len}, query_len={query_len}, prepared_seq_len={full_seq_len}"
+                        f"start={prefix_len}, query_len={query_len}, "
+                        f"prepared_seq_len={padded_seq_len_by_state[state_idx][branch]}"
                     )
             query_lens.append(query_len)
             seq_lens.append(logical_seq_len)

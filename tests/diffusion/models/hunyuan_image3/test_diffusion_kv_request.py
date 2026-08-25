@@ -24,6 +24,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.request_layout import (
     build_hunyuan_diffusion_kv_requests,
     extract_hunyuan_prompt_inputs,
     hunyuan_num_image_tokens,
+    hunyuan_paged_sequence_lengths,
     normalize_hunyuan_cot_text,
     prepare_hunyuan_layout,
 )
@@ -195,6 +196,23 @@ def test_builds_one_kv_request_per_cfg_row() -> None:
     assert [item.prefix_len for item in kv_requests] == [12, 14]
     assert [item.seq_len for item in kv_requests] == [32, 34]
     assert tokenizer.calls[0]["cfg_factor"] == 2
+
+
+def test_paged_scheduler_rounds_target_and_image_suffix_for_strict_ulysses() -> None:
+    tokenizer, image_processor = _components([12])
+    request = _request(guidance_scale=1.0)
+    prepared_layout = _prepare(request, tokenizer, image_processor)
+
+    target_len, sequence_lens = hunyuan_paged_sequence_lengths(prepared_layout, sequence_parallel_size=4)
+    assert target_len == 20
+    assert sequence_lens == [32]
+
+    kv_requests = build_hunyuan_diffusion_kv_requests(
+        request,
+        prepared_layout,
+        sequence_parallel_size=4,
+    )
+    assert [(item.prefix_len, item.target_len, item.seq_len) for item in kv_requests] == [(12, 20, 32)]
 
 
 def _reference_image() -> JointImageInfo:

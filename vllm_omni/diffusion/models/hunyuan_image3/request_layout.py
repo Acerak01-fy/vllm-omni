@@ -200,6 +200,53 @@ def hunyuan_num_image_tokens(image_info: ImageInfo) -> int:
     return int(image_info.image_token_length) + int(image_info.add_timestep_token) + int(image_info.add_guidance_token)
 
 
+def _round_up_for_sequence_parallel(value: int, sequence_parallel_size: int) -> int:
+    if type(sequence_parallel_size) is not int or sequence_parallel_size <= 0:
+        raise ValueError(f"sequence_parallel_size must be a positive integer, got {sequence_parallel_size!r}")
+    return ((value + sequence_parallel_size - 1) // sequence_parallel_size) * sequence_parallel_size
+
+
+def hunyuan_paged_sequence_lengths(
+    prepared_layout: HunyuanPreparedLayout,
+    sequence_parallel_size: int = 1,
+) -> tuple[int, list[int]]:
+    """Return Scheduler lengths after strict-Ulysses padding.
+
+    Hunyuan keeps the prompt replicated and shards the image portion.  The
+    strict Ulysses all-to-all therefore needs the image portion of every row
+    to be divisible by the SP degree.  Padding is reserved in Scheduler pages
+    but remains outside ``full_attn_spans``; the model's SP output hook removes
+    it before the public result is reshaped.
+    """
+
+    tokenizer_output = prepared_layout.tokenizer_output
+    prefix_positions = tokenizer_output.gen_timestep_scatter_index
+    real_pos = tokenizer_output.real_pos
+    if prefix_positions is None or real_pos is None:
+        raise ValueError("Hunyuan prepared layout lacks timestep/persistent-sequence position metadata")
+
+    target_len = _round_up_for_sequence_parallel(
+        hunyuan_num_image_tokens(prepared_layout.generated_image_info),
+        sequence_parallel_size,
+    )
+    sequence_lens: list[int] = []
+    for prefix_row, real_row in zip(prefix_positions, real_pos, strict=True):
+        prefix_len = int(prefix_row[-1].item())
+        real_len = int(real_row[-1].item())
+        image_and_suffix_len = real_len - prefix_len
+        if image_and_suffix_len <= 0:
+            raise ValueError(
+                f"Hunyuan prepared sequence must contain image tokens after prefix; got prefix={prefix_len}, "
+                f"real_len={real_len}"
+            )
+        padded_seq_len = prefix_len + _round_up_for_sequence_parallel(image_and_suffix_len, sequence_parallel_size)
+        # A short suffix can make the rounded generated span the larger
+        # allocation boundary.  Keep both first-write and later-write spans
+        # within the same Scheduler-owned row.
+        sequence_lens.append(max(padded_seq_len, prefix_len + target_len))
+    return target_len, sequence_lens
+
+
 def build_hunyuan_batch_rope_image_info(
     output: TokenizerEncodeOutput,
     sections: list[list[dict[str, Any]]],
@@ -333,6 +380,8 @@ class HunyuanPreparedLayout:
 def build_hunyuan_diffusion_kv_requests(
     request: OmniDiffusionRequest,
     prepared_layout: HunyuanPreparedLayout,
+    *,
+    sequence_parallel_size: int = 1,
 ) -> tuple[DiffusionKVRequest, ...]:
     """Build one persistent Scheduler KV request per Hunyuan execution row."""
 
@@ -347,7 +396,10 @@ def build_hunyuan_diffusion_kv_requests(
     real_pos = tokenizer_output.real_pos
     assert prefix_positions is not None and real_pos is not None
 
-    target_len = hunyuan_num_image_tokens(prepared_layout.generated_image_info)
+    target_len, padded_sequence_lens = hunyuan_paged_sequence_lengths(
+        prepared_layout,
+        sequence_parallel_size=sequence_parallel_size,
+    )
     return tuple(
         DiffusionKVRequest(
             f"{request.request_id}/diffusion-kv/{sequence_id}",
@@ -356,7 +408,7 @@ def build_hunyuan_diffusion_kv_requests(
             # prompt/reference-image prefix for this execution row.
             prefix_len=int(prefix_row[-1].item()),
             target_len=target_len,
-            seq_len=int(valid_row[-1].item()),
+            seq_len=padded_sequence_lens[sequence_id],
             # Prompt and reference-image tokens are already embedded in this
             # row's primary self-attention sequence. Hunyuan therefore has no
             # independently projected cross/joint-attention KV context.

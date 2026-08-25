@@ -37,12 +37,16 @@ class MockAttention(nn.Module):
         super().__init__()
         self.paged_kv_active = False
         self.calls = []
+        self.metadata_calls = []
 
     def is_paged_kv_active(self):
         return self.paged_kv_active
 
     def forward(self, query, key, value, attn_metadata=None, **kwargs):
         self.calls.append((query, key, value))
+        self.metadata_calls.append(attn_metadata)
+        if attn_metadata is not None and attn_metadata.joint_query is not None:
+            return torch.cat([attn_metadata.joint_query, query], dim=1)
         return query
 
 
@@ -238,6 +242,77 @@ def test_paged_forward_accepts_projection_native_batched_value_layout() -> None:
     assert output.shape == query.shape
     _, _, packed_value = mgr.attn.calls[-1]
     assert packed_value.shape == (batch_size * padded_len, NUM_KV_HEADS, HEAD_DIM)
+
+
+@pytest.mark.parametrize("sp_size", [2, 4])
+def test_paged_sp_first_step_keeps_joint_prompt_and_4d_image_shard(sp_size: int) -> None:
+    mgr = _make_cache_mgr(sp_size=sp_size)
+    mgr.attn.paged_kv_active = True
+    prompt_len = 3
+    local_image_len = 4
+    local_len = prompt_len + local_image_len
+    key, value = _make_known_kv(local_len)
+    query = torch.randn(local_len, NUM_HEADS, HEAD_DIM)
+
+    output = mgr(
+        query,
+        key,
+        value,
+        attention_mask=None,
+        query_lens=[local_len],
+        seq_lens=[local_len],
+        paged_query_lens=[prompt_len + local_image_len * sp_size],
+        paged_seq_lens=[prompt_len + local_image_len * sp_size],
+        full_attn_spans=[[(prompt_len, prompt_len + local_image_len * sp_size)]],
+        first_step=True,
+        shard_image_size=local_image_len,
+        num_image_tokens=local_image_len * sp_size,
+    )
+
+    assert output.shape == query.shape
+    captured_query, captured_key, captured_value = mgr.attn.calls[-1]
+    assert captured_query.shape == (1, local_image_len, NUM_HEADS, HEAD_DIM)
+    assert captured_key.shape == (1, local_image_len, NUM_KV_HEADS, HEAD_DIM)
+    assert captured_value.shape == (1, local_image_len, NUM_KV_HEADS, HEAD_DIM)
+    metadata = mgr.attn.metadata_calls[-1]
+    assert metadata.joint_query.shape == (1, prompt_len, NUM_HEADS, HEAD_DIM)
+    assert metadata.joint_key.shape == (1, prompt_len, NUM_KV_HEADS, HEAD_DIM)
+    assert metadata.joint_value.shape == (1, prompt_len, NUM_KV_HEADS, HEAD_DIM)
+    assert metadata.full_attn_spans == [[(prompt_len, prompt_len + local_image_len * sp_size)]]
+
+
+@pytest.mark.parametrize("sp_size", [2, 4])
+def test_paged_sp_later_step_uses_only_image_shard(sp_size: int) -> None:
+    mgr = _make_cache_mgr(sp_size=sp_size)
+    mgr.attn.paged_kv_active = True
+    local_image_len = 4
+    key, value = _make_known_kv(local_image_len)
+    query = torch.randn(local_image_len, NUM_HEADS, HEAD_DIM)
+
+    output = mgr(
+        query,
+        key,
+        value,
+        attention_mask=None,
+        query_lens=[local_image_len],
+        seq_lens=[local_image_len * sp_size + 3],
+        paged_query_lens=[local_image_len * sp_size],
+        paged_seq_lens=[local_image_len * sp_size + 3],
+        full_attn_spans=[[(3, 3 + local_image_len * sp_size)]],
+        first_step=False,
+        shard_image_size=local_image_len,
+        num_image_tokens=local_image_len * sp_size,
+    )
+
+    assert output.shape == query.shape
+    captured_query, captured_key, captured_value = mgr.attn.calls[-1]
+    assert captured_query.shape == (1, local_image_len, NUM_HEADS, HEAD_DIM)
+    assert captured_key.shape == (1, local_image_len, NUM_KV_HEADS, HEAD_DIM)
+    assert captured_value.shape == (1, local_image_len, NUM_KV_HEADS, HEAD_DIM)
+    metadata = mgr.attn.metadata_calls[-1]
+    assert metadata.joint_query is None
+    assert metadata.joint_key is None
+    assert metadata.joint_value is None
 
 
 def test_paged_forward_clears_stale_dense_prompt_cache() -> None:
