@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -174,12 +174,6 @@ class AttentionMetadata:
     # index the flattened physical Q/K/V tensors in logical row order. The
     # paged adapter scatters the output back to the original physical layout.
     paged_query_indices: torch.Tensor | None = None
-
-    # Optional dense K/V prefix imported by a connector and populated into a
-    # Scheduler-owned paged row before the current query/write span.  Both
-    # tensors use [B, S, H_kv, D] and are consumed only by paged attention.
-    paged_kv_prefix_key: torch.Tensor | None = None
-    paged_kv_prefix_value: torch.Tensor | None = None
 
     # Geometry of the video segment for backends that exploit spatiotemporal
     # locality (block-sparse selection, tiled masks). Dense backends ignore it.
