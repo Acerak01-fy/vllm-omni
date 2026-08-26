@@ -16,8 +16,14 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionMetadata,
+    OptionalAttentionBackendDependencyError,
+)
+from vllm_omni.diffusion.attention.backends.flash_attn import (
+    FlashAttentionImpl,
+    _load_mindiesd_attention,
+)
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 from vllm_omni.diffusion.attention.backends.utils import fa  # noqa: E402
 from vllm_omni.platforms import current_omni_platform
@@ -411,6 +417,22 @@ def _fake_mindiesd(monkeypatch, *, attention_forward=None, attention_forward_var
     )
     monkeypatch.setitem(sys.modules, "mindiesd", fake)
     return fake
+
+
+def test_mindiesd_loader_only_classifies_capability_failures(monkeypatch):
+    monkeypatch.setitem(sys.modules, "mindiesd", SimpleNamespace())
+
+    with pytest.raises(OptionalAttentionBackendDependencyError, match="does not expose attention_forward"):
+        _load_mindiesd_attention("attention_forward")
+
+    class _BrokenMindIESD:
+        def __getattr__(self, _name):
+            raise ModuleNotFoundError("No module named 'mindiesd_internal'", name="mindiesd_internal")
+
+    monkeypatch.setitem(sys.modules, "mindiesd", _BrokenMindIESD())
+
+    with pytest.raises(ModuleNotFoundError, match="mindiesd_internal"):
+        _load_mindiesd_attention("attention_forward")
 
 
 # --- Test group A: boundary resolution (_resolve_packed_seq_npu) -------------

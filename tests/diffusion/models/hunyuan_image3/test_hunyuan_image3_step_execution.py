@@ -1,19 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer as hy3_tokenizer_module
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 import vllm_omni.diffusion.models.hunyuan_image3.request_layout as hy3_layout_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
-from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model, ImageInfo
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,
@@ -106,9 +104,10 @@ def _prepared_layout() -> HunyuanPreparedLayout:
     )
 
 
-def _paged_pipeline():
+def _paged_pipeline(sequence_parallel_size: int = 1):
     pipeline = _pipeline()
     pipeline.od_config.diffusion_kv_mode = DiffusionKVCacheMode.PAGED_SCHEDULER
+    pipeline.od_config.parallel_config.sequence_parallel_size = sequence_parallel_size
     return pipeline
 
 
@@ -178,33 +177,41 @@ def test_paged_hunyuan_merge_keeps_native_spans_and_omits_dense_mask():
     assert merged["full_attn_spans"] == [[(13, 29)], [(15, 31)]]
 
 
-def test_paged_metadata_is_exposed_at_pipeline_and_model_boundaries():
-    expected = {"paged_query_lens", "paged_seq_lens", "paged_kv_start_pos"}
-    assert expected.issubset(inspect.signature(HunyuanImage3Pipeline.forward_call).parameters)
-    assert expected.issubset(inspect.signature(HunyuanImage3Model.forward).parameters)
+def test_paged_sp_first_step_aligns_heterogeneous_cfg_rows_without_changing_logical_lengths():
+    pipeline = _paged_pipeline(sequence_parallel_size=2)
+    state = _paged_state("req", 0)
+    position_ids = torch.arange(34).reshape(1, -1).expand(2, -1).clone()
+    image_mask = torch.zeros(2, 34, dtype=torch.bool)
+    image_mask[0, 13:29] = True
+    image_mask[1, 15:31] = True
+    custom_pos = torch.arange(2 * 34 * 2, dtype=torch.float32).reshape(2, 34, 2)
+    state.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "position_ids": position_ids,
+            "image_mask": image_mask,
+            "custom_pos_emb": (custom_pos, custom_pos + 1000),
+            "gen_timestep_scatter_index": torch.tensor([[12], [14]]),
+        }
+    )
 
+    input_ids, merged = pipeline._merge_step_model_inputs(
+        [state],
+        row_state_indexes=[0, 0],
+        row_branches=[0, 1],
+        first_step=True,
+    )
 
-def test_hunyuan_tokenizer_loads_remote_code_non_interactively(monkeypatch):
-    captured = {}
-
-    class _FakeTokenizer:
-        bos_token_id = 1
-        eos_token_id = 2
-        pad_token_id = 0
-        added_tokens_encoder = {}
-
-        def convert_tokens_to_ids(self, token):
-            return hash(token) % 1000
-
-    def fake_from_pretrained(model, **kwargs):
-        captured["model"] = model
-        captured.update(kwargs)
-        return _FakeTokenizer()
-
-    monkeypatch.setattr(hy3_tokenizer_module, "AutoTokenizer", SimpleNamespace(from_pretrained=fake_from_pretrained))
-    hy3_tokenizer_module.TokenizerWrapper("hunyuan-checkpoint")
-
-    assert captured == {"model": "hunyuan-checkpoint", "trust_remote_code": True}
+    assert input_ids is not None
+    assert merged["query_lens"] == [34, 34]
+    assert merged["paged_query_lens"] == [32, 34]
+    assert merged["paged_seq_lens"] == [32, 34]
+    assert merged["gen_timestep_scatter_index"].tolist() == [[14], [14]]
+    assert merged["full_attn_spans"] == [[(13, 29)], [(15, 31)]]
+    assert input_ids[0].tolist() == [*range(12), 0, 0, *range(12, 32)]
+    assert input_ids[1].tolist() == list(range(34, 68))
+    assert merged["image_mask"][0].nonzero().flatten().tolist() == list(range(15, 31))
+    assert merged["custom_pos_emb"][0].shape == (2, 34, 2)
+    assert merged["paged_query_indices"].tolist() == [*range(12), *range(14, 34), *range(34, 68)]
 
 
 def test_prepare_model_inputs_reuses_prepared_layout(monkeypatch):

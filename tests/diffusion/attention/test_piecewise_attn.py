@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """End-to-end test for ``piecewise_attn`` (CPU).
 
 Verify that running attention in segments (causal outside full-attn spans,
@@ -150,35 +150,6 @@ def test_paged_piecewise_runner_uses_runner_output_shape():
 
     assert output.shape == (6, 2, 3)
     torch.testing.assert_close(output, query[..., :3])
-
-
-def test_paged_piecewise_runner_can_read_kv_from_cache():
-    plan = build_paged_piecewise_plan(
-        [[(2, 5)]],
-        query_offsets=[0],
-        query_lens=[6],
-        seq_lens=[6],
-        device=DEVICE,
-    )
-    query = torch.arange(6 * 2 * 4, dtype=torch.float32).reshape(6, 2, 4)
-    calls = []
-
-    def run_segment(segment_query, segment_key, segment_value, _segment_batch):
-        calls.append((segment_query.shape[0], segment_key, segment_value))
-        return segment_query
-
-    output = run_paged_piecewise_plan(
-        query,
-        query + 100,
-        query + 200,
-        plan,
-        plan.segments,
-        run_segment,
-        read_kv_from_cache=True,
-    )
-
-    torch.testing.assert_close(output, query)
-    assert calls == [(2, None, None), (3, None, None), (1, None, None)]
 
 
 @pytest.mark.parametrize("global_spans", SPAN_CASES)

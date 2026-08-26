@@ -3,11 +3,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Require SPDX license headers on source files.
 
-Ported from vllm/tools/pre_commit/check_spdx_header.py. The copyright line
-uses the vLLM-Omni project name rather than upstream vLLM. Shell scripts
-(``.sh``) are included so wrappers such as ``shellcheck.sh`` cannot keep a
-stale upstream copyright that Python/Rust/proto files would have rewritten.
-``.pyi`` stubs use the same ``#`` header style as ``.py``.
+Files inherited from upstream vLLM retain their original copyright line,
+while vLLM-Omni-owned files use the vLLM-Omni line. Missing headers default to
+vLLM-Omni. Shell scripts and ``.pyi`` stubs use the same policy.
 """
 
 import sys
@@ -15,9 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-# Older files still carry the upstream vLLM copyright line. Treat it as stale
-# and rewrite it to the Omni line instead of inserting a duplicate header.
-LEGACY_COPYRIGHT_TEXT = "SPDX-FileCopyrightText: Copyright contributors to the vLLM project"
+UPSTREAM_COPYRIGHT_TEXT = "SPDX-FileCopyrightText: Copyright contributors to the vLLM project"
 
 
 @dataclass(frozen=True)
@@ -65,9 +61,9 @@ def spdx_header(style):
     return license_line, copyright_line
 
 
-def legacy_copyright_line(style):
-    """Return the stale upstream vLLM copyright line for a file style."""
-    return f"{style.comment_prefix} {LEGACY_COPYRIGHT_TEXT}"
+def upstream_copyright_line(style):
+    """Return the accepted upstream vLLM copyright line for a file style."""
+    return f"{style.comment_prefix} {UPSTREAM_COPYRIGHT_TEXT}"
 
 
 def header_insertion_index(style, lines):
@@ -81,6 +77,7 @@ def check_spdx_header_status(file_path):
     """Check SPDX header status of the file"""
     style = file_style(file_path)
     license_line, copyright_line = spdx_header(style)
+    accepted_copyright_lines = {copyright_line, upstream_copyright_line(style)}
     with open(file_path, encoding="UTF-8") as file:
         lines = file.readlines()
     if not lines:
@@ -95,14 +92,14 @@ def check_spdx_header_status(file_path):
         line = raw_line.strip()
         if line == license_line:
             has_license = True
-        elif line == copyright_line:
+        elif line in accepted_copyright_lines:
             has_copyright = True
 
     # Determine status based on what we found
     if has_license and has_copyright:
         return SPDXStatus.COMPLETE
     elif has_license and not has_copyright:
-        # Only has license line (or a stale vLLM copyright line)
+        # Only has license line.
         return SPDXStatus.MISSING_COPYRIGHT
     elif not has_license and has_copyright:
         # Only has copyright line
@@ -116,7 +113,6 @@ def add_header(file_path, status):
     """Add or supplement SPDX header based on status"""
     style = file_style(file_path)
     license_line, copyright_line = spdx_header(style)
-    stale_copyright_line = legacy_copyright_line(style)
     full_spdx_header = f"{license_line}\n{copyright_line}"
     with open(file_path, "r+", encoding="UTF-8") as file:
         lines = file.readlines()
@@ -134,20 +130,11 @@ def add_header(file_path, status):
             file.writelines(remaining_lines)
 
         elif status == SPDXStatus.MISSING_COPYRIGHT:
-            # Only has license line, need to add copyright line.
-            # Rewrite a stale upstream vLLM copyright line in place.
-            replaced = False
+            # Only has license line, need to add the default copyright line.
             for i, line in enumerate(lines):
-                if line.strip() == stale_copyright_line:
-                    lines[i] = f"{copyright_line}\n"
-                    replaced = True
+                if line.strip() == license_line:
+                    lines.insert(i + 1, f"{copyright_line}\n")
                     break
-            if not replaced:
-                for i, line in enumerate(lines):
-                    if line.strip() == license_line:
-                        lines.insert(i + 1, f"{copyright_line}\n")
-                        break
-
             file.writelines(lines)
 
         elif status == SPDXStatus.MISSING_LICENSE:

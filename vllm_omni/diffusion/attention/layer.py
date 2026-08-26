@@ -16,7 +16,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionMetadata,
+    OptionalAttentionBackendDependencyError,
+)
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
@@ -436,7 +439,7 @@ class Attention(nn.Module):
         # takes ``forward_paged`` above and never reaches this fallback.
         try:
             return self.attention.forward(query, key, value, attn_metadata)
-        except ImportError:
+        except OptionalAttentionBackendDependencyError:
             if self.paged_kv_cache_role is None or self.is_paged_kv_active():
                 raise
             logger.warning_once(

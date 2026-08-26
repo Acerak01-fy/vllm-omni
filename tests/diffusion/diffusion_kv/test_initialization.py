@@ -225,17 +225,6 @@ def test_paged_config_forwards_gpu_memory_utilization_to_native_cache_config() -
     assert vllm_config.cache_config.gpu_memory_utilization == 0.42
 
 
-def test_paged_config_applies_platform_cache_geometry(monkeypatch) -> None:
-    od_config = _od_config()
-    vllm_config = diffusion_vllm_config.create_base_diffusion_vllm_config(torch.device("cpu"), od_config)
-    configure = Mock()
-    monkeypatch.setattr(diffusion_vllm_config.current_omni_platform, "configure_diffusion_vllm_config", configure)
-
-    diffusion_vllm_config.configure_diffusion_vllm_config(vllm_config, od_config)
-
-    configure.assert_called_once_with(vllm_config, od_config)
-
-
 def test_diffusion_vllm_model_config_supplies_dtype_for_quant_methods() -> None:
     quantization_config = build_quant_config(
         {

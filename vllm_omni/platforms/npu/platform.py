@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -93,9 +93,13 @@ def _reshape_and_cache_without_cache_mode(cls, key, value, key_cache, value_cach
             raise RuntimeError("Ascend cache-writer compatibility requires key/value head sizes divisible by 16")
         write_plan = _diffusion_paged_kv_write_plan.get()
         if write_plan is None:
-            block_ids = torch.unique(slot_mapping // block_size, sorted=True)
-            local_slots = (
-                torch.searchsorted(block_ids, slot_mapping // block_size) * block_size + slot_mapping % block_size
+            valid_mask = slot_mapping >= 0
+            slot_blocks = slot_mapping // block_size
+            block_ids = torch.unique(slot_blocks[valid_mask], sorted=True)
+            local_slots = torch.full_like(slot_mapping, -1)
+            local_slots[valid_mask] = (
+                torch.searchsorted(block_ids, slot_blocks[valid_mask]) * block_size
+                + slot_mapping[valid_mask] % block_size
             ).to(dtype=slot_mapping.dtype)
         else:
             block_ids = write_plan.block_ids

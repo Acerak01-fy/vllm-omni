@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import inspect
 import logging
@@ -1097,6 +1097,7 @@ class ImageKVCacheManager(nn.Module):
         query_lens: list[int] | None,
         paged_query_lens: list[int] | None,
         paged_seq_lens: list[int] | None,
+        paged_query_indices: torch.Tensor | None,
         full_attn_spans: list[list[tuple[int, int]]] | None,
         first_step: bool | None,
         shard_image_size: int | None,
@@ -1114,7 +1115,7 @@ class ImageKVCacheManager(nn.Module):
         if paged_query_lens is None or paged_seq_lens is None:
             raise ValueError("Paged Hunyuan attention requires paged_query_lens and paged_seq_lens metadata")
         if len(paged_query_lens) != len(paged_seq_lens):
-            raise ValueError("Paged Hunyuan query and sequence length metadata must have equal row counts")
+            raise ValueError("Paged Hunyuan query and sequence metadata must have equal row counts")
         if full_attn_spans is None or len(full_attn_spans) != len(paged_query_lens):
             raise ValueError("Paged Hunyuan attention requires one full_attn_spans row per native KV row")
         if self._injected_ar_kv is not None:
@@ -1203,24 +1204,26 @@ class ImageKVCacheManager(nn.Module):
                 joint_query = query_rows[:, :local_prompt_len]
                 joint_key = key_rows[:, :local_prompt_len]
                 joint_value = value_rows[:, :local_prompt_len]
-                expected_global_query_len = local_prompt_len + shard_image_size * self.sp_size
+                physical_global_query_len = local_prompt_len + shard_image_size * self.sp_size
             else:
                 local_prompt_len = 0
                 image_query = query_rows[:, :shard_image_size]
                 image_key = key_rows[:, :shard_image_size]
                 image_value = value_rows[:, :shard_image_size]
                 joint_query = joint_key = joint_value = None
-                expected_global_query_len = shard_image_size * self.sp_size
+                physical_global_query_len = shard_image_size * self.sp_size
 
             if image_query.shape[1] != shard_image_size:
                 raise ValueError(
                     "Hunyuan paged SP image shard does not match model metadata: "
                     f"tensor={image_query.shape[1]}, metadata={shard_image_size}"
                 )
-            if any(query_len != expected_global_query_len for query_len in paged_query_lens):
+            if paged_query_indices is None and any(
+                query_len != physical_global_query_len for query_len in paged_query_lens
+            ):
                 raise ValueError(
-                    "Hunyuan paged Scheduler rows do not match the strict-Ulysses global write length: "
-                    f"rows={paged_query_lens}, expected={expected_global_query_len}"
+                    "Hunyuan paged SP heterogeneous rows require packed physical query indices: "
+                    f"rows={paged_query_lens}, physical={physical_global_query_len}"
                 )
 
             attn_metadata = AttentionMetadata(
@@ -1230,6 +1233,7 @@ class ImageKVCacheManager(nn.Module):
                 joint_strategy="front",
                 attn_mask=None,
                 full_attn_spans=full_attn_spans,
+                paged_query_indices=paged_query_indices,
             )
             output_rows = self.attn(image_query, image_key, image_value, attn_metadata)
             if output_rows.ndim != 4 or output_rows.shape[:2] != (batch_size, padded_query_len):
@@ -1296,6 +1300,7 @@ class ImageKVCacheManager(nn.Module):
                 query_lens=query_lens,
                 paged_query_lens=kwargs.get("paged_query_lens"),
                 paged_seq_lens=kwargs.get("paged_seq_lens"),
+                paged_query_indices=kwargs.get("paged_query_indices"),
                 full_attn_spans=kwargs.get("full_attn_spans"),
                 first_step=first_step,
                 shard_image_size=kwargs.get("shard_image_size"),
@@ -2570,6 +2575,7 @@ class HunyuanImage3Model(nn.Module):
         paged_query_lens: list[int] | None = None,
         paged_seq_lens: list[int] | None = None,
         paged_kv_start_pos: list[int] | None = None,
+        paged_query_indices: torch.Tensor | None = None,
         num_image_tokens: int | None = None,
         gen_timestep_scatter_index: torch.Tensor | None = None,
         uncond_cfg_prefill: bool = False,
@@ -2680,6 +2686,7 @@ class HunyuanImage3Model(nn.Module):
                 paged_query_lens=paged_query_lens,
                 paged_seq_lens=paged_seq_lens,
                 paged_kv_start_pos=paged_kv_start_pos,
+                paged_query_indices=paged_query_indices,
                 num_image_tokens=num_image_tokens,
                 gen_timestep_scatter_index=gen_timestep_scatter_index,
                 shard_image_size=shard_image_size,

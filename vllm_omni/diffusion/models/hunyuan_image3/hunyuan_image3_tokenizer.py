@@ -45,11 +45,9 @@ class Conversation:
 
 
 class TokenizerWrapper:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, *, trust_remote_code: bool = False):
         if isinstance(tokenizer, str):
-            # HunyuanImage-3 ships a checkpoint-local tokenizer implementation;
-            # worker processes must load it non-interactively.
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer, trust_remote_code=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer, trust_remote_code=trust_remote_code)
         else:
             self.tokenizer = tokenizer
 

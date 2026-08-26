@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
 import logging
@@ -163,10 +163,13 @@ def _shift_full_attn_spans(
 
 
 def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
-    hf_config = get_config(od_config.model, trust_remote_code=True)
+    trust_remote_code = bool(getattr(od_config, "trust_remote_code", False))
+    hf_config = get_config(od_config.model, trust_remote_code=trust_remote_code)
     image_processor = HunyuanImage3ImageProcessor(hf_config)
     prepare_diffusion_kv_layout = od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
-    tokenizer_wrapper = TokenizerWrapper(od_config.model) if prepare_diffusion_kv_layout else None
+    tokenizer_wrapper = (
+        TokenizerWrapper(od_config.model, trust_remote_code=trust_remote_code) if prepare_diffusion_kv_layout else None
+    )
     generation_config = GenerationConfig.from_pretrained(od_config.model) if prepare_diffusion_kv_layout else None
     vae_h_factor = hf_config.vae_downsample_factor[0] * hf_config.patch_size
     vae_w_factor = hf_config.vae_downsample_factor[1] * hf_config.patch_size
@@ -351,7 +354,7 @@ class HunyuanImage3Pipeline(
     ]
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
-        self.hf_config = get_config(od_config.model, trust_remote_code=True)
+        self.hf_config = get_config(od_config.model, trust_remote_code=od_config.trust_remote_code)
         super().__init__(self.hf_config)
         # update diffusion config
         self.generation_config = GenerationConfig.from_pretrained(od_config.model)
@@ -377,7 +380,10 @@ class HunyuanImage3Pipeline(
         self.vae = DistributedAutoencoderKLHunyuan.from_config(self.hf_config.vae)
         self.vae.use_spatial_tiling = self.od_config.vae_use_tiling
         self._pipeline = None
-        self._tkwrapper = TokenizerWrapper(od_config.model)
+        self._tkwrapper = TokenizerWrapper(
+            od_config.model,
+            trust_remote_code=od_config.trust_remote_code,
+        )
         self.image_processor = HunyuanImage3ImageProcessor(self.hf_config)
         self.vision_model = Siglip2VisionTransformer(self.hf_config.vit)
         # self.vision_model = vision_model.vision_model
@@ -514,8 +520,8 @@ class HunyuanImage3Pipeline(
         row_state_indexes: list[int],
         row_branches: list[int],
         first_step: bool,
-    ) -> tuple[list[int], list[int], list[int]]:
-        """Return the model write spans used by Scheduler-owned paging.
+    ) -> tuple[list[int], list[int], list[int], list[int], list[int]]:
+        """Return Scheduler write spans and source row boundaries.
 
         Hunyuan's first DiT pass includes the tokenizer's trailing control
         tokens. Subsequent passes overwrite only ``<timestep>`` and the image
@@ -529,6 +535,7 @@ class HunyuanImage3Pipeline(
         target_len_by_state: dict[int, int] = {}
         padded_seq_len_by_state: dict[int, list[int]] = {}
         prefix_by_state: dict[int, list[int]] = {}
+        valid_by_state: dict[int, list[int]] = {}
         for state_idx, state in enumerate(states):
             layout = request_layout_utils.get_hunyuan_prepared_layout(state)
             if layout is None:
@@ -555,7 +562,10 @@ class HunyuanImage3Pipeline(
             target_len_by_state[state_idx] = target_len
             padded_seq_len_by_state[state_idx] = padded_seq_lens
             prefix_by_state[state_idx] = [int(value.item()) for value in prefix_positions[:, -1]]
+            valid_by_state[state_idx] = [int(value.item()) for value in real_pos[:, -1]]
 
+        prefix_lens: list[int] = []
+        valid_lens: list[int] = []
         for state_idx, branch in zip(row_state_indexes, row_branches, strict=True):
             prefix_len = prefix_by_state[state_idx][branch]
             if first_step:
@@ -578,7 +588,9 @@ class HunyuanImage3Pipeline(
             query_lens.append(query_len)
             seq_lens.append(logical_seq_len)
             starts.append(kv_start_pos)
-        return query_lens, seq_lens, starts
+            prefix_lens.append(prefix_len)
+            valid_lens.append(valid_by_state[state_idx][branch])
+        return query_lens, seq_lens, starts, prefix_lens, valid_lens
 
     def prepare_paged_attention_rows(
         self,
@@ -596,7 +608,9 @@ class HunyuanImage3Pipeline(
             )
         first_step, cfg_factor = self._validate_step_group_states(groups[0])
         row_state_indexes, row_branches = self._step_row_order(groups[0], cfg_factor)
-        query_lens, seq_lens, starts = self._paged_row_spans(groups[0], row_state_indexes, row_branches, first_step)
+        query_lens, seq_lens, starts, _, _ = self._paged_row_spans(
+            groups[0], row_state_indexes, row_branches, first_step
+        )
         rows = []
         for state_idx, branch, query_len, seq_len, start in zip(
             row_state_indexes,
@@ -669,6 +683,31 @@ class HunyuanImage3Pipeline(
             out[slices] = row
             padded.append(out)
         return torch.cat(padded, dim=0)
+
+    @staticmethod
+    def _align_paged_sp_tensor_rows(
+        tensor: torch.Tensor,
+        *,
+        prefix_lens: list[int],
+        valid_lens: list[int],
+        aligned_prefix_len: int,
+        physical_query_len: int,
+        pad_value: bool | int | float = 0,
+    ) -> torch.Tensor:
+        """Move each first-step current span behind one shared SP prompt boundary."""
+
+        if tensor.ndim < 2 or tensor.shape[0] != len(prefix_lens):
+            raise ValueError(
+                "Hunyuan paged SP sequence tensor must have one row and a sequence dimension per metadata row"
+            )
+        output = tensor.new_full((tensor.shape[0], physical_query_len, *tensor.shape[2:]), pad_value)
+        for row_index, (prefix_len, valid_len) in enumerate(zip(prefix_lens, valid_lens, strict=True)):
+            real_current_len = valid_len - prefix_len
+            output[row_index, :prefix_len] = tensor[row_index, :prefix_len]
+            output[row_index, aligned_prefix_len : aligned_prefix_len + real_current_len] = tensor[
+                row_index, prefix_len:valid_len
+            ]
+        return output
 
     @staticmethod
     def _merge_attention_masks(
@@ -813,6 +852,13 @@ class HunyuanImage3Pipeline(
         first_step: bool,
     ) -> tuple[torch.Tensor | None, dict[str, Any]]:
         paged_mode = self._is_paged_kv_mode()
+        paged_row_spans = (
+            self._paged_row_spans(states, row_state_indexes, row_branches, first_step) if paged_mode else None
+        )
+        sequence_parallel_size = int(
+            getattr(getattr(self.od_config, "parallel_config", None), "sequence_parallel_size", 1) or 1
+        )
+        align_paged_sp_rows = paged_mode and first_step and sequence_parallel_size > 1
         prefix_lens = self._prompt_kv_prefix_lens(states, row_state_indexes, row_branches)
         max_prefix_len = max(prefix_lens) if prefix_lens is not None else None
         per_row_kwargs = [states[state_idx].extra[_STEP_MODEL_KWARGS] for state_idx in row_state_indexes]
@@ -856,17 +902,71 @@ class HunyuanImage3Pipeline(
                 prefix_lens=prefix_lens,
             )
 
+        if align_paged_sp_rows:
+            assert paged_row_spans is not None
+            logical_query_lens, _, _, paged_prefix_lens, paged_valid_lens = paged_row_spans
+            aligned_prefix_len = max(paged_prefix_lens)
+            physical_query_len = aligned_prefix_len + max(
+                query_len - prefix_len
+                for query_len, prefix_len in zip(logical_query_lens, paged_prefix_lens, strict=True)
+            )
+            for key in ("position_ids", "image_mask"):
+                value = merged.get(key)
+                if isinstance(value, torch.Tensor):
+                    merged[key] = self._align_paged_sp_tensor_rows(
+                        value,
+                        prefix_lens=paged_prefix_lens,
+                        valid_lens=paged_valid_lens,
+                        aligned_prefix_len=aligned_prefix_len,
+                        physical_query_len=physical_query_len,
+                    )
+            custom_pos_emb = merged.get("custom_pos_emb")
+            if isinstance(custom_pos_emb, tuple):
+                merged["custom_pos_emb"] = tuple(
+                    self._align_paged_sp_tensor_rows(
+                        item,
+                        prefix_lens=paged_prefix_lens,
+                        valid_lens=paged_valid_lens,
+                        aligned_prefix_len=aligned_prefix_len,
+                        physical_query_len=physical_query_len,
+                    )
+                    if isinstance(item, torch.Tensor)
+                    else item
+                    for item in custom_pos_emb
+                )
+            timestep_positions = merged.get("gen_timestep_scatter_index")
+            if isinstance(timestep_positions, torch.Tensor):
+                shifts = timestep_positions.new_tensor(
+                    [aligned_prefix_len - prefix_len for prefix_len in paged_prefix_lens]
+                ).unsqueeze(1)
+                merged["gen_timestep_scatter_index"] = timestep_positions + shifts
+
+            packed_indices: list[int] = []
+            for row_index, (prefix_len, query_len) in enumerate(
+                zip(paged_prefix_lens, logical_query_lens, strict=True)
+            ):
+                row_offset = row_index * physical_query_len
+                current_len = query_len - prefix_len
+                packed_indices.extend(range(row_offset, row_offset + prefix_len))
+                packed_indices.extend(
+                    range(
+                        row_offset + aligned_prefix_len,
+                        row_offset + aligned_prefix_len + current_len,
+                    )
+                )
+            identity_indices = list(range(len(logical_query_lens) * physical_query_len))
+            if packed_indices != identity_indices:
+                reference = merged.get("position_ids")
+                device = reference.device if isinstance(reference, torch.Tensor) else None
+                merged["paged_query_indices"] = torch.tensor(packed_indices, dtype=torch.long, device=device)
+
         if "attention_mask" in merged:
             b, _, q_len, seq_len = merged["attention_mask"].shape
             merged["query_lens"] = [q_len] * b
             merged["seq_lens"] = [seq_len] * b
         elif paged_mode:
-            paged_query_lens, paged_seq_lens, paged_starts = self._paged_row_spans(
-                states,
-                row_state_indexes,
-                row_branches,
-                first_step,
-            )
+            assert paged_row_spans is not None
+            paged_query_lens, paged_seq_lens, paged_starts, _, _ = paged_row_spans
             merged["paged_query_lens"] = paged_query_lens
             merged["paged_seq_lens"] = paged_seq_lens
             merged["paged_kv_start_pos"] = paged_starts
@@ -888,6 +988,17 @@ class HunyuanImage3Pipeline(
         else:
             rows = [value[branch : branch + 1] for value, branch in zip(input_values, row_branches)]
             input_ids = self._pad_tensor_rows(rows, self._tkwrapper.pad_token_id)
+            if align_paged_sp_rows:
+                assert paged_row_spans is not None
+                _, _, _, paged_prefix_lens, paged_valid_lens = paged_row_spans
+                input_ids = self._align_paged_sp_tensor_rows(
+                    input_ids,
+                    prefix_lens=paged_prefix_lens,
+                    valid_lens=paged_valid_lens,
+                    aligned_prefix_len=aligned_prefix_len,
+                    physical_query_len=physical_query_len,
+                    pad_value=self._tkwrapper.pad_token_id,
+                )
         return input_ids, merged
 
     def _restore_prompt_kv_cache(
@@ -1545,6 +1656,7 @@ class HunyuanImage3Pipeline(
                 "paged_query_lens": kwargs.get("paged_query_lens"),
                 "paged_seq_lens": kwargs.get("paged_seq_lens"),
                 "paged_kv_start_pos": kwargs.get("paged_kv_start_pos"),
+                "paged_query_indices": kwargs.get("paged_query_indices"),
                 "num_image_tokens": kwargs.get("num_image_tokens"),
                 "ar_kv_reuse_len": kwargs.get("ar_kv_reuse_len", 0),
                 "full_attn_spans": kwargs.get("full_attn_spans"),
@@ -1577,11 +1689,10 @@ class HunyuanImage3Pipeline(
                 # RoPE positions for the next image write, but no quadratic
                 # attention mask is needed on the paged path.
                 image_mask = model_kwargs["image_mask"]
-                bsz, seq_len = image_mask.shape
-                offset = model_kwargs.get("ar_kv_reuse_offset", 0)
-                index = torch.arange(offset, offset + seq_len, device=image_mask.device).unsqueeze(0).repeat(bsz, 1)
-                position_ids = index.masked_select(image_mask.bool()).reshape(bsz, -1)
-                timestep_position_ids = index[
+                bsz, _ = image_mask.shape
+                position_source = model_kwargs["position_ids"]
+                position_ids = position_source.masked_select(image_mask.bool()).reshape(bsz, -1)
+                timestep_position_ids = position_source[
                     torch.arange(bsz), model_kwargs["gen_timestep_scatter_index"][:, -1]
                 ].unsqueeze(-1)
                 updated_model_kwargs["position_ids"] = torch.cat([timestep_position_ids, position_ids], dim=1)
@@ -1731,6 +1842,7 @@ class HunyuanImage3Pipeline(
         paged_query_lens: list[int] | None = None,
         paged_seq_lens: list[int] | None = None,
         paged_kv_start_pos: list[int] | None = None,
+        paged_query_indices: torch.Tensor | None = None,
         num_image_tokens: int | None = None,
         uncond_cfg_prefill: bool = False,
         ar_kv_reuse_len: int = 0,
@@ -1838,6 +1950,7 @@ class HunyuanImage3Pipeline(
                 paged_query_lens=paged_query_lens,
                 paged_seq_lens=paged_seq_lens,
                 paged_kv_start_pos=paged_kv_start_pos,
+                paged_query_indices=paged_query_indices,
                 num_image_tokens=num_image_tokens,
                 gen_timestep_scatter_index=gen_timestep_scatter_index,
                 uncond_cfg_prefill=uncond_cfg_prefill,

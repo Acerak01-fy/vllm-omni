@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -246,8 +247,14 @@ class DiffusionPagedAttentionContext:
     piecewise_native_metadata: tuple[Any, ...]
     query_token_shape: tuple[int, ...]
     query_has_head_dims: bool
+    output_scatter_indices: torch.Tensor | None = None
 
     def restore_output(self, output: torch.Tensor) -> torch.Tensor:
+        if self.output_scatter_indices is not None:
+            physical_tokens = math.prod(self.query_token_shape)
+            restored = output.new_zeros((physical_tokens, *output.shape[1:]))
+            restored.index_copy_(0, self.output_scatter_indices, output)
+            output = restored
         if self.query_has_head_dims:
             return output.reshape(*self.query_token_shape, self.layer.num_heads, self.layer.head_size_v)
         return output.reshape(*self.query_token_shape, self.layer.num_heads * self.layer.head_size_v)
@@ -695,7 +702,7 @@ class DiffusionPagedAttentionAdapter:
         except KeyError as exc:
             raise KeyError(f"Unknown diffusion paged attention layer {layer_name!r}") from exc
         batch = self._active_batch
-        full_attn_spans = self._validate_omni_attn_metadata(omni_attn_metadata)
+        full_attn_spans, paged_query_indices = self._validate_omni_attn_metadata(omni_attn_metadata)
 
         query_flat, query_token_shape, query_has_head_dims = self._flatten_tensor(
             query,
@@ -715,6 +722,18 @@ class DiffusionPagedAttentionAdapter:
             head_size=layer.head_size_v,
             name="value",
         )
+        physical_query_token_shape = query_token_shape
+        if paged_query_indices is not None:
+            if paged_query_indices.numel() != batch.num_tokens:
+                raise ValueError(
+                    "Paged attention query indices must select exactly the prepared write tokens: "
+                    f"indices={paged_query_indices.numel()}, prepared={batch.num_tokens}"
+                )
+            query_flat = query_flat.index_select(0, paged_query_indices)
+            key_flat = key_flat.index_select(0, paged_query_indices)
+            value_flat = value_flat.index_select(0, paged_query_indices)
+            query_token_shape = key_token_shape = value_token_shape = (batch.num_tokens,)
+
         self._validate_token_layout(query_token_shape, batch, name="query")
         self._validate_token_layout(key_token_shape, batch, name="key")
         self._validate_token_layout(value_token_shape, batch, name="value")
@@ -779,17 +798,19 @@ class DiffusionPagedAttentionAdapter:
             native_metadata=native_metadata,
             piecewise_plan=piecewise_plan,
             piecewise_native_metadata=piecewise_native_metadata,
-            query_token_shape=query_token_shape,
+            query_token_shape=physical_query_token_shape,
             query_has_head_dims=query_has_head_dims,
+            output_scatter_indices=paged_query_indices,
         )
 
     @staticmethod
     def _validate_omni_attn_metadata(
         metadata: Any | None,
-    ) -> list[list[tuple[int, int]]] | None:
+    ) -> tuple[list[list[tuple[int, int]]] | None, torch.Tensor | None]:
         if metadata is None:
-            return None
+            return None, None
         full_attn_spans = getattr(metadata, "full_attn_spans", None)
+        paged_query_indices = getattr(metadata, "paged_query_indices", None)
         attn_mask = getattr(metadata, "attn_mask", None)
         unsupported_fields = [
             field_name
@@ -813,4 +834,4 @@ class DiffusionPagedAttentionAdapter:
                 "Diffusion paged attention cannot translate Omni attention metadata fields "
                 f"{unsupported_fields!r} to native FlashAttention metadata"
             )
-        return full_attn_spans
+        return full_attn_spans, paged_query_indices

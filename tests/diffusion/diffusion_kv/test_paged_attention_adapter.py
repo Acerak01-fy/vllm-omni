@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import torch
 from torch import nn
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.diffusion_kv import paged_attention_adapter as adapter_module
@@ -296,6 +297,44 @@ def test_omni_paged_backend_consumes_context_and_restores_diffusion_shape(
     assert layer.calls[0][0].shape == (5, 2, 4)
     assert layer.native_events == ["update", "forward"]
     assert layer.calls[0][3] is events[0][2]
+
+
+def test_paged_adapter_packs_valid_sp_rows_and_restores_physical_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, layer, _ = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [
+            DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=3, seq_len=3),
+            DiffusionPagedAttentionRow(request_id="req-1", sequence_id=1, query_len=5, seq_len=5),
+        ]
+    )
+    query = torch.arange(2 * 5 * 2 * 4, dtype=torch.float32).reshape(2, 5, 2, 4)
+    key = query + 100
+    value = query + 200
+    packed_indices = torch.tensor([0, 1, 2, 5, 6, 7, 8, 9], dtype=torch.long)
+    metadata = AttentionMetadata(
+        full_attn_spans=[[], []],
+        paged_query_indices=packed_indices,
+    )
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context(
+            "layer-0",
+            query,
+            key,
+            value,
+            omni_attn_metadata=metadata,
+        )
+        output = _run_omni_paged_backend(context)
+
+    torch.testing.assert_close(context.query, query.reshape(-1, 2, 4).index_select(0, packed_indices))
+    torch.testing.assert_close(context.key_write, key.reshape(-1, 2, 4).index_select(0, packed_indices))
+    assert output.shape == query.shape
+    torch.testing.assert_close(output[0, :3], query[0, :3])
+    assert torch.count_nonzero(output[0, 3:]) == 0
+    torch.testing.assert_close(output[1], query[1])
+    assert layer.updates[0][2].tolist() == batch.positions.tolist()
 
 
 def test_paged_adapter_accepts_native_gqa_shapes(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -7,6 +7,7 @@ import pytest
 import torch
 from transformers.utils.generic import ModelOutput
 
+import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer as tokenizer_module
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as pipeline_module
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
@@ -42,12 +43,56 @@ def test_dense_legacy_preprocess_does_not_initialize_layout_tokenizer(monkeypatc
     monkeypatch.setattr(
         pipeline_module,
         "TokenizerWrapper",
-        lambda _model: pytest.fail("dense_legacy must not initialize the Diffusion KV tokenizer"),
+        lambda _model, **_kwargs: pytest.fail("dense_legacy must not initialize the Diffusion KV tokenizer"),
     )
 
     get_hunyuan_image_3_pre_process_func(
         SimpleNamespace(model="model", diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY)
     )
+
+
+@pytest.mark.parametrize("trust_remote_code", [False, True])
+def test_paged_preprocess_respects_remote_code_config(monkeypatch, trust_remote_code) -> None:
+    captured: dict[str, bool] = {}
+    hf_config = SimpleNamespace(vae_downsample_factor=(8, 8), patch_size=2)
+    image_processor = SimpleNamespace(vision_encoder_processor=SimpleNamespace(patch_size=1))
+
+    def fake_get_config(_model, *, trust_remote_code):
+        captured["config"] = trust_remote_code
+        return hf_config
+
+    def fake_tokenizer(_model, **kwargs):
+        captured["tokenizer"] = trust_remote_code
+        assert kwargs == {"trust_remote_code": trust_remote_code}
+        return SimpleNamespace(
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+            added_tokens_encoder={},
+            convert_tokens_to_ids=lambda token: hash(token) % 1000,
+        )
+
+    monkeypatch.setattr(pipeline_module, "get_config", fake_get_config)
+    monkeypatch.setattr(pipeline_module, "HunyuanImage3ImageProcessor", lambda _config: image_processor)
+    monkeypatch.setattr(tokenizer_module.AutoTokenizer, "from_pretrained", fake_tokenizer)
+    monkeypatch.setattr(
+        pipeline_module.GenerationConfig,
+        "from_pretrained",
+        lambda _model: SimpleNamespace(),
+    )
+
+    get_hunyuan_image_3_pre_process_func(
+        SimpleNamespace(
+            model="model",
+            diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+            trust_remote_code=trust_remote_code,
+        )
+    )
+
+    assert captured == {
+        "config": trust_remote_code,
+        "tokenizer": trust_remote_code,
+    }
 
 
 class _FakeTokenizerWrapper:
@@ -443,7 +488,7 @@ def test_paged_preprocess_attaches_layout_and_scheduler_kv_requests(monkeypatch)
     )
     monkeypatch.setattr(pipeline_module, "get_config", lambda *_args, **_kwargs: hf_config)
     monkeypatch.setattr(pipeline_module, "HunyuanImage3ImageProcessor", lambda _config: image_processor)
-    monkeypatch.setattr(pipeline_module, "TokenizerWrapper", lambda _model: tokenizer)
+    monkeypatch.setattr(pipeline_module, "TokenizerWrapper", lambda _model, **_kwargs: tokenizer)
     monkeypatch.setattr(
         pipeline_module.GenerationConfig,
         "from_pretrained",

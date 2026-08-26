@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
 from functools import partial
@@ -11,6 +11,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
+    OptionalAttentionBackendDependencyError,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
@@ -21,6 +22,31 @@ from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def _load_mindiesd_attention(api_name: str):
+    """Load one MindIE-SD API without hiding transitive import failures."""
+
+    try:
+        import mindiesd
+    except ModuleNotFoundError as exc:
+        if exc.name != "mindiesd":
+            raise
+        raise OptionalAttentionBackendDependencyError(
+            "FlashAttentionBackend NPU implementation requires MindIE-SD. "
+            "Please install MindIE-SD to enable NPU attention support. "
+            "For installation details, see https://gitcode.com/Ascend/MindIE-SD. "
+            "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA."
+        ) from exc
+
+    try:
+        return getattr(mindiesd, api_name)
+    except AttributeError as exc:
+        raise OptionalAttentionBackendDependencyError(
+            f"The installed MindIE-SD package does not expose {api_name}. "
+            "Use a compatible MindIE-SD version or select "
+            "DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA."
+        ) from exc
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -499,15 +525,7 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
-        try:
-            from mindiesd import attention_forward
-        except ImportError:
-            raise ImportError(
-                "FlashAttentionBackend NPU implementation requires MindIE-SD. "
-                "Please install MindIE-SD to enable NPU attention support. "
-                "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
-                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
-            )
+        attention_forward = _load_mindiesd_attention("attention_forward")
         # Opt-in mask-free paths (mirror the CUDA cu_seqlens behavior): the
         # model marks extra["npu_attn_varlen"] and carries packed metadata, so
         # the padding document is excluded without reading or materializing
@@ -616,15 +634,7 @@ class FlashAttentionImpl(AttentionImpl):
             return None
         seq_q, seq_k = resolved
 
-        try:
-            from mindiesd import attention_forward_varlen
-        except ImportError:
-            raise ImportError(
-                "FlashAttentionBackend NPU implementation requires MindIE-SD. "
-                "Please install MindIE-SD to enable NPU attention support. "
-                "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
-                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
-            )
+        attention_forward_varlen = _load_mindiesd_attention("attention_forward_varlen")
         q = query.squeeze(0)  # [T, N, D] == TND
         k = key.squeeze(0)
         v = value.squeeze(0)
@@ -672,15 +682,7 @@ class FlashAttentionImpl(AttentionImpl):
         _, seq_k = resolved
         used_k = seq_k[0]  # real document length (first cumulative end)
 
-        try:
-            from mindiesd import attention_forward
-        except ImportError:
-            raise ImportError(
-                "FlashAttentionBackend NPU implementation requires MindIE-SD. "
-                "Please install MindIE-SD to enable NPU attention support. "
-                "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
-                "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
-            )
+        attention_forward = _load_mindiesd_attention("attention_forward")
         # mindiesd always takes BSND input regardless of `layout`; the arg
         # selects the op-internal layout and laser only supports BNSD, so do
         # NOT forward the model's qkv_layout ("BSND" for MiniMax-H3) here.

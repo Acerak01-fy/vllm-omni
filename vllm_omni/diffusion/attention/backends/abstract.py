@@ -10,6 +10,10 @@ import torch
 from vllm_omni.platforms import current_omni_platform
 
 
+class OptionalAttentionBackendDependencyError(ImportError):
+    """An optional backend package is unavailable for the requested path."""
+
+
 class AttentionBackend(ABC):
     """Abstract class for diffusion attention backends."""
 
@@ -166,6 +170,10 @@ class AttentionMetadata:
     # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
     full_attn_spans: list[list[tuple[int, int]]] | None = None
     query_ranges: tuple[QueryRange, ...] | None = None
+    # Optional packed-token selection applied after SP communication. Values
+    # index the flattened physical Q/K/V tensors in logical row order. The
+    # paged adapter scatters the output back to the original physical layout.
+    paged_query_indices: torch.Tensor | None = None
 
     # Geometry of the video segment for backends that exploit spatiotemporal
     # locality (block-sparse selection, tiled masks). Dense backends ignore it.

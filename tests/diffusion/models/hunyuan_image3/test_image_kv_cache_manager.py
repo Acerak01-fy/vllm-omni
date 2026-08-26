@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for ImageKVCacheManager.
 
 Covers: cache → reuse flow, AR KV injection, CFG (sequential & parallel), SP, cross-request isolation.
@@ -277,6 +277,38 @@ def test_paged_sp_first_step_keeps_joint_prompt_and_4d_image_shard(sp_size: int)
     assert metadata.joint_key.shape == (1, prompt_len, NUM_KV_HEADS, HEAD_DIM)
     assert metadata.joint_value.shape == (1, prompt_len, NUM_KV_HEADS, HEAD_DIM)
     assert metadata.full_attn_spans == [[(prompt_len, prompt_len + local_image_len * sp_size)]]
+
+
+def test_paged_sp_first_step_accepts_heterogeneous_cfg_rows_with_packed_indices() -> None:
+    mgr = _make_cache_mgr(sp_size=2)
+    mgr.attn.paged_kv_active = True
+    padded_prompt_len = 14
+    local_image_len = 10
+    local_len = padded_prompt_len + local_image_len
+    key, value = _make_known_kv(2 * local_len)
+    query = torch.randn(2 * local_len, NUM_HEADS, HEAD_DIM)
+    packed_indices = torch.tensor([*range(12), *range(14, 34), *range(34, 68)])
+
+    output = mgr(
+        query,
+        key,
+        value,
+        attention_mask=None,
+        query_lens=[local_len, local_len],
+        seq_lens=[local_len, local_len],
+        paged_query_lens=[32, 34],
+        paged_seq_lens=[32, 34],
+        paged_query_indices=packed_indices,
+        full_attn_spans=[[(13, 29)], [(15, 31)]],
+        first_step=True,
+        shard_image_size=local_image_len,
+        num_image_tokens=17,
+    )
+
+    assert output.shape == query.shape
+    metadata = mgr.attn.metadata_calls[-1]
+    assert metadata.joint_query.shape == (2, padded_prompt_len, NUM_HEADS, HEAD_DIM)
+    assert torch.equal(metadata.paged_query_indices, packed_indices)
 
 
 @pytest.mark.parametrize("sp_size", [2, 4])
