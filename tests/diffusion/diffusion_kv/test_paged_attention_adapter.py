@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import math
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -22,6 +22,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
     DiffusionPagedAttentionRow,
     DiffusionPagedAttentionRowBinding,
+    DiffusionPagedKVWritePlan,
 )
 from vllm_omni.diffusion.forward_context import (
     override_paged_kv_adapter,
@@ -155,6 +156,21 @@ def _make_adapter(
     capacity: int = 16,
 ) -> tuple[DiffusionPagedAttentionAdapter, _FakeBlockTables, _FakeLayer, list[tuple]]:
     events: list[tuple] = []
+    monkeypatch.setattr(
+        adapter_module.current_omni_platform,
+        "build_diffusion_paged_kv_write_plans",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        adapter_module.current_omni_platform,
+        "supports_diffusion_paged_kv_write_plan",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        adapter_module.current_omni_platform,
+        "use_diffusion_paged_kv_write_plan",
+        lambda _plan: nullcontext(),
+    )
     block_tables = _FakeBlockTables()
     block_tables.max_num_batched_tokens = capacity
     block_tables.num_blocks.np.fill(math.ceil(capacity / block_tables.block_sizes[0]))
@@ -350,6 +366,151 @@ def test_omni_piecewise_backend_defers_backend_owned_cache_update(monkeypatch: p
     assert [metadata.query_start_loc_cpu.tolist() for metadata in segment_metadata] == [[0, 1], [0, 2], [0, 1]]
     assert [metadata.positions.tolist() for metadata in segment_metadata] == [[0], [1, 2], [3]]
     assert [metadata.slot_mappings.tolist() for metadata in segment_metadata] == [[[0]], [[1, 2]], [[3]]]
+
+
+def test_omni_piecewise_backend_static_plan_updates_once_then_reads_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, layer, events = _make_adapter(monkeypatch)
+    layer.attn_backend.forward_includes_kv_cache_update = True
+    write_plan = DiffusionPagedKVWritePlan(
+        block_ids=torch.tensor([3]),
+        local_slot_mapping=torch.arange(4),
+    )
+    monkeypatch.setattr(
+        adapter_module.current_omni_platform,
+        "build_diffusion_paged_kv_write_plans",
+        lambda **_kwargs: {"layer-0": write_plan},
+    )
+    monkeypatch.setattr(
+        adapter_module.current_omni_platform,
+        "supports_diffusion_paged_kv_write_plan",
+        lambda: True,
+    )
+    active_plans = []
+
+    @contextmanager
+    def use_write_plan(plan):
+        active_plans.append(plan)
+        yield
+
+    monkeypatch.setattr(
+        adapter_module.current_omni_platform,
+        "use_diffusion_paged_kv_write_plan",
+        use_write_plan,
+    )
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=4, seq_len=4)]
+    )
+    query = torch.randn(1, 4, 2, 4)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    metadata = SimpleNamespace(full_attn_spans=[[(1, 3)]], extra={})
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context(
+            "layer-0",
+            query,
+            key,
+            value,
+            omni_attn_metadata=metadata,
+        )
+        output = _run_omni_paged_backend(context)
+
+    assert torch.equal(output, query)
+    assert layer.native_events == ["update", "forward", "forward", "forward"]
+    assert len(layer.updates) == 1
+    assert len(active_plans) == 4
+    assert all(plan is write_plan for plan in active_plans)
+    update_key, update_value, update_slots = layer.updates[0]
+    assert torch.equal(update_key, key.reshape(4, 2, 4))
+    assert torch.equal(update_value, value.reshape(4, 2, 4))
+    assert update_slots.tolist() == [0, 1, 2, 3]
+    assert [call[0].shape[0] for call in layer.calls] == [1, 2, 1]
+    assert all(call[1] is None and call[2] is None for call in layer.calls)
+    assert all(call[3] is event[2] for call, event in zip(layer.calls, events[1:], strict=True))
+
+
+def test_omni_non_piecewise_static_plan_does_not_write_twice(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, layer, _ = _make_adapter(monkeypatch)
+    layer.attn_backend.forward_includes_kv_cache_update = True
+    write_plan = DiffusionPagedKVWritePlan(
+        block_ids=torch.tensor([3]),
+        local_slot_mapping=torch.arange(3),
+    )
+    monkeypatch.setattr(
+        adapter_module.current_omni_platform,
+        "build_diffusion_paged_kv_write_plans",
+        lambda **_kwargs: {"layer-0": write_plan},
+    )
+    monkeypatch.setattr(
+        adapter_module.current_omni_platform,
+        "supports_diffusion_paged_kv_write_plan",
+        lambda: True,
+    )
+    active_plans = []
+
+    @contextmanager
+    def use_write_plan(plan):
+        active_plans.append(plan)
+        yield
+
+    monkeypatch.setattr(adapter_module.current_omni_platform, "use_diffusion_paged_kv_write_plan", use_write_plan)
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=3, seq_len=3)]
+    )
+    qkv = torch.randn(1, 3, 2, 4)
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context("layer-0", qkv, qkv, qkv)
+        output = _run_omni_paged_backend(context)
+
+    assert torch.equal(output, qkv)
+    assert layer.native_events == ["update", "forward"]
+    assert len(layer.updates) == 1
+    assert len(active_plans) == 2
+    assert all(plan is write_plan for plan in active_plans)
+    assert layer.calls[0][1] is None and layer.calls[0][2] is None
+
+
+def test_static_write_plan_is_reused_until_block_table_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch)
+    adapter.resolve_row = lambda *_args: DiffusionPagedAttentionRowBinding(
+        row_index=2,
+        max_seq_len=16,
+        block_ids=((3, 7, 9, 11),),
+    )
+    builds = []
+
+    def build_plans(**kwargs):
+        builds.append(kwargs)
+        return {
+            "layer-0": DiffusionPagedKVWritePlan(
+                block_ids=torch.tensor([3]),
+                local_slot_mapping=torch.arange(4),
+            )
+        }
+
+    monkeypatch.setattr(
+        adapter_module.current_omni_platform,
+        "build_diffusion_paged_kv_write_plans",
+        build_plans,
+    )
+    monkeypatch.setattr(
+        adapter_module.current_omni_platform,
+        "supports_diffusion_paged_kv_write_plan",
+        lambda: True,
+    )
+    row = DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=4, seq_len=4)
+
+    first = adapter.prepare_batch([row])
+    second = adapter.prepare_batch([row])
+    assert first.write_plans_by_layer == second.write_plans_by_layer
+    assert len(builds) == 1
+
+    adapter.invalidate_prepared_batches()
+    adapter.prepare_batch([row])
+    assert len(builds) == 2
 
 
 def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -992,7 +1153,7 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     selected_backends = []
-    impl_cls = Mock(return_value=SimpleNamespace(forward=Mock()))
+    impl_cls = Mock(return_value=SimpleNamespace(forward=Mock(), do_kv_cache_update=Mock()))
     native_backend = SimpleNamespace(
         get_name=lambda: "ASCEND",
         indexes_kv_by_block_stride=lambda: True,

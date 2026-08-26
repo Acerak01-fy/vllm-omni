@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from typing import Any
 
 import torch
@@ -13,6 +14,11 @@ from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBa
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 logger = init_logger(__name__)
+
+_diffusion_paged_kv_write_plan: ContextVar[Any | None] = ContextVar(
+    "diffusion_paged_kv_write_plan",
+    default=None,
+)
 
 _DIFFUSION_PACKED_MODULES_MAPPING = {
     "HunyuanImage3Pipeline": {
@@ -54,6 +60,79 @@ def _pa_nz_to_logical_cache(
         cache_nz.reshape(cache_nz.shape[0], num_heads, head_size // last_dim, cache_nz.shape[2], last_dim)
         .permute(0, 3, 1, 2, 4)
         .reshape(cache_nz.shape[0], cache_nz.shape[2], num_heads, head_size)
+    )
+
+
+@contextmanager
+def _use_diffusion_paged_kv_write_plan(write_plan: Any):
+    token = _diffusion_paged_kv_write_plan.set(write_plan)
+    try:
+        yield
+    finally:
+        _diffusion_paged_kv_write_plan.reset(token)
+
+
+def _reshape_and_cache_without_cache_mode(cls, key, value, key_cache, value_cache, slot_mapping):
+    """Run the legacy scatter schema, using a static diffusion plan when set."""
+
+    del cls
+    import torch_npu
+
+    if (
+        key_cache.dim() == 4
+        and value_cache.dim() == 4
+        and key.dim() == 3
+        and key_cache.shape[2] == key.shape[1]
+        and key_cache.shape[3] == key.shape[2]
+        and value_cache.shape[2] == value.shape[1]
+        and value_cache.shape[3] == value.shape[2]
+    ):
+        block_size = key_cache.shape[1]
+        last_dim = 16
+        if key.shape[-1] % last_dim or value.shape[-1] % last_dim:
+            raise RuntimeError("Ascend cache-writer compatibility requires key/value head sizes divisible by 16")
+        write_plan = _diffusion_paged_kv_write_plan.get()
+        if write_plan is None:
+            block_ids = torch.unique(slot_mapping // block_size, sorted=True)
+            local_slots = (
+                torch.searchsorted(block_ids, slot_mapping // block_size) * block_size + slot_mapping % block_size
+            ).to(dtype=slot_mapping.dtype)
+        else:
+            block_ids = write_plan.block_ids
+            local_slots = write_plan.local_slot_mapping
+            if local_slots.numel() != slot_mapping.numel():
+                raise RuntimeError(
+                    "Static diffusion KV write plan does not match the current write: "
+                    f"slots={local_slots.numel()}, expected={slot_mapping.numel()}"
+                )
+        if block_ids.numel() == 0:
+            return
+        key_cache_nz = _logical_cache_to_pa_nz(key_cache, block_ids, key.shape[-1], last_dim=last_dim)
+        value_cache_nz = _logical_cache_to_pa_nz(value_cache, block_ids, value.shape[-1], last_dim=last_dim)
+        torch_npu.npu_scatter_pa_kv_cache(
+            key=key.contiguous(),
+            value=value.contiguous(),
+            key_cache=key_cache_nz,
+            value_cache=value_cache_nz,
+            slot_mapping=local_slots.contiguous(),
+        )
+        key_cache.index_copy_(
+            0,
+            block_ids,
+            _pa_nz_to_logical_cache(key_cache_nz, key.shape[-1], last_dim=last_dim),
+        )
+        value_cache.index_copy_(
+            0,
+            block_ids,
+            _pa_nz_to_logical_cache(value_cache_nz, value.shape[-1], last_dim=last_dim),
+        )
+        return
+    torch_npu.npu_scatter_pa_kv_cache(
+        key=key.contiguous(),
+        value=value.contiguous(),
+        key_cache=key_cache,
+        value_cache=value_cache,
+        slot_mapping=slot_mapping.contiguous(),
     )
 
 
@@ -133,7 +212,6 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         is the operator default, so only the unsupported argument is removed.
         """
 
-        import torch_npu
         from vllm_ascend.device import device_op
 
         op = getattr(getattr(torch.ops, "npu", None), "npu_scatter_pa_kv_cache", None)
@@ -144,65 +222,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         if getattr(device_operator, "_omni_cache_mode_compat", False):
             return
 
-        def reshape_and_cache(cls, key, value, key_cache, value_cache, slot_mapping):
-            del cls
-            # CANN 8.5.1 selects the ND scenario for the vLLM logical cache
-            # view (N, B, H, D), but the torch_npu build shipped with the
-            # target image rejects that scenario for BF16/FP16.  The same
-            # operator accepts the PA_NZ view (N, H*D/16, B, 16).  Convert
-            # only the physical blocks touched by this write so we do not
-            # duplicate a complete per-layer cache.
-            if (
-                key_cache.dim() == 4
-                and value_cache.dim() == 4
-                and key.dim() == 3
-                and key_cache.shape[2] == key.shape[1]
-                and key_cache.shape[3] == key.shape[2]
-                and value_cache.shape[2] == value.shape[1]
-                and value_cache.shape[3] == value.shape[2]
-            ):
-                block_size = key_cache.shape[1]
-                last_dim = 16
-                if key.shape[-1] % last_dim or value.shape[-1] % last_dim:
-                    raise RuntimeError(
-                        "Ascend cache-writer compatibility requires key/value head sizes divisible by 16"
-                    )
-                block_ids = torch.unique(slot_mapping // block_size, sorted=True)
-
-                key_cache_nz = _logical_cache_to_pa_nz(key_cache, block_ids, key.shape[-1], last_dim=last_dim)
-                value_cache_nz = _logical_cache_to_pa_nz(value_cache, block_ids, value.shape[-1], last_dim=last_dim)
-                local_slots = (
-                    torch.searchsorted(block_ids, slot_mapping // block_size) * block_size
-                    + slot_mapping % block_size
-                ).to(dtype=slot_mapping.dtype)
-                torch_npu.npu_scatter_pa_kv_cache(
-                    key=key.contiguous(),
-                    value=value.contiguous(),
-                    key_cache=key_cache_nz,
-                    value_cache=value_cache_nz,
-                    slot_mapping=local_slots.contiguous(),
-                )
-
-                key_cache.index_copy_(
-                    0,
-                    block_ids,
-                    _pa_nz_to_logical_cache(key_cache_nz, key.shape[-1], last_dim=last_dim),
-                )
-                value_cache.index_copy_(
-                    0,
-                    block_ids,
-                    _pa_nz_to_logical_cache(value_cache_nz, value.shape[-1], last_dim=last_dim),
-                )
-                return
-            torch_npu.npu_scatter_pa_kv_cache(
-                key=key.contiguous(),
-                value=value.contiguous(),
-                key_cache=key_cache,
-                value_cache=value_cache,
-                slot_mapping=slot_mapping.contiguous(),
-            )
-
-        device_operator.reshape_and_cache = classmethod(reshape_and_cache)
+        device_operator.reshape_and_cache = classmethod(_reshape_and_cache_without_cache_mode)
         device_operator._omni_cache_mode_compat = True
         logger.warning_once(
             "Applied narrow vLLM-Ascend cache-writer compatibility: "
@@ -221,9 +241,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 
         supported_sizes = [
-            size
-            for size in AscendAttentionBackend.get_supported_kernel_block_sizes()
-            if type(size) is int and size > 0
+            size for size in AscendAttentionBackend.get_supported_kernel_block_sizes() if type(size) is int and size > 0
         ]
         if not supported_sizes:
             raise RuntimeError("Ascend paged attention did not expose an integer kernel block size")
@@ -231,6 +249,85 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         # stores cache pages as 128-token blocks.  Set the Manager geometry
         # before KV specs are collected so Scheduler and Worker agree.
         vllm_config.cache_config.block_size = supported_sizes[0]
+
+    @classmethod
+    def supports_diffusion_paged_kv_write_plan(cls) -> bool:
+        return True
+
+    @classmethod
+    def build_diffusion_paged_kv_write_plans(
+        cls,
+        *,
+        rows,
+        row_bindings,
+        kv_cache_config,
+        block_tables,
+        device,
+    ) -> dict[str, Any]:
+        """Build compact PA_NZ mappings from Scheduler-owned physical blocks."""
+
+        del cls
+        from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import DiffusionPagedKVWritePlan
+
+        if len(rows) != len(row_bindings):
+            raise ValueError("Diffusion KV write-plan rows and bindings must have equal length")
+        plans: dict[str, Any] = {}
+        for group_index, cache_group in enumerate(kv_cache_config.kv_cache_groups):
+            kernel_block_size = int(block_tables.kernel_block_sizes[group_index])
+            blocks_per_kv_block = int(block_tables.blocks_per_kv_block[group_index])
+            global_slots: list[int] = []
+            for row, binding in zip(rows, row_bindings, strict=True):
+                if len(binding.block_ids) != len(kv_cache_config.kv_cache_groups):
+                    raise RuntimeError(
+                        f"Paged KV row {row.identity!r} has {len(binding.block_ids)} block groups; "
+                        f"expected {len(kv_cache_config.kv_cache_groups)}"
+                    )
+                logical_blocks = binding.block_ids[group_index]
+                kernel_blocks = tuple(
+                    block_id * blocks_per_kv_block + offset
+                    for block_id in logical_blocks
+                    for offset in range(blocks_per_kv_block)
+                )
+                for position in range(row.kv_start_pos, row.kv_start_pos + row.query_len):
+                    block_index = position // (kernel_block_size * block_tables.cp_size)
+                    block_offset = position % (kernel_block_size * block_tables.cp_size)
+                    if block_index >= len(kernel_blocks):
+                        raise RuntimeError(
+                            f"Paged KV row {row.identity!r} has no physical block for write position {position}"
+                        )
+                    if block_tables.cp_size == 1:
+                        local_offset = block_offset
+                    else:
+                        is_local = (
+                            block_offset // block_tables.cp_interleave % block_tables.cp_size == block_tables.cp_rank
+                        )
+                        if not is_local:
+                            global_slots.append(-1)
+                            continue
+                        rounds = block_offset // (block_tables.cp_interleave * block_tables.cp_size)
+                        local_offset = rounds * block_tables.cp_interleave + block_offset % block_tables.cp_interleave
+                    global_slots.append(kernel_blocks[block_index] * kernel_block_size + local_offset)
+
+            touched_blocks = sorted({slot // kernel_block_size for slot in global_slots if slot >= 0})
+            compact_block_index = {block_id: index for index, block_id in enumerate(touched_blocks)}
+            local_slots = [
+                -1
+                if slot < 0
+                else compact_block_index[slot // kernel_block_size] * kernel_block_size + slot % kernel_block_size
+                for slot in global_slots
+            ]
+            plan = DiffusionPagedKVWritePlan(
+                block_ids=torch.tensor(touched_blocks, dtype=torch.int32, device=device),
+                local_slot_mapping=torch.tensor(local_slots, dtype=torch.int32, device=device),
+            )
+            for layer_name in cache_group.layer_names:
+                plans[layer_name] = plan
+        return plans
+
+    @classmethod
+    def use_diffusion_paged_kv_write_plan(cls, write_plan: Any):
+        del cls
+        return _use_diffusion_paged_kv_write_plan(write_plan)
 
     @classmethod
     def get_diffusion_kv_block_tables_cls(cls) -> type:

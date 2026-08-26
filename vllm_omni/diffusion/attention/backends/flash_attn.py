@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 from functools import partial
@@ -267,19 +267,28 @@ class FlashAttentionImpl(AttentionImpl):
         native_impl = getattr(layer, "impl", None)
         if native_impl is None:
             raise RuntimeError(f"Native attention implementation is not bound for diffusion layer {layer.layer_name!r}")
-        if not layer.attn_backend.forward_includes_kv_cache_update:
-            native_impl.do_kv_cache_update(
-                layer,
-                paged_kv_context.key_write,
-                paged_kv_context.value_write,
-                kv_cache,
-                paged_kv_context.slot_mapping,
-            )
+        static_paged_kv = (
+            paged_kv_context.write_plan is not None and current_omni_platform.supports_diffusion_paged_kv_write_plan()
+        )
+        read_paged_kv_from_cache = static_paged_kv and layer.attn_backend.forward_includes_kv_cache_update
+        if not layer.attn_backend.forward_includes_kv_cache_update or static_paged_kv:
+            if static_paged_kv and not callable(getattr(native_impl, "do_kv_cache_update", None)):
+                raise RuntimeError(
+                    f"Native attention implementation for {layer.layer_name!r} cannot consume a prepared KV write plan"
+                )
+            with current_omni_platform.use_diffusion_paged_kv_write_plan(paged_kv_context.write_plan):
+                native_impl.do_kv_cache_update(
+                    layer,
+                    paged_kv_context.key_write,
+                    paged_kv_context.value_write,
+                    kv_cache,
+                    paged_kv_context.slot_mapping,
+                )
 
         def run_native_attention(
             query: torch.Tensor,
-            key: torch.Tensor,
-            value: torch.Tensor,
+            key: torch.Tensor | None,
+            value: torch.Tensor | None,
             native_metadata,
         ) -> torch.Tensor:
             output = torch.empty(
@@ -287,15 +296,16 @@ class FlashAttentionImpl(AttentionImpl):
                 dtype=query.dtype,
                 device=query.device,
             )
-            return native_impl.forward(
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                native_metadata,
-                output,
-            )
+            with current_omni_platform.use_diffusion_paged_kv_write_plan(paged_kv_context.write_plan):
+                return native_impl.forward(
+                    layer,
+                    query,
+                    key,
+                    value,
+                    kv_cache,
+                    native_metadata,
+                    output,
+                )
 
         if paged_kv_context.piecewise_plan is not None:
             output = run_paged_piecewise_plan(
@@ -305,12 +315,15 @@ class FlashAttentionImpl(AttentionImpl):
                 paged_kv_context.piecewise_plan,
                 paged_kv_context.piecewise_native_metadata,
                 run_native_attention,
+                read_kv_from_cache=read_paged_kv_from_cache,
             )
         else:
+            native_key = None if read_paged_kv_from_cache else paged_kv_context.key_write
+            native_value = None if read_paged_kv_from_cache else paged_kv_context.value_write
             output = run_native_attention(
                 paged_kv_context.query,
-                paged_kv_context.key_write,
-                paged_kv_context.value_write,
+                native_key,
+                native_value,
                 paged_kv_context.native_metadata,
             )
         return paged_kv_context.restore_output(output)

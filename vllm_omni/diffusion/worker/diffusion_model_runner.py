@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Diffusion Model Runner for vLLM-Omni.
 
@@ -738,8 +738,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         request_ids = [request.request_id for request in requests]
         profile_kv_mode = getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
         profile_uses_dense_inputs = (
-            getattr(self.od_config, "step_execution", False)
-            and profile_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+            getattr(self.od_config, "step_execution", False) and profile_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
         )
         previous_pipeline_runtime_mode = getattr(self.pipeline, "_paged_kv_runtime_enabled", None)
         try:
@@ -1029,8 +1028,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             paged_batch: PreparedDiffusionPagedAttentionBatch | None = None
             if (
                 use_paged_attention
-                and
-                getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+                and getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
                 is DiffusionKVCacheMode.PAGED_SCHEDULER
             ):
                 prepare_rows = getattr(self.pipeline, "prepare_paged_attention_rows", None)

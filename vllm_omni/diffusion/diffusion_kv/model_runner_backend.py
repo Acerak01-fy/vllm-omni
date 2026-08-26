@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -33,17 +33,17 @@ DiffusionKVSnapshot = tuple[object, ...]
 
 
 @dataclass(frozen=True)
-class _DiffusionKVRequestState:
-    generation: int
-    snapshot: DiffusionKVSnapshot
-    row_token_lens: tuple[tuple[DiffusionKVIdentity, int], ...]
-
-
-@dataclass(frozen=True)
 class _DiffusionKVRowInstall:
     identity: DiffusionKVIdentity
     token_len: int
     block_ids: tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True)
+class _DiffusionKVRequestState:
+    generation: int
+    snapshot: DiffusionKVSnapshot
+    row_installs: tuple[_DiffusionKVRowInstall, ...]
 
 
 class DiffusionKVModelRunnerBackend:
@@ -503,7 +503,7 @@ class DiffusionKVModelRunnerBackend:
             self._diffusion_kv_request_states[metadata.request_id] = _DiffusionKVRequestState(
                 generation=metadata.allocation_generation,
                 snapshot=snapshot,
-                row_token_lens=current_state.row_token_lens,
+                row_installs=current_state.row_installs,
             )
             return False
 
@@ -530,7 +530,7 @@ class DiffusionKVModelRunnerBackend:
         self._diffusion_kv_request_states[metadata.request_id] = _DiffusionKVRequestState(
             generation=metadata.allocation_generation,
             snapshot=snapshot,
-            row_token_lens=tuple((install.identity, install.token_len) for install in installs),
+            row_installs=tuple(installs),
         )
         return True
 
@@ -588,11 +588,12 @@ class DiffusionKVModelRunnerBackend:
         identity = (request_id, None, context_id) if context_id is not None else (request_id, sequence_id, None)
         request_state = self._diffusion_kv_request_states.get(request_id)
         if request_state is not None:
-            for installed_identity, token_len in request_state.row_token_lens:
-                if installed_identity == identity:
+            for install in request_state.row_installs:
+                if install.identity == identity:
                     return DiffusionPagedAttentionRowBinding(
                         row_index=row_index,
-                        max_seq_len=token_len,
+                        max_seq_len=install.token_len,
+                        block_ids=install.block_ids,
                     )
         raise RuntimeError(f"Diffusion KV request state is missing logical length for {identity!r}")
 

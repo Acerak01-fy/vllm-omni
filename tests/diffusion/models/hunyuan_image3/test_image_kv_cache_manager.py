@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for ImageKVCacheManager.
 
 Covers: cache → reuse flow, AR KV injection, CFG (sequential & parallel), SP, cross-request isolation.
@@ -177,9 +177,7 @@ def test_gqa_kv_stays_compressed_for_paged_attention(
     # Dense compatibility keeps a batched layout. The Scheduler-paged path
     # packs each row before handing Q/K/V to the native #6102 adapter.
     expected_shape = (
-        (q_len, expected_kv_heads, HEAD_DIM)
-        if paged_kv_active
-        else (1, q_len, expected_kv_heads, HEAD_DIM)
+        (q_len, expected_kv_heads, HEAD_DIM) if paged_kv_active else (1, q_len, expected_kv_heads, HEAD_DIM)
     )
     assert key_input.shape == expected_shape
     assert value_input.shape == expected_shape

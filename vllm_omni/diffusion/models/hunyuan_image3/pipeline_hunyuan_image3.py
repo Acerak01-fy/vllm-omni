@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
 import logging
@@ -487,9 +487,7 @@ class HunyuanImage3Pipeline(
             if getattr(parallel_config, "ulysses_degree", parallel_config.sequence_parallel_size) != (
                 parallel_config.sequence_parallel_size
             ):
-                raise ValueError(
-                    "HunyuanImage3 Scheduler paged KV requires sequence_parallel_size == ulysses_degree."
-                )
+                raise ValueError("HunyuanImage3 Scheduler paged KV requires sequence_parallel_size == ulysses_degree.")
             if getattr(parallel_config, "ulysses_mode", "strict") != "strict":
                 raise ValueError("HunyuanImage3 Scheduler paged KV supports only strict Ulysses SP.")
         if parallel_config.cfg_parallel_size > 1:
@@ -504,9 +502,11 @@ class HunyuanImage3Pipeline(
         runtime_enabled = getattr(self, "_paged_kv_runtime_enabled", None)
         if runtime_enabled is False:
             return False
-        return getattr(self, "od_config", None) is not None and getattr(
-            self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY
-        ) is DiffusionKVCacheMode.PAGED_SCHEDULER
+        return (
+            getattr(self, "od_config", None) is not None
+            and getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+        )
 
     def _paged_row_spans(
         self,
@@ -596,9 +596,7 @@ class HunyuanImage3Pipeline(
             )
         first_step, cfg_factor = self._validate_step_group_states(groups[0])
         row_state_indexes, row_branches = self._step_row_order(groups[0], cfg_factor)
-        query_lens, seq_lens, starts = self._paged_row_spans(
-            groups[0], row_state_indexes, row_branches, first_step
-        )
+        query_lens, seq_lens, starts = self._paged_row_spans(groups[0], row_state_indexes, row_branches, first_step)
         rows = []
         for state_idx, branch, query_len, seq_len, start in zip(
             row_state_indexes,

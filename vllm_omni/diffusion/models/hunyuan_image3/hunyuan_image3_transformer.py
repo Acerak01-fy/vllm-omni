@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import inspect
 import logging
@@ -1278,9 +1278,7 @@ class ImageKVCacheManager(nn.Module):
             if uncond_cfg_prefill:
                 raise NotImplementedError("Hunyuan paged KV does not support the AR negative CFG prefill path")
             missing = [
-                name
-                for name in ("paged_query_lens", "paged_seq_lens", "full_attn_spans")
-                if kwargs.get(name) is None
+                name for name in ("paged_query_lens", "paged_seq_lens", "full_attn_spans") if kwargs.get(name) is None
             ]
             if missing:
                 raise RuntimeError(

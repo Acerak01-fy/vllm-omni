@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import inspect
 from types import SimpleNamespace
@@ -7,14 +7,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer as hy3_tokenizer_module
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 import vllm_omni.diffusion.models.hunyuan_image3.request_layout as hy3_layout_module
-import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer as hy3_tokenizer_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
-from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo
-from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model, ImageInfo
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,

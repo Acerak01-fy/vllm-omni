@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Piecewise attention for mixed causal / full (bidirectional) masks.
 
@@ -145,7 +145,7 @@ class PagedPiecewisePlan:
 
 
 PagedPiecewiseRunner = Callable[
-    [torch.Tensor, torch.Tensor, torch.Tensor, object],
+    [torch.Tensor, torch.Tensor | None, torch.Tensor | None, object],
     torch.Tensor,
 ]
 
@@ -210,6 +210,8 @@ def run_paged_piecewise_plan(
     plan: PagedPiecewisePlan,
     segment_metadata: Sequence[object],
     segment_runner: PagedPiecewiseRunner,
+    *,
+    read_kv_from_cache: bool = False,
 ) -> torch.Tensor:
     """Run and scatter piecewise attention over packed Q/K/V write tensors."""
 
@@ -219,10 +221,12 @@ def run_paged_piecewise_plan(
     output = None
     for segment, metadata in zip(plan.segments, segment_metadata, strict=True):
         indices = segment.query_indices
+        segment_key = None if read_kv_from_cache else key.index_select(0, indices)
+        segment_value = None if read_kv_from_cache else value.index_select(0, indices)
         segment_output = segment_runner(
             query.index_select(0, indices),
-            key.index_select(0, indices),
-            value.index_select(0, indices),
+            segment_key,
+            segment_value,
             metadata,
         )
         if output is None:
