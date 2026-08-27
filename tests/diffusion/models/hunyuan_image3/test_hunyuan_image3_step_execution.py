@@ -212,6 +212,28 @@ def test_paged_sp_first_step_aligns_heterogeneous_cfg_rows_without_changing_logi
     assert merged["image_mask"][0].nonzero().flatten().tolist() == list(range(15, 31))
     assert merged["custom_pos_emb"][0].shape == (2, 34, 2)
     assert merged["paged_query_indices"].tolist() == [*range(12), *range(14, 34), *range(34, 68)]
+    assert merged["paged_query_indices"].device == position_ids.device
+
+
+@pytest.mark.parametrize("field", ["position_ids", "image_mask"])
+def test_paged_sp_first_step_requires_tensor_layout_metadata(field: str):
+    pipeline = _paged_pipeline(sequence_parallel_size=2)
+    state = _paged_state("req", 0)
+    state.extra[_STEP_MODEL_KWARGS].update(
+        {
+            "position_ids": torch.arange(34).reshape(1, -1).expand(2, -1),
+            "image_mask": torch.zeros(2, 34, dtype=torch.bool),
+        }
+    )
+    state.extra[_STEP_MODEL_KWARGS].pop(field)
+
+    with pytest.raises(ValueError, match=rf"requires tensor {field}"):
+        pipeline._merge_step_model_inputs(
+            [state],
+            row_state_indexes=[0, 0],
+            row_branches=[0, 1],
+            first_step=True,
+        )
 
 
 def test_prepare_model_inputs_reuses_prepared_layout(monkeypatch):

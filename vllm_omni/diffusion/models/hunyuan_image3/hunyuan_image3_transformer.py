@@ -1128,11 +1128,10 @@ class ImageKVCacheManager(nn.Module):
         if batch_size == 0:
             raise ValueError("Paged Hunyuan attention received an empty batch")
         if query_lens is None:
-            local_query_lens = [max(paged_query_lens)] * batch_size
-        else:
-            if len(query_lens) != batch_size:
-                raise ValueError("Hunyuan query_lens and paged row metadata have different batch sizes")
-            local_query_lens = [int(query_len) for query_len in query_lens]
+            raise ValueError("Paged Hunyuan attention requires query_lens metadata")
+        if len(query_lens) != batch_size:
+            raise ValueError("Hunyuan query_lens and paged row metadata have different batch sizes")
+        local_query_lens = [int(query_len) for query_len in query_lens]
         if any(query_len <= 0 for query_len in local_query_lens):
             raise ValueError("Hunyuan paged attention requires a positive padded query length")
         padded_query_len = local_query_lens[0]

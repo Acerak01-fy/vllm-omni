@@ -212,6 +212,28 @@ def test_paged_forward_packs_heterogeneous_valid_rows() -> None:
     assert torch.count_nonzero(output[3:5]) == 0
 
 
+def test_paged_forward_rejects_missing_physical_query_lengths() -> None:
+    mgr = _make_cache_mgr(sp_size=2)
+    mgr.attn.paged_kv_active = True
+    query = torch.randn(4, NUM_HEADS, HEAD_DIM)
+    key, value = _make_known_kv(4)
+
+    with pytest.raises(ValueError, match="requires query_lens metadata"):
+        mgr(
+            query,
+            key,
+            value,
+            attention_mask=None,
+            query_lens=None,
+            paged_query_lens=[8],
+            paged_seq_lens=[8],
+            full_attn_spans=[[]],
+            first_step=False,
+            shard_image_size=4,
+            num_image_tokens=8,
+        )
+
+
 def test_paged_forward_accepts_projection_native_batched_value_layout() -> None:
     """Hunyuan's Q/K are rope-flattened while V remains [B, S, KV*D]."""
 

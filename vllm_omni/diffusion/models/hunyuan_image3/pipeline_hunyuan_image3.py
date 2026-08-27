@@ -901,16 +901,20 @@ class HunyuanImage3Pipeline(
                 query_len - prefix_len
                 for query_len, prefix_len in zip(logical_query_lens, paged_prefix_lens, strict=True)
             )
-            for key in ("position_ids", "image_mask"):
-                value = merged.get(key)
-                if isinstance(value, torch.Tensor):
-                    merged[key] = self._align_paged_sp_tensor_rows(
-                        value,
-                        prefix_lens=paged_prefix_lens,
-                        valid_lens=paged_valid_lens,
-                        aligned_prefix_len=aligned_prefix_len,
-                        physical_query_len=physical_query_len,
-                    )
+            position_ids = merged.get("position_ids")
+            image_mask = merged.get("image_mask")
+            if not isinstance(position_ids, torch.Tensor):
+                raise ValueError("Hunyuan paged Ulysses first-step alignment requires tensor position_ids")
+            if not isinstance(image_mask, torch.Tensor):
+                raise ValueError("Hunyuan paged Ulysses first-step alignment requires tensor image_mask")
+            for key, value in (("position_ids", position_ids), ("image_mask", image_mask)):
+                merged[key] = self._align_paged_sp_tensor_rows(
+                    value,
+                    prefix_lens=paged_prefix_lens,
+                    valid_lens=paged_valid_lens,
+                    aligned_prefix_len=aligned_prefix_len,
+                    physical_query_len=physical_query_len,
+                )
             custom_pos_emb = merged.get("custom_pos_emb")
             if isinstance(custom_pos_emb, tuple):
                 merged["custom_pos_emb"] = tuple(
@@ -947,9 +951,11 @@ class HunyuanImage3Pipeline(
                 )
             identity_indices = list(range(len(logical_query_lens) * physical_query_len))
             if packed_indices != identity_indices:
-                reference = merged.get("position_ids")
-                device = reference.device if isinstance(reference, torch.Tensor) else None
-                merged["paged_query_indices"] = torch.tensor(packed_indices, dtype=torch.long, device=device)
+                merged["paged_query_indices"] = torch.tensor(
+                    packed_indices,
+                    dtype=torch.long,
+                    device=position_ids.device,
+                )
 
         if "attention_mask" in merged:
             b, _, q_len, seq_len = merged["attention_mask"].shape
