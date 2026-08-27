@@ -37,6 +37,10 @@ class ForwardContext:
     # Keep the field opaque here to avoid coupling the common context module to
     # the diffusion_kv implementation.
     paged_kv_adapter: Any | None = None
+    # Startup-only memory profiling runs before Scheduler-owned pages exist.
+    # Attention layers use this explicit scope to distinguish that probe from
+    # a malformed paged request whose Worker adapter was not activated.
+    in_diffusion_kv_memory_profile: bool = False
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
@@ -157,6 +161,7 @@ def create_forward_context(
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     paged_kv_runtime: object | None = None,
+    in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
 ):
@@ -165,6 +170,7 @@ def create_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         paged_kv_runtime=paged_kv_runtime,
+        in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
     )
@@ -191,6 +197,7 @@ def set_forward_context(
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     paged_kv_runtime: object | None = None,
+    in_diffusion_kv_memory_profile: bool = False,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
 ):
@@ -203,6 +210,7 @@ def set_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         paged_kv_runtime=paged_kv_runtime,
+        in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
     )

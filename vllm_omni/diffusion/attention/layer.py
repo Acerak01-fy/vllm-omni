@@ -16,10 +16,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
-from vllm_omni.diffusion.attention.backends.abstract import (
-    AttentionMetadata,
-    OptionalAttentionBackendDependencyError,
-)
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
@@ -48,6 +45,8 @@ def _try_extract_layer_index(prefix: str) -> int | None:
 
 
 class Attention(nn.Module):
+    _scheduler_paged_kv = False
+
     def __init__(
         self,
         num_heads: int,
@@ -120,6 +119,7 @@ class Attention(nn.Module):
             and getattr(config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
             is DiffusionKVCacheMode.PAGED_SCHEDULER
         )
+        self._scheduler_paged_kv = scheduler_paged_kv
         if (
             scheduler_paged_kv
             and paged_kv_cache_role is not None
@@ -361,6 +361,17 @@ class Attention(nn.Module):
         # Get the appropriate parallel strategy based on SP active state
         strategy = self._get_active_parallel_strategy()
         paged_adapter = self._active_paged_kv_adapter()
+        in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
+        if (
+            self._scheduler_paged_kv
+            and self.paged_kv_cache_role is not None
+            and paged_adapter is None
+            and not in_kv_memory_profile
+        ):
+            raise RuntimeError(
+                "Scheduler-paged diffusion attention reached model forward without an active Worker adapter. "
+                "Only the startup KV memory profile may execute before paged KV initialization."
+            )
         use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
         if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
             raise NotImplementedError(
@@ -467,21 +478,22 @@ class Attention(nn.Module):
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
-        # A paged-capable backend may have an optional dense-only dependency
-        # (MindIE-SD on Ascend).  Memory profiling runs before the Worker has
-        # installed the native page-table adapter, so use the local SDPA
-        # implementation for that probe.  Once paging is active, execution
-        # takes ``forward_paged`` above and never reaches this fallback.
-        try:
-            return self.attention.forward(query, key, value, attn_metadata)
-        except OptionalAttentionBackendDependencyError:
-            if self.paged_kv_cache_role is None or self.is_paged_kv_active():
-                raise
+        in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
+        if (
+            self._scheduler_paged_kv
+            and self.paged_kv_cache_role is not None
+            and in_kv_memory_profile
+            and current_omni_platform.is_npu()
+            and self.attn_backend.get_name() == "FLASH_ATTN"
+            and not current_omni_platform.supports_diffusion_dense_flash_attention()
+        ):
             logger.warning_once(
-                "Dense profiling for paged diffusion attention is falling back to SDPA because "
-                "the selected backend's optional dense kernel is unavailable."
+                "The startup KV memory profile is using SDPA because MindIE-SD is unavailable. "
+                "Formal paged requests still use the platform-native paged attention backend."
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+
+        return self.attention.forward(query, key, value, attn_metadata)
 
     def _assert_piecewise_compatible(self, attn_metadata: AttentionMetadata | None) -> None:
         if attn_metadata is None or attn_metadata.full_attn_spans is None:

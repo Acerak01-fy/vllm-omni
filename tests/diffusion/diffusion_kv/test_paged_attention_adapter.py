@@ -1324,3 +1324,15 @@ def test_omni_attention_keeps_dense_kernel_without_active_adapter() -> None:
 
     assert events == ["pre", "dense", "post"]
     assert output is qkv
+
+
+def test_omni_attention_rejects_scheduler_paged_forward_without_active_adapter() -> None:
+    layer = Attention.__new__(Attention)
+    nn.Module.__init__(layer)
+    layer._scheduler_paged_kv = True
+    layer.paged_kv_cache_role = "primary"
+    layer._get_active_parallel_strategy = lambda: object()
+    qkv = torch.zeros(1, 2, 2, 4)
+
+    with set_forward_context(), pytest.raises(RuntimeError, match="without an active Worker adapter"):
+        layer._forward_impl(qkv, qkv, qkv)

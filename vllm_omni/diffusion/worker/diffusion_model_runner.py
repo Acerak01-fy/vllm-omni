@@ -609,6 +609,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         kv_prefetch_job: KVPrefetchJob | None = None,
         record_name: str,
         record_output_peak_memory: bool = True,
+        in_diffusion_kv_memory_profile: bool = False,
     ) -> BatchRunnerOutput:
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not reqs:
@@ -647,6 +648,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=od_config,
                 paged_kv_runtime=paged_kv_runtime,
+                in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 with record_function(record_name):
                     raw_outputs = self.pipeline.forward(batch)
@@ -765,6 +767,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     scheduler_output,
                     validate_kv_metadata=False,
                     record_output_peak_memory=False,
+                    in_diffusion_kv_memory_profile=True,
                 )
             else:
                 runner_output = self._execute_request_list(
@@ -777,6 +780,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     # peak counters. Resetting them here would discard request
                     # preparation allocations and understate the budget.
                     record_output_peak_memory=False,
+                    in_diffusion_kv_memory_profile=True,
                 )
             current_omni_platform.synchronize()
         finally:
@@ -931,6 +935,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         *,
         validate_kv_metadata: bool,
         record_output_peak_memory: bool,
+        in_diffusion_kv_memory_profile: bool = False,
     ) -> BatchRunnerOutput:
         """Execute one step with explicit validation and profiling policy."""
 
@@ -970,6 +975,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return self._execute_stepwise_core(
                 scheduler_output,
                 record_output_peak_memory=record_output_peak_memory,
+                in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             )
         except Exception:
             if installed_request_ids:
@@ -981,6 +987,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         scheduler_output: DiffusionSchedulerOutput,
         *,
         record_output_peak_memory: bool,
+        in_diffusion_kv_memory_profile: bool = False,
     ) -> BatchRunnerOutput:
         """Run the denoise step after metadata admission and row installation."""
 
@@ -1008,6 +1015,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
                 paged_kv_runtime=paged_kv_runtime,
+                in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 clear_pipeline_stage_durations(self.pipeline)
                 noise_pred = self.pipeline.denoise_step(input_batch, states=states)

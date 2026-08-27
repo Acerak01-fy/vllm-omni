@@ -151,6 +151,12 @@ class OmniPlatform(Platform):
         backend_cls.validate_available()
 
     @classmethod
+    def supports_diffusion_dense_flash_attention(cls) -> bool:
+        """Whether the platform's dense ``FLASH_ATTN`` dependencies exist."""
+
+        return True
+
+    @classmethod
     def supports_torch_inductor(cls) -> bool:
         """Check if the platform supports torch.compile with inductor backend."""
         raise NotImplementedError

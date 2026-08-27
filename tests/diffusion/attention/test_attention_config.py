@@ -11,15 +11,13 @@ Tests cover:
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 import vllm_omni.diffusion.attention.layer as layer_mod
-from vllm_omni.diffusion.attention.backends.abstract import (
-    AttentionMetadata,
-    OptionalAttentionBackendDependencyError,
-)
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.config import (
     get_current_diffusion_config,
@@ -422,37 +420,67 @@ class TestCurrentDiffusionConfig:
 
 
 class TestAttentionInitUsesCurrentDiffusionConfig:
-    @pytest.mark.parametrize(
-        ("error", "falls_back"),
-        [
-            (OptionalAttentionBackendDependencyError("optional"), True),
-            (ImportError("bug"), False),
-        ],
-        ids=["optional-backend", "unrelated-import"],
-    )
-    def test_paged_profile_only_falls_back_for_optional_backend(self, monkeypatch, error, falls_back):
+    @pytest.mark.parametrize("mindiesd_available", [False, True])
+    def test_paged_npu_memory_profile_uses_sdpa_only_without_mindiesd(self, monkeypatch, mindiesd_available):
         attention = Attention.__new__(Attention)
+        attention._scheduler_paged_kv = True
         attention.paged_kv_cache_role = "primary"
         attention.backend_pref = "FLASH_ATTN"
         attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
-        attention.attention = SimpleNamespace(forward=lambda *args: (_ for _ in ()).throw(error))
-        expected = torch.zeros(1)
-        attention.sdpa_fallback = SimpleNamespace(forward=lambda *args: expected)
+        flash_output = torch.ones(1)
+        sdpa_output = torch.zeros(1)
+        dense_flash = Mock(return_value=flash_output)
+        sdpa = Mock(return_value=sdpa_output)
+        attention.attention = SimpleNamespace(forward=dense_flash)
+        attention.sdpa_fallback = SimpleNamespace(forward=sdpa)
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(
+            layer_mod,
+            "get_forward_context",
+            lambda: SimpleNamespace(in_diffusion_kv_memory_profile=True),
+        )
+        monkeypatch.setattr(layer_mod.current_omni_platform, "is_npu", lambda: True)
+        monkeypatch.setattr(
+            layer_mod.current_omni_platform,
+            "supports_diffusion_dense_flash_attention",
+            lambda: mindiesd_available,
+        )
+
+        result = attention._run_local_attention(
+            torch.zeros(1, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.bfloat16),
+            torch.zeros(1, dtype=torch.bfloat16),
+            AttentionMetadata(),
+        )
+
+        if mindiesd_available:
+            assert result is flash_output
+            dense_flash.assert_called_once()
+            sdpa.assert_not_called()
+        else:
+            assert result is sdpa_output
+            dense_flash.assert_not_called()
+            sdpa.assert_called_once()
+
+    def test_dense_flash_import_error_is_not_reclassified(self, monkeypatch):
+        attention = Attention.__new__(Attention)
+        attention._scheduler_paged_kv = False
+        attention.paged_kv_cache_role = "primary"
+        attention.backend_pref = "FLASH_ATTN"
+        attention.attn_backend = SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
+        attention.attention = SimpleNamespace(
+            forward=Mock(side_effect=ModuleNotFoundError("No module named 'mindiesd'", name="mindiesd"))
+        )
+        attention.sdpa_fallback = SimpleNamespace(forward=Mock(side_effect=AssertionError("must not fall back")))
         monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
 
-        def run_attention():
-            return attention._run_local_attention(
+        with pytest.raises(ModuleNotFoundError, match="mindiesd"):
+            attention._run_local_attention(
                 torch.zeros(1, dtype=torch.bfloat16),
                 torch.zeros(1, dtype=torch.bfloat16),
                 torch.zeros(1, dtype=torch.bfloat16),
                 AttentionMetadata(),
             )
-
-        if falls_back:
-            assert run_attention() is expected
-        else:
-            with pytest.raises(ImportError, match="bug"):
-                run_attention()
 
     def test_paged_marker_does_not_change_dense_backend(self, monkeypatch):
         class _FakeAttentionImpl:

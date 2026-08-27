@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import importlib.util
 import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -15,6 +16,19 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_dense_flash_capability_tracks_mindiesd(monkeypatch, available):
+    from vllm_omni.platforms.npu.platform import NPUOmniPlatform
+
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name: object() if name == "mindiesd" and available else None,
+    )
+
+    assert NPUOmniPlatform.supports_diffusion_dense_flash_attention() is available
 
 
 def _install_fake_pa_scatter(monkeypatch):

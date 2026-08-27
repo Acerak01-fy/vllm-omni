@@ -10,10 +10,6 @@ import torch
 from vllm_omni.platforms import current_omni_platform
 
 
-class OptionalAttentionBackendDependencyError(ImportError):
-    """An optional backend package is unavailable for the requested path."""
-
-
 class AttentionBackend(ABC):
     """Abstract class for diffusion attention backends."""
 

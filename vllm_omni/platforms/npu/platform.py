@@ -343,6 +343,14 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
+    def supports_diffusion_dense_flash_attention(cls) -> bool:
+        """Return whether MindIE-SD is installed for dense NPU FlashAttention."""
+
+        from importlib.util import find_spec
+
+        return find_spec("mindiesd") is not None
+
+    @classmethod
     def supports_torch_inductor(cls) -> bool:
         return False
 
