@@ -47,8 +47,6 @@ def initialize_diffusion_kv_control_plane(
 ) -> tuple[KVCacheConfig, int, int, VllmConfig] | None:
     """Run the native Worker-spec to Scheduler-config initialization chain."""
 
-    # Configuration construction normalizes the mode and rejects paged
-    # Scheduler requests that do not use step execution before this boundary.
     if (
         getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
         is not DiffusionKVCacheMode.PAGED_SCHEDULER

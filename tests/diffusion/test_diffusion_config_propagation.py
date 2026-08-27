@@ -157,7 +157,6 @@ class TestCreateDefaultDiffusion:
             model="x",
             diffusion_kv_mode="paged_scheduler",
             diffusion_kv_max_rows_per_request=2,
-            step_execution=True,
         )
 
         assert od.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER

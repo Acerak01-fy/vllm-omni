@@ -8,7 +8,6 @@ import queue
 import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -510,86 +509,6 @@ class TestRunner:
     """DiffusionModelRunner.execute_stepwise"""
 
     @pytest.mark.parametrize(
-        ("diffusion_kv_mode", "expect_paged_hooks"),
-        [
-            (DiffusionKVCacheMode.DENSE_LEGACY, False),
-            (DiffusionKVCacheMode.PAGED_SCHEDULER, True),
-        ],
-    )
-    def test_step_core_only_activates_model_paged_hooks_in_scheduler_mode(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        diffusion_kv_mode: DiffusionKVCacheMode,
-        expect_paged_hooks: bool,
-    ):
-        """The generic runner owns paging lifetime without changing dense execution."""
-
-        class _HookPipeline(_StepPipeline):
-            def __init__(self):
-                super().__init__()
-                self.prepare_rows_calls = 0
-                self.active_during_denoise = []
-                self.paged_active = False
-
-            def prepare_paged_attention_rows(self, states):
-                self.prepare_rows_calls += 1
-                assert states
-                return ("row",)
-
-            def denoise_step(self, input_batch, **kwargs):
-                self.active_during_denoise.append(self.paged_active)
-                del input_batch, kwargs
-                self.denoise_calls += 1
-                return torch.zeros(1)
-
-        runner = _make_runner(diffusion_kv_mode)
-        pipeline = _HookPipeline()
-        runner.pipeline = pipeline
-        state = StepRequestState(request_id="req-1", sampling=SimpleNamespace(), prompt="prompt")
-        pipeline.prepare_encode(state)
-        runner._update_states = lambda scheduler_output: ([state], ["req-1"])
-        runner._prepare_batch_inputs = lambda states, new_ids: SimpleNamespace(prompt_embeds=state.prompt_embeds)
-        runner._update_states_after = lambda states, batch, interrupted: None
-        runner.remove_diffusion_kv_requests = Mock()
-        runner.prepare_paged_attention_batch = Mock(return_value=object())
-
-        @contextmanager
-        def activate_paged_attention(batch):
-            del batch
-            pipeline.paged_active = True
-            try:
-                yield
-            finally:
-                pipeline.paged_active = False
-
-        runner.activate_paged_attention = Mock(side_effect=activate_paged_attention)
-        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
-
-        DiffusionModelRunner._execute_stepwise_core(
-            runner,
-            DiffusionSchedulerOutput(
-                step_id=0,
-                scheduled_new_reqs=[],
-                scheduled_cached_reqs=CachedRequestData.make_empty(),
-                finished_req_ids=set(),
-                num_running_reqs=1,
-                num_waiting_reqs=0,
-            ),
-            record_output_peak_memory=False,
-        )
-
-        if expect_paged_hooks:
-            assert pipeline.prepare_rows_calls == 1
-            runner.prepare_paged_attention_batch.assert_called_once_with(("row",))
-            runner.activate_paged_attention.assert_called_once()
-            assert pipeline.active_during_denoise == [True]
-        else:
-            assert pipeline.prepare_rows_calls == 0
-            runner.prepare_paged_attention_batch.assert_not_called()
-            runner.activate_paged_attention.assert_not_called()
-            assert pipeline.active_during_denoise == [False]
-
-    @pytest.mark.parametrize(
         ("diffusion_kv_mode", "should_cleanup"),
         [
             (DiffusionKVCacheMode.DENSE_LEGACY, False),
@@ -648,9 +567,6 @@ class TestRunner:
                 allocation_generation=1,
                 sequences=(),
             )
-            monkeypatch.setattr(runner.pipeline, "prepare_paged_attention_rows", lambda states: ("row",), raising=False)
-            monkeypatch.setattr(runner, "prepare_paged_attention_batch", lambda rows: object())
-            monkeypatch.setattr(runner, "activate_paged_attention", lambda batch: _noop_forward_context(batch))
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
         first_output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
@@ -882,11 +798,6 @@ class TestRunner:
         monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _FakeProfiler)
         monkeypatch.setattr(model_runner_module, "get_offload_backend", lambda *args, **kwargs: None)
         monkeypatch.setattr(model_runner_module, "get_cache_backend", lambda *args, **kwargs: None)
-        monkeypatch.setattr(
-            model_runner_module.current_omni_platform,
-            "init_diffusion_model_runner_runtime",
-            lambda *args, **kwargs: None,
-        )
 
         with pytest.raises(ValueError, match="RequestOnlyPipeline"):
             DiffusionModelRunner.load_model(runner)

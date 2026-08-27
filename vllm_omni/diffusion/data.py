@@ -1004,11 +1004,6 @@ class OmniDiffusionConfig:
             and self.diffusion_kv_max_rows_per_request is None
         ):
             raise ValueError("paged_scheduler requires diffusion_kv_max_rows_per_request to be set")
-        if self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and not self.step_execution:
-            raise ValueError(
-                "paged_scheduler requires step_execution=True; "
-                "request-mode execution cannot activate Scheduler-owned paged attention"
-            )
         if self.kv_cache_memory_bytes is not None and self.kv_cache_memory_bytes < 0:
             raise ValueError("kv_cache_memory_bytes must be non-negative")
         if not 0.0 < self.gpu_memory_utilization <= 1.0:

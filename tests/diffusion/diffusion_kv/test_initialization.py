@@ -41,7 +41,6 @@ def _od_config(**overrides):
     values = dict(
         model="test-diffusion",
         diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
-        step_execution=True,
         dtype=torch.bfloat16,
         max_model_len=64,
         quantization_config=None,

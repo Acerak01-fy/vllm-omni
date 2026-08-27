@@ -642,10 +642,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 current_omni_platform.reset_peak_memory_stats()
 
             kv_backend = getattr(self, "diffusion_kv_backend", None)
+            paged_kv_runtime = kv_backend if getattr(kv_backend, "paged_attention_adapter", None) is not None else None
             with set_forward_context(
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=od_config,
-                paged_kv_runtime=getattr(kv_backend, "paged_attention_adapter", None),
+                paged_kv_runtime=paged_kv_runtime,
             ):
                 with record_function(record_name):
                     raw_outputs = self.pipeline.forward(batch)
@@ -1001,11 +1002,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             attn_metadata = {}
 
             kv_backend = getattr(self, "diffusion_kv_backend", None)
+            paged_kv_runtime = kv_backend if getattr(kv_backend, "paged_attention_adapter", None) is not None else None
             with set_forward_context(
                 vllm_config=self.vllm_config,
                 omni_diffusion_config=self.od_config,
                 attn_metadata=attn_metadata,
-                paged_kv_runtime=getattr(kv_backend, "paged_attention_adapter", None),
+                paged_kv_runtime=paged_kv_runtime,
             ):
                 clear_pipeline_stage_durations(self.pipeline)
                 noise_pred = self.pipeline.denoise_step(input_batch, states=states)

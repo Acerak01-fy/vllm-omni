@@ -195,28 +195,23 @@ def test_scheduler_paged_kv_runs_piecewise_for_first_and_later_steps() -> None:
     assert mgr.attn.paged_metadata[1].full_attn_spans == full_attn_spans
 
 
-def test_hunyuan_model_builds_cfg_paged_rows_from_runtime_geometry() -> None:
-    from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
-    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model
+def test_hunyuan_pipeline_submits_cfg_rows_to_worker_runtime() -> None:
+    from vllm_omni.diffusion.forward_context import set_forward_context
+    from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import HunyuanImage3Pipeline
 
-    class FakeAdapter:
+    class FakeRuntime:
         def __init__(self):
             self.rows = None
 
-        def prepare_batch(self, rows):
-            self.rows = tuple(rows)
-            return self.rows
-
         @contextmanager
-        def activate(self, batch):
-            assert batch is self.rows
-            with override_paged_kv_adapter(self):
-                yield self
+        def activate_paged_attention_rows(self, rows):
+            self.rows = tuple(rows)
+            yield self
 
-    adapter = FakeAdapter()
+    runtime = FakeRuntime()
     identities = [("req", 0), ("req", 1)]
-    with patched_mgr_env(sp_size=1), set_forward_context(paged_kv_runtime=adapter):
-        with HunyuanImage3Model._paged_attention_context(
+    with set_forward_context(paged_kv_runtime=runtime):
+        with HunyuanImage3Pipeline._paged_attention_context(
             mode="gen_image",
             first_step=True,
             query_lens=[12, 12],
@@ -229,10 +224,10 @@ def test_hunyuan_model_builds_cfg_paged_rows_from_runtime_geometry() -> None:
             pass
 
         assert [
-            (row.request_id, row.sequence_id, row.query_len, row.seq_len, row.kv_start_pos) for row in adapter.rows
+            (row.request_id, row.sequence_id, row.query_len, row.seq_len, row.kv_start_pos) for row in runtime.rows
         ] == [("req", 0, 12, 12, 0), ("req", 1, 12, 12, 0)]
 
-        with HunyuanImage3Model._paged_attention_context(
+        with HunyuanImage3Pipeline._paged_attention_context(
             mode="gen_image",
             first_step=False,
             query_lens=[3, 3],
@@ -244,7 +239,7 @@ def test_hunyuan_model_builds_cfg_paged_rows_from_runtime_geometry() -> None:
         ):
             pass
 
-    assert [(row.kv_start_pos, row.query_len, row.seq_len) for row in adapter.rows] == [(4, 3, 7), (5, 3, 8)]
+    assert [(row.kv_start_pos, row.query_len, row.seq_len) for row in runtime.rows] == [(4, 3, 7), (5, 3, 8)]
 
 
 def test_cfg_parallel_splits_paged_row_identities() -> None:
@@ -263,13 +258,13 @@ def test_cfg_parallel_splits_paged_row_identities() -> None:
     assert model_kwargs["diffusion_kv_row_identities"] == [("req-0", 1), ("req-1", 1)]
 
 
-def test_hunyuan_model_rejects_partial_first_step_paged_rows() -> None:
+def test_hunyuan_pipeline_rejects_partial_first_step_paged_rows() -> None:
     from vllm_omni.diffusion.forward_context import set_forward_context
-    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model
+    from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import HunyuanImage3Pipeline
 
-    with patched_mgr_env(sp_size=1), set_forward_context(paged_kv_runtime=object()):
+    with set_forward_context(paged_kv_runtime=object()):
         with pytest.raises(ValueError, match="complete sequence as the query"):
-            HunyuanImage3Model._paged_attention_context(
+            HunyuanImage3Pipeline._paged_attention_context(
                 mode="gen_image",
                 first_step=True,
                 query_lens=[8],
@@ -281,13 +276,13 @@ def test_hunyuan_model_rejects_partial_first_step_paged_rows() -> None:
             )
 
 
-def test_hunyuan_model_rejects_imported_ar_kv_for_paged_rows() -> None:
+def test_hunyuan_pipeline_rejects_imported_ar_kv_for_paged_rows() -> None:
     from vllm_omni.diffusion.forward_context import set_forward_context
-    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model
+    from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import HunyuanImage3Pipeline
 
-    with patched_mgr_env(sp_size=1), set_forward_context(paged_kv_runtime=object()):
+    with set_forward_context(paged_kv_runtime=object()):
         with pytest.raises(NotImplementedError, match="does not support imported AR KV"):
-            HunyuanImage3Model._paged_attention_context(
+            HunyuanImage3Pipeline._paged_attention_context(
                 mode="gen_image",
                 first_step=True,
                 query_lens=[8],
@@ -299,51 +294,46 @@ def test_hunyuan_model_rejects_imported_ar_kv_for_paged_rows() -> None:
             )
 
 
-def test_hunyuan_model_builds_global_paged_rows_for_ulysses() -> None:
+def test_hunyuan_pipeline_submits_global_request_mode_sp_rows() -> None:
     from vllm_omni.diffusion.forward_context import set_forward_context
-    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model
+    from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import HunyuanImage3Pipeline
 
-    class FakeAdapter:
-        def prepare_batch(self, rows):
-            self.rows = tuple(rows)
-            return self.rows
-
+    class FakeRuntime:
         @contextmanager
-        def activate(self, batch):
-            yield batch
+        def activate_paged_attention_rows(self, rows):
+            self.rows = tuple(rows)
+            yield self
 
-    adapter = FakeAdapter()
-    with patched_mgr_env(sp_size=2), set_forward_context(paged_kv_runtime=adapter):
-        with HunyuanImage3Model._paged_attention_context(
+    runtime = FakeRuntime()
+    with set_forward_context(paged_kv_runtime=runtime):
+        with HunyuanImage3Pipeline._paged_attention_context(
             mode="gen_image",
             first_step=True,
-            query_lens=[7],
-            seq_lens=[7],
-            position_ids=torch.arange(7).reshape(1, -1),
+            query_lens=[10],
+            seq_lens=[10],
+            position_ids=torch.arange(10).reshape(1, -1),
             gen_timestep_scatter_index=torch.tensor([[3]]),
             ar_kv_reuse_len=0,
             row_identities=[("req", 0)],
-            shard_image_size=4,
-            shard_padding_size=1,
+            uncond_cfg_prefill=False,
         ):
             pass
-        assert (adapter.rows[0].query_len, adapter.rows[0].seq_len) == (10, 10)
+        assert (runtime.rows[0].query_len, runtime.rows[0].seq_len) == (10, 10)
 
-        with HunyuanImage3Model._paged_attention_context(
+        with HunyuanImage3Pipeline._paged_attention_context(
             mode="gen_image",
             first_step=False,
-            query_lens=[4],
-            seq_lens=[7],
-            position_ids=torch.arange(3, 7).reshape(1, -1),
+            query_lens=[7],
+            seq_lens=[10],
+            position_ids=torch.arange(3, 10).reshape(1, -1),
             gen_timestep_scatter_index=None,
             ar_kv_reuse_len=0,
             row_identities=[("req", 0)],
-            shard_image_size=4,
-            shard_padding_size=1,
+            uncond_cfg_prefill=False,
         ):
             pass
 
-    row = adapter.rows[0]
+    row = runtime.rows[0]
     assert (row.kv_start_pos, row.query_len, row.seq_len) == (3, 7, 10)
 
 

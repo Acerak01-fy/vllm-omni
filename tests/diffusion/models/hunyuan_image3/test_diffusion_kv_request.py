@@ -7,7 +7,6 @@ import pytest
 import torch
 from transformers.utils.generic import ModelOutput
 
-import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer as tokenizer_module
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as pipeline_module
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
@@ -25,7 +24,6 @@ from vllm_omni.diffusion.models.hunyuan_image3.request_layout import (
     build_hunyuan_diffusion_kv_requests,
     extract_hunyuan_prompt_inputs,
     hunyuan_num_image_tokens,
-    hunyuan_paged_sequence_lengths,
     normalize_hunyuan_cot_text,
     prepare_hunyuan_layout,
 )
@@ -49,65 +47,6 @@ def test_dense_legacy_preprocess_does_not_initialize_layout_tokenizer(monkeypatc
     get_hunyuan_image_3_pre_process_func(
         SimpleNamespace(model="model", diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY)
     )
-
-
-def test_paged_preprocess_preserves_remote_code_loading_contract(monkeypatch) -> None:
-    captured: dict[str, object] = {}
-    hf_config = SimpleNamespace(vae_downsample_factor=(8, 8), patch_size=2)
-    image_processor = SimpleNamespace(vision_encoder_processor=SimpleNamespace(patch_size=1))
-
-    def fake_get_config(_model, *, trust_remote_code):
-        captured["config"] = trust_remote_code
-        return hf_config
-
-    def fake_tokenizer(_model):
-        captured["tokenizer"] = True
-        return SimpleNamespace(
-            bos_token_id=1,
-            eos_token_id=2,
-            pad_token_id=0,
-            added_tokens_encoder={},
-            convert_tokens_to_ids=lambda token: hash(token) % 1000,
-        )
-
-    monkeypatch.setattr(pipeline_module, "get_config", fake_get_config)
-    monkeypatch.setattr(pipeline_module, "HunyuanImage3ImageProcessor", lambda _config: image_processor)
-    monkeypatch.setattr(tokenizer_module.AutoTokenizer, "from_pretrained", fake_tokenizer)
-    monkeypatch.setattr(
-        pipeline_module.GenerationConfig,
-        "from_pretrained",
-        lambda _model: SimpleNamespace(),
-    )
-
-    get_hunyuan_image_3_pre_process_func(
-        SimpleNamespace(
-            model="model",
-            diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
-            max_num_seqs=1,
-        )
-    )
-
-    assert captured == {
-        "config": True,
-        "tokenizer": True,
-    }
-
-
-def test_paged_preprocess_rejects_multiple_scheduler_sequences_before_loading(monkeypatch) -> None:
-    monkeypatch.setattr(
-        pipeline_module,
-        "get_config",
-        lambda *_args, **_kwargs: pytest.fail("invalid paged concurrency must fail before model loading"),
-    )
-
-    with pytest.raises(ValueError, match="supports only max_num_seqs=1"):
-        get_hunyuan_image_3_pre_process_func(
-            SimpleNamespace(
-                model="model",
-                diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
-                max_num_seqs=2,
-            )
-        )
 
 
 class _FakeTokenizerWrapper:
@@ -256,23 +195,6 @@ def test_builds_one_kv_request_per_cfg_row() -> None:
     assert [item.prefix_len for item in kv_requests] == [12, 14]
     assert [item.seq_len for item in kv_requests] == [32, 34]
     assert tokenizer.calls[0]["cfg_factor"] == 2
-
-
-def test_paged_scheduler_rounds_target_and_image_suffix_for_strict_ulysses() -> None:
-    tokenizer, image_processor = _components([12])
-    request = _request(guidance_scale=1.0)
-    prepared_layout = _prepare(request, tokenizer, image_processor)
-
-    target_len, sequence_lens = hunyuan_paged_sequence_lengths(prepared_layout, sequence_parallel_size=4)
-    assert target_len == 20
-    assert sequence_lens == [32]
-
-    kv_requests = build_hunyuan_diffusion_kv_requests(
-        request,
-        prepared_layout,
-        sequence_parallel_size=4,
-    )
-    assert [(item.prefix_len, item.target_len, item.seq_len) for item in kv_requests] == [(12, 20, 32)]
 
 
 def _reference_image() -> JointImageInfo:
@@ -510,11 +432,7 @@ def test_paged_preprocess_attaches_layout_and_scheduler_kv_requests(monkeypatch)
         lambda _model: SimpleNamespace(sequence_template="instruct", drop_think=False),
     )
     preprocess = get_hunyuan_image_3_pre_process_func(
-        SimpleNamespace(
-            model="model",
-            diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
-            max_num_seqs=1,
-        )
+        SimpleNamespace(model="model", diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
     )
     request = _request(guidance_scale=1.0)
 

@@ -578,6 +578,14 @@ class DiffusionKVModelRunnerBackend:
 
         return self.get_paged_attention_adapter().activate(batch)
 
+    def activate_paged_attention_rows(
+        self,
+        rows: Sequence[DiffusionPagedAttentionRow],
+    ):
+        """Prepare and activate model-provided spans against Worker-owned rows."""
+
+        return self.activate_paged_attention(self.prepare_paged_attention_batch(rows))
+
     def _resolve_paged_attention_row(
         self,
         request_id: str,

@@ -148,7 +148,7 @@ class PagedPiecewisePlan:
 
 
 PagedPiecewiseRunner = Callable[
-    [torch.Tensor, torch.Tensor, torch.Tensor, object, torch.Tensor | None],
+    [torch.Tensor, torch.Tensor | None, torch.Tensor | None, object, torch.Tensor | None],
     torch.Tensor,
 ]
 
@@ -225,8 +225,8 @@ def build_paged_piecewise_plan(
 
 def run_paged_piecewise_plan(
     query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    key: torch.Tensor | None,
+    value: torch.Tensor | None,
     plan: PagedPiecewisePlan,
     segment_metadata: Sequence[object],
     segment_runner: PagedPiecewiseRunner,
@@ -248,13 +248,13 @@ def run_paged_piecewise_plan(
         segment_output_buffer = None
         if segment.query_range is None:
             segment_query = query.index_select(0, indices)
-            segment_key = key.index_select(0, indices)
-            segment_value = value.index_select(0, indices)
+            segment_key = None if key is None else key.index_select(0, indices)
+            segment_value = None if value is None else value.index_select(0, indices)
         else:
             start, end = segment.query_range
             segment_query = query[start:end]
-            segment_key = key[start:end]
-            segment_value = value[start:end]
+            segment_key = None if key is None else key[start:end]
+            segment_value = None if value is None else value[start:end]
             if output is not None:
                 segment_output_buffer = output[start:end]
         segment_output = segment_runner(
