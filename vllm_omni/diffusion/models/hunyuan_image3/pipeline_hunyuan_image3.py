@@ -163,13 +163,15 @@ def _shift_full_attn_spans(
 
 
 def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
-    trust_remote_code = bool(getattr(od_config, "trust_remote_code", False))
-    hf_config = get_config(od_config.model, trust_remote_code=trust_remote_code)
-    image_processor = HunyuanImage3ImageProcessor(hf_config)
     prepare_diffusion_kv_layout = od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
-    tokenizer_wrapper = (
-        TokenizerWrapper(od_config.model, trust_remote_code=trust_remote_code) if prepare_diffusion_kv_layout else None
-    )
+    if prepare_diffusion_kv_layout and od_config.max_num_seqs > 1:
+        raise ValueError(
+            "HunyuanImage3 Scheduler paged KV currently supports only max_num_seqs=1; "
+            "staggered first-step and cached requests require separate paged-attention batches."
+        )
+    hf_config = get_config(od_config.model, trust_remote_code=True)
+    image_processor = HunyuanImage3ImageProcessor(hf_config)
+    tokenizer_wrapper = TokenizerWrapper(od_config.model) if prepare_diffusion_kv_layout else None
     generation_config = GenerationConfig.from_pretrained(od_config.model) if prepare_diffusion_kv_layout else None
     vae_h_factor = hf_config.vae_downsample_factor[0] * hf_config.patch_size
     vae_w_factor = hf_config.vae_downsample_factor[1] * hf_config.patch_size
@@ -354,7 +356,7 @@ class HunyuanImage3Pipeline(
     ]
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
-        self.hf_config = get_config(od_config.model, trust_remote_code=od_config.trust_remote_code)
+        self.hf_config = get_config(od_config.model, trust_remote_code=True)
         super().__init__(self.hf_config)
         # update diffusion config
         self.generation_config = GenerationConfig.from_pretrained(od_config.model)
@@ -380,10 +382,7 @@ class HunyuanImage3Pipeline(
         self.vae = DistributedAutoencoderKLHunyuan.from_config(self.hf_config.vae)
         self.vae.use_spatial_tiling = self.od_config.vae_use_tiling
         self._pipeline = None
-        self._tkwrapper = TokenizerWrapper(
-            od_config.model,
-            trust_remote_code=od_config.trust_remote_code,
-        )
+        self._tkwrapper = TokenizerWrapper(od_config.model)
         self.image_processor = HunyuanImage3ImageProcessor(self.hf_config)
         self.vision_model = Siglip2VisionTransformer(self.hf_config.vit)
         # self.vision_model = vision_model.vision_model
@@ -600,17 +599,9 @@ class HunyuanImage3Pipeline(
 
         if not self._is_paged_kv_mode():
             raise RuntimeError("Hunyuan paged attention rows requested while diffusion_kv_mode is dense_legacy")
-        groups = self._split_step_groups(states)
-        if len(groups) != 1:
-            raise ValueError(
-                "HunyuanImage3 Scheduler paged KV currently requires one compatible step group; "
-                f"received {len(groups)} groups."
-            )
-        first_step, cfg_factor = self._validate_step_group_states(groups[0])
-        row_state_indexes, row_branches = self._step_row_order(groups[0], cfg_factor)
-        query_lens, seq_lens, starts, _, _ = self._paged_row_spans(
-            groups[0], row_state_indexes, row_branches, first_step
-        )
+        first_step, cfg_factor = self._validate_step_group_states(states)
+        row_state_indexes, row_branches = self._step_row_order(states, cfg_factor)
+        query_lens, seq_lens, starts, _, _ = self._paged_row_spans(states, row_state_indexes, row_branches, first_step)
         rows = []
         for state_idx, branch, query_len, seq_len, start in zip(
             row_state_indexes,
@@ -622,7 +613,7 @@ class HunyuanImage3Pipeline(
         ):
             rows.append(
                 DiffusionPagedAttentionRow(
-                    request_id=groups[0][state_idx].request_id,
+                    request_id=states[state_idx].request_id,
                     sequence_id=branch,
                     query_len=query_len,
                     seq_len=seq_len,

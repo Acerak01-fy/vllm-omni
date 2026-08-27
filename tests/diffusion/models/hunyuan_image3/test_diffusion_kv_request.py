@@ -43,7 +43,7 @@ def test_dense_legacy_preprocess_does_not_initialize_layout_tokenizer(monkeypatc
     monkeypatch.setattr(
         pipeline_module,
         "TokenizerWrapper",
-        lambda _model, **_kwargs: pytest.fail("dense_legacy must not initialize the Diffusion KV tokenizer"),
+        lambda _model: pytest.fail("dense_legacy must not initialize the Diffusion KV tokenizer"),
     )
 
     get_hunyuan_image_3_pre_process_func(
@@ -51,9 +51,8 @@ def test_dense_legacy_preprocess_does_not_initialize_layout_tokenizer(monkeypatc
     )
 
 
-@pytest.mark.parametrize("trust_remote_code", [False, True])
-def test_paged_preprocess_respects_remote_code_config(monkeypatch, trust_remote_code) -> None:
-    captured: dict[str, bool] = {}
+def test_paged_preprocess_preserves_remote_code_loading_contract(monkeypatch) -> None:
+    captured: dict[str, object] = {}
     hf_config = SimpleNamespace(vae_downsample_factor=(8, 8), patch_size=2)
     image_processor = SimpleNamespace(vision_encoder_processor=SimpleNamespace(patch_size=1))
 
@@ -61,9 +60,8 @@ def test_paged_preprocess_respects_remote_code_config(monkeypatch, trust_remote_
         captured["config"] = trust_remote_code
         return hf_config
 
-    def fake_tokenizer(_model, **kwargs):
-        captured["tokenizer"] = trust_remote_code
-        assert kwargs == {"trust_remote_code": trust_remote_code}
+    def fake_tokenizer(_model):
+        captured["tokenizer"] = True
         return SimpleNamespace(
             bos_token_id=1,
             eos_token_id=2,
@@ -85,14 +83,31 @@ def test_paged_preprocess_respects_remote_code_config(monkeypatch, trust_remote_
         SimpleNamespace(
             model="model",
             diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
-            trust_remote_code=trust_remote_code,
+            max_num_seqs=1,
         )
     )
 
     assert captured == {
-        "config": trust_remote_code,
-        "tokenizer": trust_remote_code,
+        "config": True,
+        "tokenizer": True,
     }
+
+
+def test_paged_preprocess_rejects_multiple_scheduler_sequences_before_loading(monkeypatch) -> None:
+    monkeypatch.setattr(
+        pipeline_module,
+        "get_config",
+        lambda *_args, **_kwargs: pytest.fail("invalid paged concurrency must fail before model loading"),
+    )
+
+    with pytest.raises(ValueError, match="supports only max_num_seqs=1"):
+        get_hunyuan_image_3_pre_process_func(
+            SimpleNamespace(
+                model="model",
+                diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+                max_num_seqs=2,
+            )
+        )
 
 
 class _FakeTokenizerWrapper:
@@ -488,14 +503,18 @@ def test_paged_preprocess_attaches_layout_and_scheduler_kv_requests(monkeypatch)
     )
     monkeypatch.setattr(pipeline_module, "get_config", lambda *_args, **_kwargs: hf_config)
     monkeypatch.setattr(pipeline_module, "HunyuanImage3ImageProcessor", lambda _config: image_processor)
-    monkeypatch.setattr(pipeline_module, "TokenizerWrapper", lambda _model, **_kwargs: tokenizer)
+    monkeypatch.setattr(pipeline_module, "TokenizerWrapper", lambda _model: tokenizer)
     monkeypatch.setattr(
         pipeline_module.GenerationConfig,
         "from_pretrained",
         lambda _model: SimpleNamespace(sequence_template="instruct", drop_think=False),
     )
     preprocess = get_hunyuan_image_3_pre_process_func(
-        SimpleNamespace(model="model", diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
+        SimpleNamespace(
+            model="model",
+            diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+            max_num_seqs=1,
+        )
     )
     request = _request(guidance_scale=1.0)
 

@@ -18,7 +18,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _install_fake_pa_scatter(monkeypatch):
-    from vllm_omni.platforms.npu.platform import (
+    from vllm_omni.platforms.npu.utils import (
         _logical_cache_to_pa_nz,
         _pa_nz_to_logical_cache,
     )
@@ -67,7 +67,7 @@ def _build_write_plan(rows, bindings, *, cp_size=1, cp_rank=0, cp_interleave=1):
 
 def test_logical_cache_pa_nz_round_trip_preserves_head_chunks() -> None:
     pytest.importorskip("vllm_ascend")
-    from vllm_omni.platforms.npu.platform import (
+    from vllm_omni.platforms.npu.utils import (
         _logical_cache_to_pa_nz,
         _pa_nz_to_logical_cache,
     )
@@ -145,7 +145,7 @@ def test_diffusion_write_plan_maps_scheduler_blocks(row_specs, cp_size, expected
 @pytest.mark.parametrize("static_plan", [False, True], ids=["dynamic", "static"])
 def test_cache_writer_skips_negative_slots_and_writes_back_logical_cache(monkeypatch, static_plan) -> None:
     pytest.importorskip("vllm_ascend")
-    from vllm_omni.platforms.npu.platform import (
+    from vllm_omni.platforms.npu.utils import (
         _reshape_and_cache_without_cache_mode,
         _use_diffusion_paged_kv_write_plan,
     )
