@@ -251,7 +251,9 @@ class FlashAttentionImpl(AttentionImpl):
         rank-local native cache context.  The adapter no longer performs the
         attention call itself; this method is the backend-owned execution
         boundary.  Its native layer wrapper keeps vLLM version-specific cache
-        and kernel details out of Omni's common ``Attention`` layer.
+        and kernel details out of Omni's common ``Attention`` layer. CUDA uses
+        the native vLLM FlashAttention writer/kernel contract. Ascend may add a
+        static write plan for its PA_NZ cache writer before invoking native FIA.
         """
 
         layer = getattr(paged_kv_context, "layer", None)
@@ -266,6 +268,9 @@ class FlashAttentionImpl(AttentionImpl):
         write_plan = getattr(paged_kv_context, "write_plan", None)
         static_paged_kv = write_plan is not None and current_omni_platform.supports_diffusion_paged_kv_write_plan()
         read_kv_from_cache = static_paged_kv and layer.attn_backend.forward_includes_kv_cache_update
+        # With no platform static plan (the GPU/default path), preserve the
+        # native backend's cache-update ownership. NPU supplies a static plan
+        # so its Ascend cache writer can consume Scheduler physical blocks.
         if not layer.attn_backend.forward_includes_kv_cache_update or static_paged_kv:
             cache_update = getattr(native_impl, "do_kv_cache_update", None)
             if not callable(cache_update):

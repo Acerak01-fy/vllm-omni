@@ -507,6 +507,10 @@ class DiffusionPagedAttentionAdapter:
             self.kv_cache_config,
         )
         write_plans_by_layer: dict[str, DiffusionPagedKVWritePlan] = {}
+        # GPU and other default platforms leave this empty and pass vLLM's
+        # slot mapping directly to their native cache writer. The NPU override
+        # converts Scheduler physical block IDs into the compact mapping used
+        # by the Ascend PA_NZ-compatible writer.
         if current_omni_platform.supports_diffusion_paged_kv_write_plan():
             write_plan_cache_key = tuple(
                 (

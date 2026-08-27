@@ -201,11 +201,11 @@ class OmniPlatform(Platform):
     def build_diffusion_kv_attn_metadata(cls, **kwargs: Any) -> dict[str, Any]:
         """Build native attention metadata for the diffusion paged path.
 
-        The common CUDA/ROCm/XPU path uses vLLM's builder. Platforms with a
-        backend-specific metadata contract can override this hook without
-        making the diffusion adapter import their optional runtime package.
-        ``seq_lens_cpu`` is an adapter-only convenience value and is removed
-        before calling the upstream builder.
+        This default is the GPU/common path and uses vLLM's builder. NPU
+        overrides it to build Ascend attention metadata without making the
+        shared diffusion adapter import ``vllm_ascend``. ``seq_lens_cpu`` is an
+        adapter-only convenience value and is removed before calling the
+        upstream builder.
         """
         from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 
@@ -216,9 +216,10 @@ class OmniPlatform(Platform):
     def build_diffusion_paged_kv_write_plans(cls, **kwargs: Any) -> dict[str, Any]:
         """Build optional platform-specific plans for native KV cache writes.
 
-        A non-empty result means the platform can consume Scheduler-owned
-        physical blocks directly.  An empty result keeps the native backend's
-        normal cache-update ownership unchanged.
+        The default GPU/common path returns no plan and keeps the native
+        backend's normal cache-update ownership. The NPU override returns a
+        compact plan so the Ascend writer can consume Scheduler-owned physical
+        blocks directly.
         """
 
         del kwargs

@@ -126,13 +126,14 @@ class Attention(nn.Module):
             and spec is None
             and not attn_backend_cls.supports_paged_kv
         ):
-            # Scheduler-owned paging is executed by the platform-native vLLM
-            # implementation.  A platform may legitimately default dense
+            # FLASH_ATTN is an Omni selector, not a device-specific kernel.
+            # vLLM resolves it to CUDA FlashAttention on GPU and Ascend native
+            # attention on NPU. A platform may legitimately default dense
             # attention to SDPA (for example when an optional diffusion FA
             # package is absent), but a paged layer must advertise the
             # capability so the Worker can register its native cache view.
-            # Resolve the portable Flash backend only for this marked layer;
-            # unmarked dense attention keeps the platform default unchanged.
+            # Resolve the selector only for this marked layer; unmarked dense
+            # attention keeps the platform default unchanged.
             from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 
             dense_backend_name = attn_backend_cls.get_name()
@@ -424,9 +425,9 @@ class Attention(nn.Module):
                 key = _remove_paged_sp_padding(key)
                 value = _remove_paged_sp_padding(value)
 
-        # 2. Kernel execution stays inside the selected Omni backend.  The
-        # Worker adapter only prepares the native page-table context after
-        # SP has produced rank-local Q/K/V tensors.
+        # 2. This is the shared GPU/NPU boundary. The Worker adapter prepares
+        # the native page-table context after SP has produced rank-local Q/K/V;
+        # backend resolution below selects CUDA or Ascend execution.
         if use_paged_attention:
             assert paged_adapter is not None
             paged_kv_context = paged_adapter.prepare_layer_context(
@@ -479,6 +480,10 @@ class Attention(nn.Module):
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
         in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
+        # NPU only: the startup KV-capacity profile needs tensor shapes, not a
+        # paged attention result. If dense MindIE-SD is absent, SDPA provides
+        # that profile forward. Formal GPU/NPU paged requests never use this
+        # branch because their Worker adapter is active.
         if (
             self._scheduler_paged_kv
             and self.paged_kv_cache_role is not None

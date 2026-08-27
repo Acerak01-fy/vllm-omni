@@ -1516,7 +1516,11 @@ class HunyuanImage3Pipeline(
         row_identities: list[tuple[str, int]] | None,
         uncond_cfg_prefill: bool = False,
     ):
-        """Describe one DiT write span to the Worker-owned paged runtime."""
+        """Describe one DiT write span to the Worker-owned paged runtime.
+
+        Row identities and write spans are platform-neutral. The Worker and
+        platform hooks translate them into CUDA or Ascend physical layouts.
+        """
 
         if not is_forward_context_available():
             return nullcontext()

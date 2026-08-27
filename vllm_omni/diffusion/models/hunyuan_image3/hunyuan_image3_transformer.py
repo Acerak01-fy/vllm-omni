@@ -1088,7 +1088,12 @@ class ImageKVCacheManager(nn.Module):
         full_attn_spans: list[list[tuple[int, int]]],
         uncond_cfg_prefill: bool,
     ) -> torch.Tensor:
-        """Run Hunyuan attention against Worker-managed Scheduler pages."""
+        """Run Hunyuan attention against Worker-managed Scheduler pages.
+
+        This model boundary is shared by GPU and NPU: it describes Hunyuan's
+        Q/K/V layout and mixed-attention spans, while the common Attention
+        layer resolves the actual CUDA or Ascend paged kernel.
+        """
 
         if uncond_cfg_prefill:
             raise RuntimeError("Hunyuan negative-CFG prefill must run before paged row activation")
@@ -1152,7 +1157,7 @@ class ImageKVCacheManager(nn.Module):
         attention_mask: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        """Run the historical model-owned dense prompt-KV path."""
+        """Run the device-neutral, model-owned dense prompt-KV compatibility path."""
 
         first_step = kwargs.get("first_step")
         uncond_cfg_prefill = kwargs.get("uncond_cfg_prefill", False)
