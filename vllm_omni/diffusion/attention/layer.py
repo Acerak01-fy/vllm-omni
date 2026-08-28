@@ -458,7 +458,7 @@ class Attention(nn.Module):
 
     @staticmethod
     def _active_paged_kv_adapter():
-        """Return the opaque Worker adapter installed for this forward."""
+        """Return the Worker adapter selected by Runner-owned metadata."""
 
         if not is_forward_context_available():
             return None

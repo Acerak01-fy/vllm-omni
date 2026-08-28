@@ -8,7 +8,6 @@ import torch
 
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 import vllm_omni.diffusion.models.hunyuan_image3.request_layout as hy3_layout_module
-from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import build_paged_piecewise_plan
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo
@@ -271,42 +270,15 @@ def test_grouped_denoise_allows_sdpa_attention_backend():
     pipeline._ensure_grouped_attention_backend_supported(2)
 
 
-def test_grouped_denoise_allows_scheduler_paged_attention_backend():
-    pipeline = _pipeline()
-    pipeline.od_config.diffusion_attention_config = AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN"))
-    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
-
-    pipeline._ensure_grouped_attention_backend_supported(2)
-
-
-def test_paged_first_step_groups_only_compatible_piecewise_layouts():
+def test_scheduler_paged_step_execution_is_rejected():
     pipeline = _pipeline()
     pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
-    short = _state("short", 0)
-    long = _state("long", 0)
-    compatible = _state("compatible", 0)
-    short.extra[_STEP_MODEL_KWARGS].update(
-        {
-            "attention_mask": torch.ones(1, 1, 5, 5, dtype=torch.bool),
-            "full_attn_spans": [[(2, 5)]],
-        }
-    )
-    long.extra[_STEP_MODEL_KWARGS].update(
-        {
-            "attention_mask": torch.ones(1, 1, 7, 7, dtype=torch.bool),
-            "full_attn_spans": [[(4, 7)]],
-        }
-    )
-    compatible.extra[_STEP_MODEL_KWARGS].update(
-        {
-            "attention_mask": torch.ones(1, 1, 7, 7, dtype=torch.bool),
-            "full_attn_spans": [[(3, 7)]],
-        }
-    )
+    state = _state("paged-step", 0)
 
-    groups = pipeline._split_step_groups([short, long, compatible])
-
-    assert [[state.request_id for state in group] for group in groups] == [["short"], ["long", "compatible"]]
+    with pytest.raises(ValueError, match="request-level execution only"):
+        pipeline.prepare_encode(state)
+    with pytest.raises(ValueError, match="request-level execution only"):
+        pipeline.denoise_step(InputBatch.make_batch([state]))
 
 
 def test_step_scheduler_preserves_latent_dtype_for_mixed_progress_batches():
@@ -366,46 +338,6 @@ def test_later_step_merge_shifts_spans_without_polluting_request_state():
     assert states[1].extra[_STEP_MODEL_KWARGS]["attention_mask"].shape == (1, 1, 3, 7)
     assert states[0].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(2, 5)]]
     assert states[1].extra[_STEP_MODEL_KWARGS]["full_attn_spans"] == [[(4, 7)]]
-
-
-@pytest.mark.parametrize("batch_size", [4, 8])
-def test_later_paged_step_merge_keeps_compact_spans_for_heterogeneous_prefixes(batch_size):
-    pipeline = _pipeline()
-    pipeline.od_config.diffusion_kv_mode = hy3_module.DiffusionKVCacheMode.PAGED_SCHEDULER
-    states = []
-    prefix_lens = []
-    expected_spans = []
-    query_len = 3
-
-    for index in range(batch_size):
-        prefix_len = 2 + index % 3
-        state = _state(f"req-{index}", 1)
-        state.extra[_STEP_MODEL_KWARGS].update(
-            {
-                "attention_mask": torch.ones(1, 1, query_len, prefix_len + query_len, dtype=torch.bool),
-                "full_attn_spans": [[(prefix_len, prefix_len + query_len)]],
-                "position_ids": torch.arange(prefix_len, prefix_len + query_len).unsqueeze(0),
-            }
-        )
-        states.append(state)
-        prefix_lens.append(prefix_len)
-        expected_spans.append([(prefix_len, prefix_len + query_len)])
-
-    _, merged = pipeline._merge_step_model_inputs(
-        states,
-        row_state_indexes=list(range(batch_size)),
-        row_branches=[0] * batch_size,
-        first_step=False,
-    )
-
-    assert merged["full_attn_spans"] == expected_spans
-    plan = build_paged_piecewise_plan(
-        merged["full_attn_spans"],
-        query_offsets=prefix_lens,
-        query_lens=[query_len] * batch_size,
-        seq_lens=[prefix_len + query_len for prefix_len in prefix_lens],
-    )
-    assert plan.num_query_tokens == batch_size * query_len
 
 
 def test_later_step_merge_allows_request_local_step_counts_and_guidance_values():

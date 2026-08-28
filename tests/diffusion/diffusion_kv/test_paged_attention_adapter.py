@@ -20,14 +20,17 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.diffusion_kv import paged_attention_adapter as adapter_module
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
+    DiffusionPagedAttentionMetadata,
     DiffusionPagedAttentionRow,
     DiffusionPagedAttentionRowBinding,
+    DiffusionPagedAttentionRuntime,
     DiffusionPagedKVWritePlan,
 )
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     override_paged_kv_adapter,
     set_forward_context,
+    set_forward_context_denoise_step_idx,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -977,6 +980,28 @@ def test_forward_rejects_batched_layout_that_does_not_match_rows(monkeypatch: py
         adapter.prepare_layer_context("layer-0", qkv, qkv, qkv)
 
 
+def test_forward_packs_and_restores_right_padded_heterogeneous_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [
+            DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=1, seq_len=1),
+            DiffusionPagedAttentionRow(request_id="req-1", sequence_id=1, query_len=3, seq_len=3),
+        ]
+    )
+    qkv = torch.arange(2 * 3 * 2 * 4, dtype=torch.float32).reshape(2, 3, 2, 4)
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context("layer-0", qkv, qkv, qkv)
+
+    assert context.output_scatter_indices.tolist() == [0, 3, 4, 5]
+    torch.testing.assert_close(context.query, qkv.reshape(-1, 2, 4)[[0, 3, 4, 5]])
+    restored = context.restore_output(context.query)
+    assert restored.shape == qkv.shape
+    torch.testing.assert_close(restored[0, 0], qkv[0, 0])
+    assert torch.count_nonzero(restored[0, 1:]) == 0
+    torch.testing.assert_close(restored[1], qkv[1])
+
+
 def test_forward_rejects_padded_full_kv(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, _, _ = _make_adapter(monkeypatch)
     batch = adapter.prepare_batch(
@@ -1002,6 +1027,43 @@ def test_forward_rejects_padded_full_kv(monkeypatch: pytest.MonkeyPatch) -> None
 
     with adapter.activate(batch), pytest.raises(ValueError, match="batched key layout must match prepared rows"):
         adapter.prepare_layer_context("layer-0", query, full_kv, full_kv)
+
+
+def test_runner_runtime_switches_from_prefill_to_reusable_denoise_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch)
+    metadata = DiffusionPagedAttentionMetadata(
+        prefill_rows=(
+            DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=6, seq_len=6),
+        ),
+        denoise_rows=(
+            DiffusionPagedAttentionRow(
+                request_id="req-0",
+                sequence_id=0,
+                query_len=2,
+                seq_len=5,
+                kv_start_pos=3,
+            ),
+        ),
+    )
+    runtime = DiffusionPagedAttentionRuntime(adapter, metadata)
+
+    with set_forward_context(paged_kv_runtime=runtime), runtime.activate():
+        set_forward_context_denoise_step_idx(0)
+        assert Attention._active_paged_kv_adapter() is adapter
+        assert adapter._active_batch.rows == metadata.prefill_rows
+
+        set_forward_context_denoise_step_idx(1)
+        assert Attention._active_paged_kv_adapter() is adapter
+        denoise_batch = adapter._active_batch
+        assert denoise_batch.rows == metadata.denoise_rows
+
+        set_forward_context_denoise_step_idx(2)
+        assert Attention._active_paged_kv_adapter() is adapter
+        assert adapter._active_batch is denoise_batch
+
+    assert adapter._active_batch is None
 
 
 def test_causal_batch_rejects_non_suffix_write(monkeypatch: pytest.MonkeyPatch) -> None:

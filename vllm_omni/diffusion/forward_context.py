@@ -29,8 +29,9 @@ class ForwardContext:
     vllm_config: VllmConfig | None = None
     omni_diffusion_config: OmniDiffusionConfig | None = None
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
-    # Worker-owned paged runtime available to model integrations while they
-    # describe the current query/write spans.
+    # Runner-owned paged execution metadata/runtime. Attention resolves the
+    # active Worker adapter from it; model code must not construct BlockTable
+    # rows or activate the runtime directly.
     paged_kv_runtime: object | None = None
     # Active Worker-side paged KV adapter.  The adapter is installed only for
     # the duration of a paged forward; dense forwards leave this as ``None``.
@@ -260,6 +261,10 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
+        if step_idx is not None:
+            ensure_active = getattr(_forward_context.paged_kv_runtime, "ensure_active", None)
+            if callable(ensure_active):
+                ensure_active(step_idx)
 
 
 class DenoiseProgressMixin:

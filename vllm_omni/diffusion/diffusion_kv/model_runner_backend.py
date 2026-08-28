@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,9 +22,9 @@ from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
     DiffusionPagedAttentionLayerAdapter,
-    DiffusionPagedAttentionRow,
+    DiffusionPagedAttentionMetadata,
     DiffusionPagedAttentionRowBinding,
-    PreparedDiffusionPagedAttentionBatch,
+    DiffusionPagedAttentionRuntime,
 )
 from vllm_omni.platforms import current_omni_platform
 
@@ -559,32 +559,11 @@ class DiffusionKVModelRunnerBackend:
             raise RuntimeError("paged_scheduler native attention adapter is not initialized")
         return self.paged_attention_adapter
 
-    def prepare_paged_attention_batch(
-        self,
-        rows: Sequence[DiffusionPagedAttentionRow],
-    ) -> PreparedDiffusionPagedAttentionBatch:
-        """Build native page-table metadata for one Diffusion forward.
+    def activate_paged_attention_metadata(self, metadata: DiffusionPagedAttentionMetadata):
+        """Activate Runner-owned request metadata for an internal denoise loop."""
 
-        The scheduler allocation payload describes capacity, while the model
-        integration supplies the current ``query_len``/``kv_start_pos`` span
-        for each row.  Keeping this boundary explicit prevents the Worker from
-        guessing model-specific text/image layout.
-        """
-
-        return self.get_paged_attention_adapter().prepare_batch(rows)
-
-    def activate_paged_attention(self, batch: PreparedDiffusionPagedAttentionBatch):
-        """Return the context manager that exposes a prepared batch to Omni Attention."""
-
-        return self.get_paged_attention_adapter().activate(batch)
-
-    def activate_paged_attention_rows(
-        self,
-        rows: Sequence[DiffusionPagedAttentionRow],
-    ):
-        """Prepare and activate model-provided spans against Worker-owned rows."""
-
-        return self.activate_paged_attention(self.prepare_paged_attention_batch(rows))
+        runtime = DiffusionPagedAttentionRuntime(self.get_paged_attention_adapter(), metadata)
+        return runtime, runtime.activate()
 
     def _resolve_paged_attention_row(
         self,

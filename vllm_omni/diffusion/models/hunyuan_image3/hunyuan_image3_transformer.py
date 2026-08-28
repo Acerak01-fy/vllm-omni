@@ -2813,9 +2813,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # List[List[...]] per-sample metadata indexed along the CFG batch dim
         if isinstance(model_kwargs.get("full_attn_spans"), list):
             model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"][s.start : s.stop]
-        if isinstance(model_kwargs.get("diffusion_kv_row_identities"), list):
-            model_kwargs["diffusion_kv_row_identities"] = model_kwargs["diffusion_kv_row_identities"][s.start : s.stop]
-
         # custom_pos_emb: tuple of (cos, sin)
         if "custom_pos_emb" in model_kwargs and model_kwargs["custom_pos_emb"] is not None:
             cos, sin = model_kwargs["custom_pos_emb"]
