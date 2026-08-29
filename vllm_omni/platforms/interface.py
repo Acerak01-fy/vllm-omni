@@ -213,30 +213,23 @@ class OmniPlatform(Platform):
         return build_attn_metadata(**kwargs)
 
     @classmethod
-    def build_diffusion_paged_kv_write_plans(cls, **kwargs: Any) -> dict[str, Any]:
-        """Build optional platform-specific plans for native KV cache writes.
+    def get_diffusion_paged_kv_attn_backend(cls, attn_backend: type, *, ulysses_degree: int) -> type:
+        """Specialize a native paged backend for diffusion execution."""
 
-        The default GPU/common path returns no plan and keeps the native
-        backend's normal cache-update ownership. The NPU override returns a
-        compact plan so the Ascend writer can consume Scheduler-owned physical
-        blocks directly.
+        del ulysses_degree
+        return attn_backend
+
+    @classmethod
+    def requires_diffusion_paged_kv_prewrite(cls) -> bool:
+        """Whether paged attention must write K/V before native execution.
+
+        The default GPU path keeps cache-update ownership in its native
+        attention call. Ascend overrides this because piecewise FIA should
+        write the complete K/V span once, then read it from cache for every
+        segment.
         """
 
-        del kwargs
-        return {}
-
-    @classmethod
-    def supports_diffusion_paged_kv_write_plan(cls) -> bool:
-        """Whether this platform can precompute Scheduler-owned KV writes."""
-
         return False
-
-    @classmethod
-    def use_diffusion_paged_kv_write_plan(cls, write_plan: Any):
-        """Expose a prepared write plan while a native cache writer runs."""
-
-        del write_plan
-        return nullcontext()
 
     @classmethod
     def init_diffusion_worker_vllm_config(

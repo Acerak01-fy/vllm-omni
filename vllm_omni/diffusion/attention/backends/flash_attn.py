@@ -282,8 +282,8 @@ class FlashAttentionImpl(AttentionImpl):
         attention call itself; this method is the backend-owned execution
         boundary.  Its native layer wrapper keeps vLLM version-specific cache
         and kernel details out of Omni's common ``Attention`` layer. CUDA uses
-        the native vLLM FlashAttention writer/kernel contract. Ascend may add a
-        static write plan for its PA_NZ cache writer before invoking native FIA.
+        the native vLLM FlashAttention writer/kernel contract. Ascend writes
+        the complete K/V span once before its piecewise FIA calls.
         """
 
         layer = getattr(paged_kv_context, "layer", None)
@@ -295,26 +295,24 @@ class FlashAttentionImpl(AttentionImpl):
         native_impl = getattr(layer, "impl", None)
         if native_impl is None:
             raise RuntimeError(f"Native attention implementation is not bound for diffusion layer {layer.layer_name!r}")
-        write_plan = getattr(paged_kv_context, "write_plan", None)
-        static_paged_kv = write_plan is not None and current_omni_platform.supports_diffusion_paged_kv_write_plan()
-        read_kv_from_cache = static_paged_kv and layer.attn_backend.forward_includes_kv_cache_update
-        # With no platform static plan (the GPU/default path), preserve the
-        # native backend's cache-update ownership. NPU supplies a static plan
-        # so its Ascend cache writer can consume Scheduler physical blocks.
-        if not layer.attn_backend.forward_includes_kv_cache_update or static_paged_kv:
+        prewrite_kv = current_omni_platform.requires_diffusion_paged_kv_prewrite()
+        read_kv_from_cache = prewrite_kv and layer.attn_backend.forward_includes_kv_cache_update
+        # The GPU/default path preserves native cache-update ownership. Ascend
+        # prewrites through vLLM-Ascend's normal-layout writer so piecewise FIA
+        # segments do not repeatedly scatter the same layer K/V.
+        if not layer.attn_backend.forward_includes_kv_cache_update or prewrite_kv:
             cache_update = getattr(native_impl, "do_kv_cache_update", None)
             if not callable(cache_update):
                 raise RuntimeError(
-                    f"Native attention implementation for {layer.layer_name!r} cannot consume a prepared KV write plan"
+                    f"Native attention implementation for {layer.layer_name!r} cannot update the KV cache"
                 )
-            with current_omni_platform.use_diffusion_paged_kv_write_plan(write_plan):
-                cache_update(
-                    layer,
-                    paged_kv_context.key_write,
-                    paged_kv_context.value_write,
-                    kv_cache,
-                    paged_kv_context.slot_mapping,
-                )
+            cache_update(
+                layer,
+                paged_kv_context.key_write,
+                paged_kv_context.value_write,
+                kv_cache,
+                paged_kv_context.slot_mapping,
+            )
 
         def run_native_attention(
             query: torch.Tensor,
@@ -329,16 +327,15 @@ class FlashAttentionImpl(AttentionImpl):
                     dtype=query.dtype,
                     device=query.device,
                 )
-            with current_omni_platform.use_diffusion_paged_kv_write_plan(write_plan):
-                return native_impl.forward(
-                    layer,
-                    query,
-                    None if read_kv_from_cache else key,
-                    None if read_kv_from_cache else value,
-                    kv_cache,
-                    native_metadata,
-                    output,
-                )
+            return native_impl.forward(
+                layer,
+                query,
+                None if read_kv_from_cache else key,
+                None if read_kv_from_cache else value,
+                kv_cache,
+                native_metadata,
+                output,
+            )
 
         if paged_kv_context.piecewise_plan is not None:
             output = torch.empty(

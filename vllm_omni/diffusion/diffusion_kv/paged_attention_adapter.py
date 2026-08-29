@@ -37,14 +37,6 @@ class DiffusionPagedAttentionRowBinding:
     block_ids: tuple[tuple[int, ...], ...] = ()
 
 
-@dataclass(frozen=True, slots=True)
-class DiffusionPagedKVWritePlan:
-    """Static compact-page mapping consumed by a platform cache writer."""
-
-    block_ids: torch.Tensor
-    local_slot_mapping: torch.Tensor
-
-
 DiffusionKVRowResolver = Callable[
     [str, int | None, str | None],
     DiffusionPagedAttentionRowBinding,
@@ -90,22 +82,14 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         num_kv_heads //= ulysses_degree
 
         attention_config = vllm_config.attention_config
-        parallel_config = vllm_config.parallel_config
         previous_backend = attention_config.backend
         previous_backend_per_kind = attention_config.backend_per_kind
-        previous_pcp_size = parallel_config.prefill_context_parallel_size
         try:
             # This is a portable vLLM backend request. The active platform
             # resolves it to its native implementation, such as FlashAttention
             # on CUDA or AscendAttentionBackend on NPU.
             attention_config.backend = AttentionBackendEnum.FLASH_ATTN
             attention_config.backend_per_kind = {}
-            # Omni maps strict Ulysses onto vLLM's PCP group for expert
-            # collectives. Paged attention runs after the Ulysses all-to-all,
-            # where every rank owns the full sequence and rank-local heads, so
-            # native attention must select a non-PCP kernel.
-            if ulysses_degree > 1:
-                parallel_config.prefill_context_parallel_size = 1
             with set_current_vllm_config(vllm_config):
                 attn_backend = get_attn_backend(
                     head_size=spec.head_size,
@@ -117,7 +101,10 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
         finally:
             attention_config.backend = previous_backend
             attention_config.backend_per_kind = previous_backend_per_kind
-            parallel_config.prefill_context_parallel_size = previous_pcp_size
+        attn_backend = current_omni_platform.get_diffusion_paged_kv_attn_backend(
+            attn_backend,
+            ulysses_degree=ulysses_degree,
+        )
         canonical_spec = replace(
             spec,
             num_kv_heads=num_kv_heads,
@@ -172,7 +159,7 @@ class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
             )
         needs_explicit_cache_update = (
             not self.attn_backend.forward_includes_kv_cache_update
-            or current_omni_platform.supports_diffusion_paged_kv_write_plan()
+            or current_omni_platform.requires_diffusion_paged_kv_prewrite()
         )
         if needs_explicit_cache_update and not callable(getattr(impl, "do_kv_cache_update", None)):
             raise RuntimeError(
@@ -261,7 +248,6 @@ class PreparedDiffusionPagedAttentionBatch:
     slot_mappings: torch.Tensor
     attn_metadata: dict[str, Any]
     slot_mappings_by_layer: dict[str, torch.Tensor]
-    write_plans_by_layer: dict[str, DiffusionPagedKVWritePlan]
     num_tokens: int
     _owner: object = field(repr=False, compare=False)
     _generation: int = field(repr=False, compare=False)
@@ -276,7 +262,6 @@ class DiffusionPagedAttentionContext:
     key_write: torch.Tensor
     value_write: torch.Tensor
     slot_mapping: torch.Tensor
-    write_plan: DiffusionPagedKVWritePlan | None
     native_metadata: Any
     piecewise_plan: PagedPiecewisePlan | None
     piecewise_native_metadata: tuple[Any, ...]
@@ -390,8 +375,6 @@ class DiffusionPagedAttentionAdapter:
         self._active_batch: PreparedDiffusionPagedAttentionBatch | None = None
         self._active_piecewise_plan: PagedPiecewisePlan | None = None
         self._active_piecewise_native_metadata: tuple[dict[str, Any], ...] | None = None
-        self._write_plan_cache_key: object | None = None
-        self._write_plans_by_layer: dict[str, DiffusionPagedKVWritePlan] = {}
         self._causal_by_group = self._resolve_group_causality()
         self._reorder_batch_threshold = self._resolve_reorder_batch_threshold()
 
@@ -598,32 +581,6 @@ class DiffusionPagedAttentionAdapter:
             slot_mappings,
             self.kv_cache_config,
         )
-        write_plans_by_layer: dict[str, DiffusionPagedKVWritePlan] = {}
-        # GPU and other default platforms leave this empty and pass vLLM's
-        # slot mapping directly to their native cache writer. The NPU override
-        # converts Scheduler physical block IDs into the compact mapping used
-        # by the Ascend PA_NZ-compatible writer.
-        if current_omni_platform.supports_diffusion_paged_kv_write_plan():
-            write_plan_cache_key = tuple(
-                (
-                    row.identity,
-                    row.kv_start_pos,
-                    row.query_len,
-                    row.seq_len,
-                    binding.block_ids,
-                )
-                for row, binding in zip(rows, row_bindings, strict=True)
-            )
-            if write_plan_cache_key != self._write_plan_cache_key:
-                self._write_plans_by_layer = current_omni_platform.build_diffusion_paged_kv_write_plans(
-                    rows=rows,
-                    row_bindings=row_bindings,
-                    kv_cache_config=self.kv_cache_config,
-                    block_tables=self.block_tables,
-                    device=self.device,
-                )
-                self._write_plan_cache_key = write_plan_cache_key
-            write_plans_by_layer = self._write_plans_by_layer
         return PreparedDiffusionPagedAttentionBatch(
             rows=rows,
             row_indices=row_indices,
@@ -634,7 +591,6 @@ class DiffusionPagedAttentionAdapter:
             slot_mappings=slot_mappings,
             attn_metadata=attn_metadata,
             slot_mappings_by_layer=slot_mappings_by_layer,
-            write_plans_by_layer=write_plans_by_layer,
             num_tokens=num_tokens,
             _owner=self._owner,
             _generation=generation,
@@ -646,8 +602,6 @@ class DiffusionPagedAttentionAdapter:
         if self._active_batch is not None:
             raise RuntimeError("Cannot change paged attention BlockTables during an active forward")
         self._prepare_generation += 1
-        self._write_plan_cache_key = None
-        self._write_plans_by_layer = {}
 
     @contextmanager
     def activate(
@@ -951,7 +905,6 @@ class DiffusionPagedAttentionAdapter:
             key_write=key_flat,
             value_write=value_flat,
             slot_mapping=slot_mapping,
-            write_plan=batch.write_plans_by_layer.get(layer_name),
             native_metadata=native_metadata,
             piecewise_plan=piecewise_plan,
             piecewise_native_metadata=piecewise_native_metadata,

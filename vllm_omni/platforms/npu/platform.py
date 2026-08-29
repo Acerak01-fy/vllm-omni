@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
+from functools import cache
 from typing import Any
 
 import torch
@@ -11,11 +12,6 @@ from vllm_ascend.platform import NPUPlatform
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
-from vllm_omni.platforms.npu.utils import (
-    _reshape_and_cache_without_cache_mode,
-    _use_diffusion_paged_kv_write_plan,
-)
-
 logger = init_logger(__name__)
 
 _DIFFUSION_PACKED_MODULES_MAPPING = {
@@ -23,6 +19,28 @@ _DIFFUSION_PACKED_MODULES_MAPPING = {
         "experts": ["experts.0.gate_up_proj", "experts.0.down_proj"],
     },
 }
+
+
+@cache
+def _get_strict_ulysses_paged_backend() -> type:
+    """Return an Ascend backend that bypasses vLLM PCP dispatch."""
+
+    from vllm_ascend.attention.attention_v1 import (
+        AscendAttentionBackend,
+        AscendAttentionBackendImpl,
+        AscendAttentionMetadataBuilder,
+    )
+
+    class AscendStrictUlyssesPagedBackend(AscendAttentionBackend):
+        @staticmethod
+        def get_impl_cls() -> type:
+            return AscendAttentionBackendImpl
+
+        @staticmethod
+        def get_builder_cls() -> type:
+            return AscendAttentionMetadataBuilder
+
+    return AscendStrictUlyssesPagedBackend
 
 
 class NPUOmniPlatform(OmniPlatform, NPUPlatform):
@@ -89,34 +107,6 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         # non-UVA buffer implementation on NPU.
         adapt_patch()
         init_ascend_config(vllm_config)
-        cls._patch_scatter_cache_mode_compat()
-
-    @staticmethod
-    def _patch_scatter_cache_mode_compat() -> None:
-        """Bridge the 0.27 writer to torch_npu schemas without ``cache_mode``.
-
-        vLLM-Ascend 0.27 passes ``cache_mode=\"Norm\"`` to
-        ``npu_scatter_pa_kv_cache``.  Some torch_npu 2.10 builds expose the
-        same normal-layout operator without that keyword; the normal layout
-        is the operator default, so only the unsupported argument is removed.
-        """
-
-        from vllm_ascend.device import device_op
-
-        op = getattr(getattr(torch.ops, "npu", None), "npu_scatter_pa_kv_cache", None)
-        schema = getattr(getattr(op, "default", None), "_schema", None)
-        if schema is None or "cache_mode" in str(schema):
-            return
-        device_operator = device_op.DeviceOperator
-        if getattr(device_operator, "_omni_cache_mode_compat", False):
-            return
-
-        device_operator.reshape_and_cache = classmethod(_reshape_and_cache_without_cache_mode)
-        device_operator._omni_cache_mode_compat = True
-        logger.warning_once(
-            "Applied narrow vLLM-Ascend cache-writer compatibility: "
-            "torch_npu.npu_scatter_pa_kv_cache does not accept cache_mode."
-        )
 
     @classmethod
     def configure_diffusion_vllm_config(cls, vllm_config: Any, od_config: Any) -> None:
@@ -134,89 +124,29 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         ]
         if not supported_sizes:
             raise RuntimeError("Ascend paged attention did not expose an integer kernel block size")
-        # vLLM's generic default is 16, while the 0.27 Ascend FIA backend
-        # stores cache pages as 128-token blocks.  Set the Manager geometry
+        # vLLM's generic default is 16, while the Ascend FIA backend stores
+        # cache pages as 128-token blocks. Set the Manager geometry
         # before KV specs are collected so Scheduler and Worker agree.
         vllm_config.cache_config.block_size = supported_sizes[0]
 
     @classmethod
-    def supports_diffusion_paged_kv_write_plan(cls) -> bool:
+    def requires_diffusion_paged_kv_prewrite(cls) -> bool:
+        """Write the full K/V span once before piecewise FIA segments."""
+
         return True
 
     @classmethod
-    def build_diffusion_paged_kv_write_plans(
-        cls,
-        *,
-        rows,
-        row_bindings,
-        kv_cache_config,
-        block_tables,
-        device,
-    ) -> dict[str, Any]:
-        """Build compact PA_NZ mappings from Scheduler-owned physical blocks."""
+    def get_diffusion_paged_kv_attn_backend(cls, attn_backend: type, *, ulysses_degree: int) -> type:
+        """Keep strict Ulysses paged FIA out of vLLM's PCP implementation."""
 
         del cls
-        from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import DiffusionPagedKVWritePlan
+        if ulysses_degree <= 1:
+            return attn_backend
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 
-        if len(rows) != len(row_bindings):
-            raise ValueError("Diffusion KV write-plan rows and bindings must have equal length")
-        plans: dict[str, Any] = {}
-        for group_index, cache_group in enumerate(kv_cache_config.kv_cache_groups):
-            kernel_block_size = int(block_tables.kernel_block_sizes[group_index])
-            blocks_per_kv_block = int(block_tables.blocks_per_kv_block[group_index])
-            global_slots: list[int] = []
-            for row, binding in zip(rows, row_bindings, strict=True):
-                if len(binding.block_ids) != len(kv_cache_config.kv_cache_groups):
-                    raise RuntimeError(
-                        f"Paged KV row {row.identity!r} has {len(binding.block_ids)} block groups; "
-                        f"expected {len(kv_cache_config.kv_cache_groups)}"
-                    )
-                logical_blocks = binding.block_ids[group_index]
-                kernel_blocks = tuple(
-                    block_id * blocks_per_kv_block + offset
-                    for block_id in logical_blocks
-                    for offset in range(blocks_per_kv_block)
-                )
-                for position in range(row.kv_start_pos, row.kv_start_pos + row.query_len):
-                    block_index = position // (kernel_block_size * block_tables.cp_size)
-                    block_offset = position % (kernel_block_size * block_tables.cp_size)
-                    if block_index >= len(kernel_blocks):
-                        raise RuntimeError(
-                            f"Paged KV row {row.identity!r} has no physical block for write position {position}"
-                        )
-                    if block_tables.cp_size == 1:
-                        local_offset = block_offset
-                    else:
-                        is_local = (
-                            block_offset // block_tables.cp_interleave % block_tables.cp_size == block_tables.cp_rank
-                        )
-                        if not is_local:
-                            global_slots.append(-1)
-                            continue
-                        rounds = block_offset // (block_tables.cp_interleave * block_tables.cp_size)
-                        local_offset = rounds * block_tables.cp_interleave + block_offset % block_tables.cp_interleave
-                    global_slots.append(kernel_blocks[block_index] * kernel_block_size + local_offset)
-
-            touched_blocks = sorted({slot // kernel_block_size for slot in global_slots if slot >= 0})
-            compact_block_index = {block_id: index for index, block_id in enumerate(touched_blocks)}
-            local_slots = [
-                -1
-                if slot < 0
-                else compact_block_index[slot // kernel_block_size] * kernel_block_size + slot % kernel_block_size
-                for slot in global_slots
-            ]
-            plan = DiffusionPagedKVWritePlan(
-                block_ids=torch.tensor(touched_blocks, dtype=torch.int32, device=device),
-                local_slot_mapping=torch.tensor(local_slots, dtype=torch.int32, device=device),
-            )
-            for layer_name in cache_group.layer_names:
-                plans[layer_name] = plan
-        return plans
-
-    @classmethod
-    def use_diffusion_paged_kv_write_plan(cls, write_plan: Any):
-        del cls
-        return _use_diffusion_paged_kv_write_plan(write_plan)
+        if not isinstance(attn_backend, type) or not issubclass(attn_backend, AscendAttentionBackend):
+            return attn_backend
+        return _get_strict_ulysses_paged_backend()
 
     @classmethod
     def get_diffusion_kv_block_tables_cls(cls) -> type:
