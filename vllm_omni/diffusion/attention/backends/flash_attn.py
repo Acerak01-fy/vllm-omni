@@ -338,11 +338,22 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         if paged_kv_context.piecewise_plan is not None:
-            output = torch.empty(
-                (paged_kv_context.query.shape[0], layer.num_heads, layer.head_size_v),
-                dtype=paged_kv_context.query.dtype,
-                device=paged_kv_context.query.device,
+            # Ascend FIA can execute identical CFG rows as one batched call
+            # per piece.  Keep that batch layout through the piecewise runner
+            # so it can concatenate row-major results instead of emitting an
+            # indexed ScatterUpdate for every segment.  The CUDA path keeps
+            # its existing output-buffer contract (including graph capture).
+            use_homogeneous_batch = (
+                current_omni_platform.is_npu()
+                and paged_kv_context.piecewise_plan.homogeneous_batch_shape is not None
             )
+            output = None
+            if not use_homogeneous_batch:
+                output = torch.empty(
+                    (paged_kv_context.query.shape[0], layer.num_heads, layer.head_size_v),
+                    dtype=paged_kv_context.query.dtype,
+                    device=paged_kv_context.query.device,
+                )
             output = run_paged_piecewise_plan(
                 paged_kv_context.query,
                 None if read_kv_from_cache else paged_kv_context.key_write,
@@ -351,6 +362,7 @@ class FlashAttentionImpl(AttentionImpl):
                 paged_kv_context.piecewise_native_metadata,
                 run_native_attention,
                 output_buffer=output,
+                use_homogeneous_batch=use_homogeneous_batch,
             )
         else:
             output = run_native_attention(

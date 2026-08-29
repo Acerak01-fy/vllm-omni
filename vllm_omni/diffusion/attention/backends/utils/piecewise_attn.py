@@ -135,6 +135,10 @@ class PagedPiecewiseSegment:
     row_segments: tuple[Segment, ...]
     query_indices: torch.Tensor
     query_range: tuple[int, int] | None
+    # Local [start, end) range shared by every row when the batch can retain
+    # its original [B, S] layout.  The packed query_indices remain available
+    # for metadata construction and the heterogeneous fallback.
+    local_query_range: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +149,11 @@ class PagedPiecewisePlan:
     segments: tuple[PagedPiecewiseSegment, ...]
     num_query_tokens: int
     segments_cover_query_contiguously: bool
+    # (batch_size, query_len) when all rows have the same local segment
+    # layout.  Native FIA still receives flattened row-major tokens, but the
+    # runner can restore outputs with one batch concat instead of one indexed
+    # scatter per segment.
+    homogeneous_batch_shape: tuple[int, int] | None = None
 
 
 PagedPiecewiseRunner = Callable[
@@ -194,18 +203,22 @@ def build_paged_piecewise_plan(
         if len({segment.mode for segment in row_segments}) != 1:
             raise ValueError("Paged piecewise rows must use the same attention mode per segment")
         query_indices: list[int] = []
+        local_ranges: list[tuple[int, int]] = []
         for row_index, (segment, query_offset) in enumerate(zip(row_segments, query_offsets, strict=True)):
             local_start = segment.q_start - query_offset
             local_end = segment.q_end - query_offset
+            local_ranges.append((local_start, local_end))
             query_indices.extend(range(packed_offsets[row_index] + local_start, packed_offsets[row_index] + local_end))
         query_range = None
         if query_indices and query_indices == list(range(query_indices[0], query_indices[-1] + 1)):
             query_range = (query_indices[0], query_indices[-1] + 1)
+        local_query_range = local_ranges[0] if len(set(local_ranges)) == 1 else None
         packed_segments.append(
             PagedPiecewiseSegment(
                 row_segments=tuple(row_segments),
                 query_indices=torch.tensor(query_indices, dtype=torch.long, device=device),
                 query_range=query_range,
+                local_query_range=local_query_range,
             )
         )
 
@@ -215,12 +228,88 @@ def build_paged_piecewise_plan(
             break
         covered = segment.query_range[1]
     segments_cover_query_contiguously = covered == packed_offsets[-1]
+    homogeneous_batch_shape: tuple[int, int] | None = None
+    if row_count > 1 and len(set(query_lens)) == 1 and all(
+        segment.local_query_range is not None for segment in packed_segments
+    ):
+        # A common local range is sufficient even when rows have different
+        # global offsets or KV lengths; those values remain row-specific in
+        # native metadata.
+        homogeneous_batch_shape = (row_count, int(query_lens[0]))
     return PagedPiecewisePlan(
         spans=spans,
         segments=tuple(packed_segments),
         num_query_tokens=packed_offsets[-1],
         segments_cover_query_contiguously=segments_cover_query_contiguously,
+        homogeneous_batch_shape=homogeneous_batch_shape,
     )
+
+
+def _run_homogeneous_paged_piecewise_plan(
+    query: torch.Tensor,
+    key: torch.Tensor | None,
+    value: torch.Tensor | None,
+    plan: PagedPiecewisePlan,
+    segment_metadata: Sequence[object],
+    segment_runner: PagedPiecewiseRunner,
+    output_buffer: torch.Tensor | None,
+) -> torch.Tensor:
+    """Run a homogeneous batch while retaining the old [B, S] layout.
+
+    The native FIA contract is flattened TND, so each segment is flattened
+    only for the kernel call.  Results are reshaped back to [B, L] and
+    concatenated along the sequence dimension, which avoids the per-segment
+    ``index_copy_`` used by heterogeneous packed rows.
+    """
+
+    batch_shape = plan.homogeneous_batch_shape
+    assert batch_shape is not None
+    batch_size, query_len = batch_shape
+    if query.shape[0] != batch_size * query_len:
+        raise ValueError(
+            f"Homogeneous paged piecewise plan expects {batch_size * query_len} query tokens, "
+            f"got {query.shape[0]}"
+        )
+    query_rows = query.reshape(batch_size, query_len, *query.shape[1:])
+    key_rows = None if key is None else key.reshape(batch_size, query_len, *key.shape[1:])
+    value_rows = None if value is None else value.reshape(batch_size, query_len, *value.shape[1:])
+
+    segment_outputs: list[torch.Tensor] = []
+    for segment, metadata in zip(plan.segments, segment_metadata, strict=True):
+        local_range = segment.local_query_range
+        if local_range is None:
+            raise ValueError("Homogeneous paged piecewise execution requires a shared local segment range")
+        start, end = local_range
+        segment_query = query_rows[:, start:end].contiguous().reshape(-1, *query.shape[1:])
+        segment_key = None if key_rows is None else key_rows[:, start:end].contiguous().reshape(-1, *key.shape[1:])
+        segment_value = (
+            None if value_rows is None else value_rows[:, start:end].contiguous().reshape(-1, *value.shape[1:])
+        )
+        segment_output = segment_runner(segment_query, segment_key, segment_value, metadata, None)
+        expected_tokens = batch_size * (end - start)
+        if segment_output.shape[0] != expected_tokens:
+            raise ValueError(
+                f"Paged piecewise runner returned {segment_output.shape[0]} tokens "
+                f"for a {expected_tokens}-token homogeneous segment"
+            )
+        segment_outputs.append(segment_output.reshape(batch_size, end - start, *segment_output.shape[1:]))
+
+    if not segment_outputs:
+        result = torch.empty_like(query)
+    elif len(segment_outputs) == 1:
+        result = segment_outputs[0].reshape(plan.num_query_tokens, *segment_outputs[0].shape[2:])
+    else:
+        result_rows = torch.cat(segment_outputs, dim=1)
+        result = result_rows.reshape(plan.num_query_tokens, *result_rows.shape[2:])
+    if output_buffer is not None:
+        if output_buffer.shape != result.shape:
+            raise ValueError(
+                f"Paged piecewise output buffer shape {tuple(output_buffer.shape)} does not match "
+                f"homogeneous result shape {tuple(result.shape)}"
+            )
+        output_buffer.copy_(result)
+        return output_buffer
+    return result
 
 
 def run_paged_piecewise_plan(
@@ -231,14 +320,32 @@ def run_paged_piecewise_plan(
     segment_metadata: Sequence[object],
     segment_runner: PagedPiecewiseRunner,
     output_buffer: torch.Tensor | None = None,
+    *,
+    use_homogeneous_batch: bool = False,
 ) -> torch.Tensor:
-    """Run piecewise attention with view fast paths for contiguous segments."""
+    """Run piecewise attention with view fast paths for contiguous segments.
+
+    ``use_homogeneous_batch`` is an opt-in for native backends that can keep
+    identical rows in the legacy batch layout.  The default remains the
+    indexed packed path so existing GPU/heterogeneous contracts are unchanged.
+    """
 
     if query.shape[0] != plan.num_query_tokens:
         raise ValueError(f"Paged piecewise plan has {plan.num_query_tokens} query tokens, got {query.shape[0]}")
     if output_buffer is not None and output_buffer.shape[0] != plan.num_query_tokens:
         raise ValueError(
             f"Paged piecewise output buffer has {output_buffer.shape[0]} tokens; expected {plan.num_query_tokens}"
+        )
+
+    if use_homogeneous_batch and plan.homogeneous_batch_shape is not None:
+        return _run_homogeneous_paged_piecewise_plan(
+            query,
+            key,
+            value,
+            plan,
+            segment_metadata,
+            segment_runner,
+            output_buffer,
         )
 
     output = output_buffer

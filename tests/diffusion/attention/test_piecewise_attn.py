@@ -136,6 +136,72 @@ def test_paged_piecewise_runner_uses_packed_indices_and_kv_endpoints():
     ]
 
 
+def test_paged_piecewise_runner_preserves_homogeneous_batch_without_scatter(monkeypatch: pytest.MonkeyPatch):
+    plan = build_paged_piecewise_plan(
+        [[(2, 5)], [(2, 5)]],
+        query_offsets=[0, 0],
+        query_lens=[6, 6],
+        seq_lens=[6, 6],
+        device=DEVICE,
+    )
+    assert plan.homogeneous_batch_shape == (2, 6)
+    query = torch.arange(12 * 2 * 4, dtype=torch.float32).reshape(12, 2, 4)
+    calls: list[torch.Tensor] = []
+
+    def fail_index_copy(*_args, **_kwargs):
+        raise AssertionError("homogeneous piecewise path must not use index_copy_")
+
+    monkeypatch.setattr(torch.Tensor, "index_copy_", fail_index_copy)
+
+    def run_segment(segment_query, segment_key, segment_value, _metadata, segment_output_buffer):
+        assert segment_key is None
+        assert segment_value is None
+        assert segment_output_buffer is None
+        calls.append(segment_query.clone())
+        return segment_query + 1
+
+    output_buffer = torch.empty_like(query)
+    output = run_paged_piecewise_plan(
+        query,
+        None,
+        None,
+        plan,
+        plan.segments,
+        run_segment,
+        output_buffer=output_buffer,
+        use_homogeneous_batch=True,
+    )
+
+    assert output is output_buffer
+    torch.testing.assert_close(output, query + 1)
+    assert [call.shape[0] for call in calls] == [4, 6, 2]
+    torch.testing.assert_close(calls[0], query[[0, 1, 6, 7]])
+    torch.testing.assert_close(calls[1], query[[2, 3, 4, 8, 9, 10]])
+    torch.testing.assert_close(calls[2], query[[5, 11]])
+
+
+def test_paged_piecewise_runner_keeps_indexed_fallback_for_heterogeneous_layout():
+    plan = build_paged_piecewise_plan(
+        [[(2, 5)], [(1, 4)]],
+        query_offsets=[0, 0],
+        query_lens=[6, 6],
+        seq_lens=[6, 6],
+        device=DEVICE,
+    )
+    assert plan.homogeneous_batch_shape is None
+    query = torch.arange(12 * 2 * 4, dtype=torch.float32).reshape(12, 2, 4)
+    output = run_paged_piecewise_plan(
+        query,
+        None,
+        None,
+        plan,
+        plan.segments,
+        lambda segment_query, *_args: segment_query,
+        use_homogeneous_batch=True,
+    )
+    torch.testing.assert_close(output, query)
+
+
 def test_paged_piecewise_runner_slices_contiguous_segments():
     plan = build_paged_piecewise_plan(
         [[(2, 5)]],
