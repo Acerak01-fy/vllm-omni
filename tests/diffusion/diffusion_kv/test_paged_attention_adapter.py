@@ -440,6 +440,9 @@ def test_platform_prewrite_updates_once_then_piecewise_reads_cache(monkeypatch: 
 
 def test_omni_paged_backend_runs_hunyuan_piecewise_segments(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, layer, events = _make_adapter(monkeypatch)
+    # Exercise the Ascend-only homogeneous batch path. CUDA keeps its native
+    # output-buffer contract and is covered by the GPU adapter tests.
+    monkeypatch.setattr(adapter_module.current_omni_platform, "is_npu", lambda: True)
     batch = adapter.prepare_batch(
         [
             DiffusionPagedAttentionRow(
