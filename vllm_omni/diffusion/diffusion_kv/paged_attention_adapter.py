@@ -916,10 +916,18 @@ class DiffusionPagedAttentionAdapter:
                 f"expected {batch.num_tokens}"
             )
 
-        # vLLM's writer consumes slot_mapping directly, so a span that starts
+        # vLLM's CUDA writer consumes the source token strides directly, so
+        # preserve strided QKV-projection views instead of materializing an
+        # extra K/V copy here. Platform writers with stricter contracts (for
+        # example, Ascend PA scatter) make their inputs contiguous locally.
+        # The native CUDA writer still assumes heads and head dimensions are
+        # packed within each token; materialize unusual inner layouts only.
+        if key_flat.stride(-1) != 1 or (key_flat.shape[-2] > 1 and key_flat.stride(-2) != key_flat.shape[-1]):
+            key_flat = key_flat.contiguous()
+        if value_flat.stride(-1) != 1 or (value_flat.shape[-2] > 1 and value_flat.stride(-2) != value_flat.shape[-1]):
+            value_flat = value_flat.contiguous()
+        # The writer also consumes slot_mapping directly, so a span that starts
         # inside a physical block naturally writes only the requested suffix.
-        key_flat = key_flat.contiguous()
-        value_flat = value_flat.contiguous()
         try:
             native_metadata = batch.attn_metadata[layer_name]
         except KeyError as exc:

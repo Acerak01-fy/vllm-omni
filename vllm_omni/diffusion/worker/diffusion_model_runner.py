@@ -410,9 +410,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         f"module_path={module_path!r}"
                     )
                 if layer_name in cache_layers:
-                    raise RuntimeError(
-                        f"Duplicate canonical paged Diffusion Attention prefix {layer_name!r}"
-                    )
+                    raise RuntimeError(f"Duplicate canonical paged Diffusion Attention prefix {layer_name!r}")
                 cache_layers[layer_name] = (module, spec)
         if not cache_layers:
             raise RuntimeError(
@@ -685,12 +683,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 paged_kv_runtime, paged_kv_context = self.diffusion_kv_backend.activate_paged_attention_metadata(
                     paged_metadata
                 )
-            with set_forward_context(
-                vllm_config=self.vllm_config,
-                omni_diffusion_config=od_config,
-                paged_kv_runtime=paged_kv_runtime,
-                in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
-            ), paged_kv_context:
+            with (
+                set_forward_context(
+                    vllm_config=self.vllm_config,
+                    omni_diffusion_config=od_config,
+                    paged_kv_runtime=paged_kv_runtime,
+                    in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
+                ),
+                paged_kv_context,
+            ):
                 with record_function(record_name):
                     raw_outputs = self.pipeline.forward(batch)
                     outputs = _normalize_pipeline_outputs(

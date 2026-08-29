@@ -321,6 +321,47 @@ def test_paged_adapter_accepts_native_gqa_shapes(monkeypatch: pytest.MonkeyPatch
     assert context.value_write.shape == (3, 8, 4)
 
 
+def test_paged_adapter_preserves_strided_kv_for_platform_writer(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=5, seq_len=5)]
+    )
+    packed_qkv = torch.randn(1, 5, 3 * 2 * 4)
+    query, key, value = packed_qkv.split(2 * 4, dim=-1)
+    query = query.reshape(1, 5, 2, 4)
+    key = key.reshape(1, 5, 2, 4)
+    value = value.reshape(1, 5, 2, 4)
+    assert not key.is_contiguous()
+    assert not value.is_contiguous()
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context("layer-0", query, key, value)
+
+    assert context.query.is_contiguous()
+    assert not context.key_write.is_contiguous()
+    assert not context.value_write.is_contiguous()
+    assert context.key_write.data_ptr() == key.data_ptr()
+    assert context.value_write.data_ptr() == value.data_ptr()
+
+
+def test_paged_adapter_packs_noncontiguous_kv_head_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, _, _, _ = _make_adapter(monkeypatch)
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=5, seq_len=5)]
+    )
+    query = torch.randn(1, 5, 2, 4)
+    key = torch.randn(1, 5, 4, 2).transpose(-1, -2)
+    value = torch.randn(1, 5, 4, 2).transpose(-1, -2)
+    assert key.shape == (1, 5, 2, 4)
+    assert key.stride(-1) != 1
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context("layer-0", query, key, value)
+
+    assert context.key_write.is_contiguous()
+    assert context.value_write.is_contiguous()
+
+
 def test_omni_paged_backend_defers_backend_owned_cache_update(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, layer, _ = _make_adapter(monkeypatch)
     layer.attn_backend.forward_includes_kv_cache_update = True
@@ -1034,9 +1075,7 @@ def test_runner_runtime_switches_from_prefill_to_reusable_denoise_metadata(
 ) -> None:
     adapter, _, _, _ = _make_adapter(monkeypatch)
     metadata = DiffusionPagedAttentionMetadata(
-        prefill_rows=(
-            DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=6, seq_len=6),
-        ),
+        prefill_rows=(DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=6, seq_len=6),),
         denoise_rows=(
             DiffusionPagedAttentionRow(
                 request_id="req-0",
