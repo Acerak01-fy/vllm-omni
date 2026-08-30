@@ -45,6 +45,7 @@ class ForwardContext:
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
+    total_denoise_steps: int | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
@@ -267,6 +268,27 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
                 ensure_active(step_idx)
 
 
+def set_forward_context_denoise_timestep(timestep: float | None) -> None:
+    """Set the normalized (descending, 1 -> 0) denoise timestep.
+
+    Timestep-gated attention features read this; pipelines that drive their own
+    denoise loop can publish it directly instead of going through
+    :meth:`DenoiseProgressMixin.record_denoise_step`.
+    """
+    if _forward_context is not None:
+        _forward_context.denoise_timestep = None if timestep is None else float(timestep)
+
+
+def set_forward_context_denoise_total_steps(total_steps: int | None) -> None:
+    """Set the total denoise step count on the active ForwardContext.
+
+    Denoise loops publish it so tail-fallback gates (e.g. ``end_step`` in
+    RAINFUSION_ATTN) know when the final denoise steps begin.
+    """
+    if _forward_context is not None:
+        _forward_context.total_denoise_steps = total_steps
+
+
 class DenoiseProgressMixin:
     def record_denoise_step(
         self,
@@ -274,8 +296,11 @@ class DenoiseProgressMixin:
         timestep=None,
         scheduler=None,
         normalized_timestep: float | None = None,
+        total_steps: int | None = None,
     ) -> None:
         set_forward_context_denoise_step_idx(step_idx)
+        if _forward_context is not None:
+            _forward_context.total_denoise_steps = total_steps
         if _forward_context is None:
             return
         if normalized_timestep is not None:
