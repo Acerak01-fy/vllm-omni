@@ -24,7 +24,6 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRow,
     DiffusionPagedAttentionRowBinding,
     DiffusionPagedAttentionRuntime,
-    DiffusionPagedKVWritePlan,
 )
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,

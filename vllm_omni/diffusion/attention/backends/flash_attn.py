@@ -344,8 +344,7 @@ class FlashAttentionImpl(AttentionImpl):
             # indexed ScatterUpdate for every segment.  The CUDA path keeps
             # its existing output-buffer contract (including graph capture).
             use_homogeneous_batch = (
-                current_omni_platform.is_npu()
-                and paged_kv_context.piecewise_plan.homogeneous_batch_shape is not None
+                current_omni_platform.is_npu() and paged_kv_context.piecewise_plan.homogeneous_batch_shape is not None
             )
             output = None
             if not use_homogeneous_batch:

@@ -12,6 +12,7 @@ from vllm_ascend.platform import NPUPlatform
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+
 logger = init_logger(__name__)
 
 _DIFFUSION_PACKED_MODULES_MAPPING = {

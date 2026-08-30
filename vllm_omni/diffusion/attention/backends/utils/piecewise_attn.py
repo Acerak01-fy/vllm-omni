@@ -229,8 +229,10 @@ def build_paged_piecewise_plan(
         covered = segment.query_range[1]
     segments_cover_query_contiguously = covered == packed_offsets[-1]
     homogeneous_batch_shape: tuple[int, int] | None = None
-    if row_count > 1 and len(set(query_lens)) == 1 and all(
-        segment.local_query_range is not None for segment in packed_segments
+    if (
+        row_count > 1
+        and len(set(query_lens)) == 1
+        and all(segment.local_query_range is not None for segment in packed_segments)
     ):
         # A common local range is sufficient even when rows have different
         # global offsets or KV lengths; those values remain row-specific in
@@ -267,8 +269,7 @@ def _run_homogeneous_paged_piecewise_plan(
     batch_size, query_len = batch_shape
     if query.shape[0] != batch_size * query_len:
         raise ValueError(
-            f"Homogeneous paged piecewise plan expects {batch_size * query_len} query tokens, "
-            f"got {query.shape[0]}"
+            f"Homogeneous paged piecewise plan expects {batch_size * query_len} query tokens, got {query.shape[0]}"
         )
     query_rows = query.reshape(batch_size, query_len, *query.shape[1:])
     key_rows = None if key is None else key.reshape(batch_size, query_len, *key.shape[1:])
