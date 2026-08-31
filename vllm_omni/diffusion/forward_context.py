@@ -263,7 +263,8 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
         if step_idx is not None:
-            ensure_active = getattr(_forward_context.paged_kv_runtime, "ensure_active", None)
+            paged_kv_runtime = getattr(_forward_context, "paged_kv_runtime", None)
+            ensure_active = getattr(paged_kv_runtime, "ensure_active", None)
             if callable(ensure_active):
                 ensure_active(step_idx)
 

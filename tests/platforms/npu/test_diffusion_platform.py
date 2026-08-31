@@ -11,6 +11,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 @pytest.mark.parametrize("available", [False, True])
 def test_dense_flash_capability_tracks_mindiesd(monkeypatch, available):
+    pytest.importorskip("vllm_ascend")
     from vllm_omni.platforms.npu.platform import NPUOmniPlatform
 
     monkeypatch.setattr(
