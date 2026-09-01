@@ -28,6 +28,88 @@ _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
+# Top-level API/CLI spellings that are meaningful only to a diffusion stage.
+# They are deliberately kept at this schema boundary rather than in the
+# entrypoint so the typed and compatibility views receive identical routing.
+# Shared engine controls (TP/DP/PP, dtype, revision, memory limits, etc.) are
+# intentionally absent and continue to apply to every applicable stage.
+_DIFFUSION_STAGE_ONLY_CLI_FIELDS = frozenset(
+    {
+        "VSA_sparsity",
+        "additional_config",
+        "auxiliary_text_encoder",
+        "boundary_ratio",
+        "cache_backend",
+        "cache_config",
+        "cache_strategy",
+        "cfg_parallel_size",
+        "custom_pipeline_args",
+        "default_llama_model_id",
+        "diffusers_call_kwargs",
+        "diffusers_load_kwargs",
+        "diffusers_pipeline_cls",
+        "diffusion_attention_backend",
+        "diffusion_attention_config",
+        "diffusion_compile_dynamic",
+        "diffusion_compile_granularity",
+        "diffusion_kv_cache_dtype",
+        "diffusion_kv_cache_skip_layers",
+        "diffusion_kv_cache_skip_steps",
+        "diffusion_load_format",
+        "diffusion_model_runner_cls",
+        "diffusion_quantization_config",
+        "enable_cache_dit_summary",
+        "enable_cpu_offload",
+        "enable_diffusion_pipeline_profiler",
+        "enable_distributed_layerwise_offload",
+        "enable_layerwise_offload",
+        "fa_deterministic",
+        "fastvideo_vsa_topk",
+        "flow_shift",
+        "force_cutlass_fp8",
+        "hsdp_replicate_size",
+        "hsdp_shard_size",
+        "host_weight_runtime_mode",
+        "host_weight_runtime_root",
+        "lora_backend",
+        "lora_path",
+        "lora_scale",
+        "max_cpu_loras",
+        "moba_config_path",
+        "model_class_name",
+        "output_type",
+        "pin_cpu_memory",
+        "prompt_embed_cache_size",
+        "enable_prompt_embed_cache",
+        "enable_session_state_manager",
+        "enable_stage_verification",
+        "request_batch_max_wait_ms",
+        "skip_time_steps",
+        "static_lora_scale",
+        "step_execution",
+        "streaming_output",
+        "supports_mixed_reference_inputs",
+        "supports_multimodal_inputs",
+        "vae_use_slicing",
+        "vae_use_tiling",
+        "vae_parallel_mode",
+        "vae_patch_parallel_size",
+        "text_encoder_tp_size",
+        "ulysses_a2a_permute",
+        "ulysses_degree",
+        "ulysses_mode",
+        "ring_degree",
+        "allgather_degree",
+        "use_hsdp",
+        "diffusion_kv_mode",
+        "diffusion_kv_max_rows_per_request",
+        "dlo_use_allgather",
+        "dlo_resident_layers",
+        "dlo_host_registration_limit_gib",
+        "override_transformer_cls_name",
+    }
+)
+
 
 def pipeline_cfg_resolver(config_type: type[PretrainedConfig]):
     """Wraps a resolver such that we return None if a hf_config of the wrong type is provided."""
@@ -68,7 +150,13 @@ def build_stage_runtime_overrides(
         # the default blacklist for true orchestrator/shared fields while
         # allowing any field explicitly represented by the deploy schema to
         # continue flowing into per-stage overrides.
-        internal_keys = (internal_blacklist_keys() | SHARED_FIELDS) - deploy_runtime_override_keys()
+        # ``enable_sleep_mode`` is parsed by the orchestrator as well as the
+        # stage engine.  It is intentionally absent from DeployConfig because
+        # the CLI/API value is a process-wide switch, but it still must reach
+        # every stage's model config (including typed diffusion stages).
+        internal_keys = (
+            (internal_blacklist_keys() | SHARED_FIELDS) - deploy_runtime_override_keys() - {"enable_sleep_mode"}
+        )
 
     result: dict[str, Any] = {}
 
@@ -93,7 +181,15 @@ def normalize_pipeline_cli_overrides(
     pipeline: PipelineConfig,
     cli_overrides: dict[str, Any],
 ) -> dict[str, Any]:
-    """Translate pipeline-owned global CLI aliases into stage-scoped overrides."""
+    """Translate pipeline-owned global CLI aliases into stage-scoped overrides.
+
+    Diffusion-only global CLI spellings (for example
+    ``--diffusion-streaming-output`` and ``--auxiliary-text-encoder``) are
+    translated to the owning diffusion stage here.  Keeping that translation
+    at the shared config boundary means both the typed and legacy views see the
+    same value; pipelines without a diffusion stage simply discard these
+    diffusion-only flags instead of forwarding them to an LLM stage.
+    """
     normalized = dict(cli_overrides)
     for source, (stage_id, target) in pipeline.stage_cli_aliases.items():
         invalid_stage_keys = [
@@ -123,6 +219,57 @@ def normalize_pipeline_cli_overrides(
             )
             continue
         normalized[stage_key] = value
+
+    diffusion_stage_ids = {
+        stage.stage_id for stage in pipeline.stages if stage.execution_type == StageExecutionType.DIFFUSION
+    }
+
+    # These spellings are accepted by the top-level API/CLI for historical
+    # compatibility, but their structured owners exist only on diffusion
+    # stages. Route each global value to every diffusion stage (there is
+    # normally one), preserving an explicit stage-local value as the winner.
+    diffusion_aliases = {name: name for name in _DIFFUSION_STAGE_ONLY_CLI_FIELDS}
+    diffusion_aliases["diffusion_streaming_output"] = "streaming_output"
+    for key in list(normalized):
+        match = _STAGE_OVERRIDE_PATTERN.match(key)
+        if match is None or match.group(2) not in diffusion_aliases:
+            continue
+        stage_id = int(match.group(1))
+        source = match.group(2)
+        value = normalized.pop(key)
+        if value is None:
+            continue
+        if stage_id not in diffusion_stage_ids:
+            raise ValueError(
+                f"{key} cannot be set for pipeline {pipeline.model_type!r}; {source} belongs to a diffusion stage."
+            )
+        target_key = f"stage_{stage_id}_{diffusion_aliases[source]}"
+        existing = normalized.get(target_key)
+        if existing is not None and existing != value:
+            warnings.warn(
+                f"Ignoring {key}={value!r} because {target_key}={existing!r} takes precedence.",
+                UserWarning,
+                stacklevel=2,
+            )
+            continue
+        normalized[target_key] = value
+
+    for source, target in diffusion_aliases.items():
+        global_value = normalized.pop(source, None)
+        if global_value is None:
+            continue
+        for stage_id in diffusion_stage_ids:
+            target_key = f"stage_{stage_id}_{target}"
+            existing = normalized.get(target_key)
+            if existing is not None and existing != global_value:
+                warnings.warn(
+                    f"Ignoring {source}={global_value!r} because {target_key}={existing!r} takes precedence.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                continue
+            normalized[target_key] = global_value
+
     return normalized
 
 

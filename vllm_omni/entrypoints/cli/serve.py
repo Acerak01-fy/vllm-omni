@@ -193,7 +193,15 @@ class OmniServeCommand(CLISubcommand):
         from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 
         model = getattr(args, "model_tag", None) or getattr(args, "model", None)
-        if model and is_diffusion_model(model):
+        revision = getattr(args, "revision", None)
+        if model:
+            if revision is None:
+                diffusion_model = is_diffusion_model(model)
+            else:
+                diffusion_model = is_diffusion_model(model, revision=revision)
+        else:
+            diffusion_model = False
+        if diffusion_model:
             logger.info("Detected diffusion model: %s", model)
             return
         validate_parsed_serve_args(args)
@@ -934,6 +942,7 @@ def run_headless(args: TrackingNamespace) -> None:
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
     from vllm.version import __version__ as VLLM_VERSION
 
+    from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig
     from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_omni_kv_config_for_stage
     from vllm_omni.engine.stage_engine_startup import (
         get_headless_replica_devices,
@@ -949,7 +958,7 @@ def run_headless(args: TrackingNamespace) -> None:
         prepare_engine_environment,
     )
     from vllm_omni.entrypoints.utils import (
-        load_and_resolve_stage_configs,
+        load_and_resolve_stage_config_views,
         parse_stage_overrides,
     )
 
@@ -991,7 +1000,7 @@ def run_headless(args: TrackingNamespace) -> None:
     # standard launches resolve to the same per-stage device layout.
     stage_overrides = parse_stage_overrides(args_dict.get("stage_overrides"))
 
-    config_path, stage_configs, _ = load_and_resolve_stage_configs(
+    resolved_stage_configs = load_and_resolve_stage_config_views(
         model,
         args_dict,
         # store_true cannot express an explicit False: absent maps to None
@@ -1001,6 +1010,8 @@ def run_headless(args: TrackingNamespace) -> None:
         stage_overrides=stage_overrides,
         strategy_config_path=args_dict.get("strategy_config"),
     )
+    config_path = resolved_stage_configs.config_path
+    stage_configs = resolved_stage_configs.stage_configs
 
     # Locate the stage config that matches stage_id.
     stage_cfg = None
@@ -1013,14 +1024,19 @@ def run_headless(args: TrackingNamespace) -> None:
             f"No stage config found for stage_id={stage_id}. Available stage ids: {[c.stage_id for c in stage_configs]}"
         )
 
+    typed_stage_cfg = (
+        resolved_stage_configs.typed_stage_by_id(stage_id) if resolved_stage_configs.omni_config is not None else None
+    )
+
     prepare_engine_environment()
     per_replica_devices = get_headless_replica_devices(stage_cfg, stage_id, omni_dp_size_local)
 
-    if stage_cfg.stage_type == "diffusion":
+    if isinstance(typed_stage_cfg, VllmOmniDiffusionStageConfig):
         launch_headless_diffusion_replicas(
             model=model,
-            stage_cfg=stage_cfg,
-            stage_configs=stage_configs,
+            stage_config=typed_stage_cfg,
+            legacy_registration_config=stage_cfg,
+            stage_configs=list(resolved_stage_configs.typed_topology()),
             stage_id=stage_id,
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
@@ -1030,8 +1046,14 @@ def run_headless(args: TrackingNamespace) -> None:
             replica_bind_address=omni_replica_address,
         )
         return
+    if stage_cfg.stage_type == "diffusion":
+        raise TypeError(f"Diffusion stage {stage_id} did not resolve to a typed diffusion config")
 
-    omni_transfer_config = load_omni_transfer_config_for_model(model, config_path)
+    revision = stage_cfg.engine_args.get("revision")
+    if revision is None:
+        omni_transfer_config = load_omni_transfer_config_for_model(model, config_path)
+    else:
+        omni_transfer_config = load_omni_transfer_config_for_model(model, config_path, revision=revision)
     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
     stage_connector_spec = get_stage_connector_spec(
         omni_transfer_config=omni_transfer_config,

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for vllm_omni.entrypoints.utils module."""
 
 import os
@@ -11,22 +14,36 @@ import torch
 from pytest_mock import MockerFixture
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.config.omni_config import VllmOmniConfig, VllmOmniDiffusionStageConfig
+from vllm_omni.config.stage_config import (
+    DeployConfig,
+    PipelineConfig,
+    StageDeployConfig,
+    StageExecutionType,
+    StagePipelineConfig,
+    merge_pipeline_deploy,
+)
 from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_init_utils import (
+    build_diffusion_engine_args_from_omni_stage_config,
     get_stage_connector_spec,
     load_omni_transfer_config_for_model,
 )
 from vllm_omni.entrypoints.utils import (
+    ResolvedStageConfigs,
     _convert_dataclasses_to_dict,
     _filter_dict_like_object,
+    _filter_resolved_stage_views,
     _try_resolve_omni_model_type,
     coerce_param_message_types,
     filter_dataclass_kwargs,
     filter_stages,
     load_and_resolve_stage_configs,
+    load_stage_config_views_from_model,
     load_stage_configs_from_model,
     resolve_model_config_path,
 )
@@ -519,21 +536,115 @@ class TestLoadAndResolveStageConfigs:
         assert filtered[0].final_output is False
         assert filtered[0].final_output_type is None
 
+    def test_mode_filter_keeps_full_typed_topology_for_dit_kv_inference(self, tmp_path):
+        pipeline = PipelineConfig(
+            model_type="mode_filtered_typed_topology",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="ar",
+                    execution_type=StageExecutionType.LLM_AR,
+                ),
+                StagePipelineConfig(
+                    stage_id=1,
+                    model_stage="dit",
+                    execution_type=StageExecutionType.DIFFUSION,
+                    input_sources=(0,),
+                    final_output=True,
+                    final_output_type="image",
+                    model_arch="TestDiffusion",
+                    omni_kv_config={"need_recv_cache": True},
+                ),
+            ),
+        )
+        deploy = DeployConfig(
+            async_chunk=False,
+            stages=[
+                StageDeployConfig(stage_id=0, tensor_parallel_size=4),
+                StageDeployConfig(stage_id=1, tensor_parallel_size=2),
+            ],
+        )
+        omni_config = VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            user_deploy_config=deploy,
+            cli_overrides={"model": "test-model"},
+        )
+        legacy_stages = [stage.to_omegaconf() for stage in merge_pipeline_deploy(pipeline, deploy)]
+        config_path = tmp_path / "mode.yaml"
+        config_path.write_text("modes:\n  - mode: dit-only\n    stages: [1]\n", encoding="utf-8")
+
+        filtered = _filter_resolved_stage_views(
+            ResolvedStageConfigs(
+                config_path=str(config_path),
+                omni_config=omni_config,
+                stage_configs=legacy_stages,
+                deploy_config=deploy,
+                omni_lb_policy=None,
+            ),
+            {"mode": "dit-only"},
+        )
+
+        assert [stage.stage_id for stage in filtered.stage_configs] == [1]
+        assert [stage.stage_id for stage in filtered.omni_config.stage_configs] == [1]
+        assert [stage.stage_id for stage in filtered.typed_topology()] == [0, 1]
+
+        dit_stage = filtered.typed_stage_by_id(1)
+        assert isinstance(dit_stage, VllmOmniDiffusionStageConfig)
+        engine_args = build_diffusion_engine_args_from_omni_stage_config(
+            dit_stage,
+            "test-model",
+            omni_kv_connector=({"name": "TestConnector"}, "0", "1"),
+            stage_configs=filtered.typed_topology(),
+        )
+        assert engine_args["omni_kv_config"]["rank_mapping"] == {
+            "from_tp": 4,
+            "to_tp": 2,
+        }
+
 
 class TestLoadStageConfigsFromModel:
-    def test_unresolved_model_does_not_fall_back_to_yaml(self, mocker: MockerFixture, caplog):
+    def test_unresolved_model_does_not_fall_back_to_yaml(self, mocker: MockerFixture):
         mocker.patch(
             "vllm_omni.entrypoints.utils.StageConfigFactory.create_legacy_stage_configs_from_model",
             return_value=(None, None),
         )
         resolve_path = mocker.patch("vllm_omni.entrypoints.utils.resolve_model_config_path")
+        warning = mocker.patch("vllm_omni.entrypoints.utils.logger.warning")
 
         result = load_stage_configs_from_model("unregistered-model", trust_remote_code=False)
 
         assert result == ([], None)
         resolve_path.assert_not_called()
-        assert "No registered PipelineConfig resolved" in caplog.text
-        assert "deploy_config" in caplog.text
+        warning.assert_called_once()
+        assert "No registered PipelineConfig resolved" in warning.call_args.args[0]
+        assert "deploy_config" in warning.call_args.args[0]
+
+    def test_revision_reaches_legacy_and_typed_diffusion_views(self, mocker: MockerFixture):
+        """The shared resolver must keep Hub revision aligned across consumers."""
+
+        class FakeConfig:
+            model_type = "wan2_2_ti2v"
+
+        get_config = mocker.patch(
+            "vllm_omni.config.config_factory.get_config",
+            return_value=FakeConfig(),
+        )
+        # Use a unique model id so this test cannot observe another test's
+        # cached discovery result.
+        model = "org/wan2-2-revision-views"
+        revision = "refs/pr/6701"
+        resolved = load_stage_config_views_from_model(
+            model,
+            trust_remote_code=False,
+            base_engine_args={"revision": revision},
+            deploy_config_path=get_deploy_config_path("wan2_2_ti2v.yaml"),
+        )
+
+        assert get_config.call_args.kwargs["revision"] == revision
+        legacy_stage = resolved.legacy_stage_by_id(0)
+        typed_stage = resolved.typed_stage_by_id(0)
+        assert legacy_stage.engine_args.revision == revision
+        assert typed_stage.diffusion_config.revision == revision
 
 
 class TestCumulativeStreamingCoercion:

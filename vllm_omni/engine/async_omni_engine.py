@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import janus
 import torch
-from omegaconf import OmegaConf
 from vllm import envs as vllm_envs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
@@ -82,13 +81,22 @@ from vllm_omni.engine.stage_runtime import (
 )
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import (
-    load_and_resolve_stage_configs,
+    ResolvedStageConfigs,
+    load_and_resolve_stage_config_views,
     parse_stage_overrides,
+)
+from vllm_omni.entrypoints.utils import (
+    load_and_resolve_stage_configs as _legacy_stage_config_resolver,
 )
 from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 
 logger = init_logger(__name__)
+
+# Kept as a module-level compatibility symbol for downstream tests and
+# integrations that patched the pre-Phase-3 resolver. Runtime startup uses the
+# typed view resolver below.
+load_and_resolve_stage_configs = _legacy_stage_config_resolver
 
 if TYPE_CHECKING:
     from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlClient
@@ -123,6 +131,7 @@ class AsyncOmniEngine:
     _enable_orch_monitor: bool = False
     # Lazily created by get_output_blocking_async().
     _output_drain_executor: concurrent.futures.ThreadPoolExecutor | None = None
+    vllm_omni_config: Any = None
 
     def __init__(
         self,
@@ -140,6 +149,12 @@ class AsyncOmniEngine:
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
+        # Keep the caller-selected model revision available at the public
+        # metadata boundary.  The typed resolver normally carries this value
+        # on the diffusion stage, but unregistered-model fallback and clients
+        # that query metadata before stage startup still need the original
+        # revision for class discovery.
+        self._model_revision = kwargs.get("revision")
         self.diffusion_batch_size = diffusion_batch_size
         # Cached by get_diffusion_od_config().
         self._diffusion_od_config_view: Any = None
@@ -194,19 +209,20 @@ class AsyncOmniEngine:
                 self._omni_master_port,
             )
 
-        # Stage resolution pops deploy_config, so get pipeline-wide settings beforehand.
+        # Resolve pipeline-wide metadata before stage resolution.  The typed
+        # resolver normally supplies the same values, but this early lookup is
+        # intentionally retained as a compatibility/fallback boundary for
+        # callers that override or mock stage resolution (and for deploy files
+        # that contain no registered stage pipeline).
         deploy_config_path = kwargs.get("deploy_config")
-        # ``trust_remote_code`` is tri-state (bool | None): ``None`` means "not
-        # specified" so stage-config resolution can defer to the deploy yaml's
-        # per-stage value (see ``with_trust_remote_code_override``). The
-        # restriction path below loads the top-level HF config via vLLM's
-        # ``get_config``, which needs a real bool, so collapse ``None`` to the
-        # default ``False`` here (#5495).
-        pipeline_config = StageConfigFactory.get_pipeline_config(
-            model=model,
-            trust_remote_code=bool(trust_remote_code),
-            deploy_config_path=deploy_config_path,
-        )
+        pipeline_lookup_kwargs = {
+            "model": model,
+            "trust_remote_code": bool(trust_remote_code),
+            "deploy_config_path": deploy_config_path,
+        }
+        if kwargs.get("revision") is not None:
+            pipeline_lookup_kwargs["revision"] = kwargs["revision"]
+        pipeline_config = StageConfigFactory.get_pipeline_config(**pipeline_lookup_kwargs)
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
         self._duplex_runtime_extension_path = (
             pipeline_config.duplex_runtime_extension if pipeline_config is not None else None
@@ -217,7 +233,22 @@ class AsyncOmniEngine:
         self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
         self.duplex_session_config = DuplexSessionRuntimeConfig()
         if deploy_config_path is not None:
-            self.duplex_session_config = load_deploy_config(deploy_config_path).duplex_session
+            # This is an early compatibility read used for endpoint/session
+            # metadata. Reuse the factory's bare-name lookup (``deploy/foo``)
+            # and let the canonical resolver remain the source of truth. A
+            # missing path is intentionally deferred so patched resolvers and
+            # the eventual typed resolution can decide how to handle it.
+            try:
+                # Keep the legacy module-level hook for integrations that
+                # patch it, then fall back to the factory's bare-name lookup.
+                early_deploy_config = load_deploy_config(deploy_config_path)
+            except FileNotFoundError:
+                try:
+                    early_deploy_config = StageConfigFactory._load_user_deploy_config(deploy_config_path)
+                except FileNotFoundError:
+                    early_deploy_config = None
+            if early_deploy_config is not None:
+                self.duplex_session_config = early_deploy_config.duplex_session
 
         # Tri-state: None means "not specified" — the deploy yaml's per-stage
         # trust_remote_code stays in effect. An explicit True/False here is a
@@ -229,6 +260,26 @@ class AsyncOmniEngine:
             kwargs,
             trust_remote_code=trust_remote_code,
         )
+
+        resolved = getattr(self, "_resolved_stage_configs", None)
+        resolved_pipeline_config = (
+            resolved.omni_config.pipeline_config if resolved is not None and resolved.omni_config is not None else None
+        )
+        if resolved_pipeline_config is not None:
+            pipeline_config = resolved_pipeline_config
+            self.endpoint_restrictions = pipeline_config.endpoint_restrictions
+        self._duplex_runtime_extension_path = (
+            pipeline_config.duplex_runtime_extension
+            if pipeline_config is not None
+            else self._duplex_runtime_extension_path
+        )
+        self.duplex_serving_adapter_path = (
+            pipeline_config.duplex_serving_adapter if pipeline_config is not None else self.duplex_serving_adapter_path
+        )
+        if pipeline_config is not None:
+            self._duplex_control_enabled = bool(pipeline_config.duplex_control_enabled)
+        if resolved is not None and resolved.deploy_config is not None:
+            self.duplex_session_config = resolved.deploy_config.duplex_session
 
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
@@ -293,19 +344,42 @@ class AsyncOmniEngine:
     def get_diffusion_od_config(self) -> Any:
         """Expose the diffusion ``model_class_name`` to client-side model-extras.
 
-        The worker holds the full config; here we just resolve the pipeline class
-        name from the model config (cached). ``model_class_name`` may be ``None``.
+        The worker holds the full config.  Reuse the already-resolved typed
+        diffusion stage when available so registry selection and the worker
+        cannot disagree (especially for revision-specific Hub files).  The
+        read-only fallback is retained for mocked/unregistered engines.
         """
-        if self._diffusion_od_config_view is None:
+        if getattr(self, "_diffusion_od_config_view", None) is None:
             from types import SimpleNamespace
 
             from vllm_omni.diffusion.data import resolve_model_class_name
             from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
-            model_class_name = resolve_model_class_name(self.model)
+            model_class_name = None
+            revision = getattr(self, "_model_revision", None)
+            # ``VllmOmniDiffusionStageConfig`` owns the canonical class name;
+            # avoid importing the concrete class here to keep this lightweight
+            # metadata API usable by tests and out-of-process clients.
+            omni_config = getattr(self, "vllm_omni_config", None)
+            for stage in getattr(omni_config, "stage_configs", ()):
+                diffusion_config = getattr(stage, "diffusion_config", None)
+                if diffusion_config is None:
+                    continue
+                model_class_name = getattr(diffusion_config, "model_class_name", None)
+                revision = getattr(diffusion_config, "revision", None) or revision
+                if model_class_name is not None:
+                    break
+
+            if model_class_name is None:
+                if revision is None:
+                    model_class_name = resolve_model_class_name(self.model)
+                else:
+                    model_class_name = resolve_model_class_name(self.model, revision=revision)
             metadata = get_diffusion_model_metadata(model_class_name)
             self._diffusion_od_config_view = SimpleNamespace(
+                model=self.model,
                 model_class_name=model_class_name,
+                revision=revision,
                 supports_multimodal_inputs=metadata.supports_multimodal_inputs,
                 max_multimodal_image_inputs=metadata.max_multimodal_image_inputs,
                 supports_mixed_reference_inputs=metadata.supports_mixed_reference_inputs,
@@ -314,8 +388,16 @@ class AsyncOmniEngine:
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors via StageRuntime and assign to self."""
+        resolved = getattr(self, "_resolved_stage_configs", None)
+        typed_topology_stage_configs = (
+            resolved.typed_topology()
+            if isinstance(resolved, ResolvedStageConfigs)
+            else tuple(getattr(getattr(self, "vllm_omni_config", None), "stage_configs", ()))
+        )
         self._runtime = create_stage_runtime(
             stage_configs=self.stage_configs,
+            omni_config=self.vllm_omni_config,
+            typed_topology_stage_configs=typed_topology_stage_configs,
             model=self.model,
             config_path=self.config_path,
             single_stage_mode=self.single_stage_mode,
@@ -1025,7 +1107,13 @@ class AsyncOmniEngine:
                 default_sampling_params = None
         if not isinstance(default_sampling_params, dict):
             default_sampling_params = None
-        stage_default_sampling_params = default_sampling_params.get("0", {}) if default_sampling_params else {}
+        if default_sampling_params:
+            # The top-level CLI historically accepts a stage-indexed mapping,
+            # while ``--stage-overrides`` supplies the stage's sampling mapping
+            # directly.  Accept both forms at the fallback boundary.
+            stage_default_sampling_params = default_sampling_params.get("0", default_sampling_params)
+        else:
+            stage_default_sampling_params = {}
         if normalized_kwargs.get("dtype") is None:
             normalized_kwargs["dtype"] = "auto"
 
@@ -1091,10 +1179,21 @@ class AsyncOmniEngine:
         num_gpus = normalized_kwargs.get("num_gpus")
         if num_gpus is not None:
             num_gpus = int(num_gpus)
+            if num_gpus < 1:
+                raise ValueError(f"num_gpus must be >= 1, got {num_gpus}")
+            # The unregistered single-stage fallback has historically
+            # materialized its device layout before creating the legacy stage.
+            # Keep that behavior (including WORLD-derived DP) while the
+            # registered-pipeline typed path defers the same validation to the
+            # terminal OmniDiffusionConfig consumer.
             parallel_config.resolve_data_parallel_size(num_gpus)
 
         num_devices = max(1, int(parallel_config.world_size))
-        devices = ",".join(str(i) for i in range(num_devices))
+        devices = normalized_kwargs.get("devices")
+        if devices is None:
+            devices = ",".join(str(i) for i in range(num_devices))
+        elif isinstance(devices, (list, tuple)):
+            devices = ",".join(str(device) for device in devices)
         model_class_name = kwargs.get("model_class_name", None)
         final_output_type = get_diffusion_output_type(model_class_name)
 
@@ -1165,6 +1264,14 @@ class AsyncOmniEngine:
             "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
             "worker_extension_cls": kwargs.get("worker_extension_cls", None),
             "trust_remote_code": (False if kwargs.get("trust_remote_code") is None else kwargs["trust_remote_code"]),
+            # Keep the revision on the fallback stage as well as on the
+            # registered typed path.  Once a Hub id is resolved to a local
+            # snapshot, the diffusion consumer can no longer recover a
+            # caller-supplied revision, so dropping it here changes which
+            # checkpoint is loaded.
+            "revision": kwargs.get("revision"),
+            "tokenizer_revision": kwargs.get("tokenizer_revision"),
+            "code_revision": kwargs.get("code_revision"),
             "distributed_executor_backend": kwargs.get("distributed_executor_backend"),
             "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
             "enable_prompt_embed_cache": kwargs.get("enable_prompt_embed_cache", False),
@@ -1172,14 +1279,17 @@ class AsyncOmniEngine:
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
-            "quantization_config": kwargs.get("quantization_config", None),
+            "quantization_config": kwargs.get("diffusion_quantization_config") or kwargs.get("quantization_config"),
             "diffusion_kv_cache_dtype": kwargs.get("diffusion_kv_cache_dtype", None),
             "diffusion_kv_cache_skip_steps": kwargs.get("diffusion_kv_cache_skip_steps", None),
             "diffusion_kv_cache_skip_layers": kwargs.get("diffusion_kv_cache_skip_layers", None),
             **({"diffusion_attention_config": attention_config} if attention_config is not None else {}),
             "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
-            "streaming_output": kwargs.get("diffusion_streaming_output", False),
+            "streaming_output": kwargs.get(
+                "streaming_output",
+                kwargs.get("diffusion_streaming_output", False),
+            ),
             "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
             "extras": extras,
             **(
@@ -1204,14 +1314,19 @@ class AsyncOmniEngine:
         if kwargs.get("diffusers_call_kwargs") is not None:
             stage_engine_args["diffusers_call_kwargs"] = kwargs["diffusers_call_kwargs"]
 
+        runtime = {
+            "process": True,
+            "devices": devices,
+        }
+        for runtime_field in ("num_replicas", "env"):
+            if normalized_kwargs.get(runtime_field) is not None:
+                runtime[runtime_field] = normalized_kwargs[runtime_field]
+
         default_stage_cfg = [
             {
                 "stage_id": 0,
                 "stage_type": "diffusion",
-                "runtime": {
-                    "process": True,
-                    "devices": devices,
-                },
+                "runtime": runtime,
                 "engine_args": stage_engine_args,
                 "engine_input_source": [],
                 "default_sampling_params": stage_default_sampling_params,
@@ -1257,7 +1372,7 @@ class AsyncOmniEngine:
         kwargs: dict[str, Any],
         *,
         trust_remote_code: bool | None,
-    ) -> tuple[str, list[Any]]:
+    ) -> tuple[str | None, list[Any]]:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
         for legacy_arg in ("stage_configs_path", "stage_configs"):
@@ -1272,35 +1387,75 @@ class AsyncOmniEngine:
         stage_overrides = parse_stage_overrides(stage_overrides_json)
 
         # Unregistered diffusion checkpoints use the single-stage fallback
-        # below instead of StageConfigFactory, so fold stage-0 model extras
-        # into the fallback's input as well.  Registered pipelines still get
-        # the complete override mapping through load_and_resolve_stage_configs.
-        default_stage_kwargs = kwargs
-        stage_zero_overrides = (stage_overrides or {}).get("0", {})
-        if "extras" in stage_zero_overrides:
-            override_extras = stage_zero_overrides["extras"]
-            if not isinstance(override_extras, Mapping):
+        # below instead of StageConfigFactory, so fold the complete stage-0
+        # override mapping into the fallback's input as well. Registered
+        # pipelines receive the same mapping through the factory below.
+        default_stage_kwargs = dict(kwargs)
+        stage_zero_overrides: dict[str, Any] = {}
+        if stage_overrides:
+            if not isinstance(stage_overrides, Mapping):
+                raise TypeError("--stage-overrides must be a mapping keyed by stage id")
+            # JSON produces string keys, while Python callers often use integer
+            # stage ids.  Merge both spellings deterministically, with the
+            # JSON-compatible string key taking precedence when both exist.
+            for stage_key in (0, "0"):
+                raw_overrides = stage_overrides.get(stage_key)
+                if raw_overrides is None:
+                    continue
+                if not isinstance(raw_overrides, Mapping):
+                    raise TypeError("stage 0 overrides must be a mapping")
+                stage_zero_overrides.update(raw_overrides)
+
+        if stage_zero_overrides:
+            default_stage_kwargs.update(stage_zero_overrides)
+            base_extras = kwargs.get("extras")
+            override_extras = stage_zero_overrides.get("extras")
+            if base_extras is not None and not isinstance(base_extras, Mapping):
+                raise TypeError("global extras must be a mapping")
+            if override_extras is not None and not isinstance(override_extras, Mapping):
                 raise TypeError("stage 0 extras must be a mapping")
-            default_stage_kwargs = {
-                **kwargs,
-                "extras": {
-                    **(kwargs.get("extras") or {}),
-                    **override_extras,
-                },
-            }
+            if base_extras is not None or override_extras is not None:
+                # Keep nested model-specific extras from the global API while
+                # allowing a stage override to replace only one leaf.
+                def merge_extras(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
+                    merged = copy.deepcopy(dict(base))
+                    for key, value in overlay.items():
+                        old_value = merged.get(key)
+                        if isinstance(old_value, Mapping) and isinstance(value, Mapping):
+                            merged[key] = merge_extras(old_value, value)
+                        else:
+                            merged[key] = copy.deepcopy(value)
+                    return merged
+
+                default_stage_kwargs["extras"] = merge_extras(base_extras or {}, override_extras or {})
+
+            # The typed projection owns the canonical names.  Normalize the
+            # two legacy spellings here because the fallback bypasses the
+            # registered pipeline alias normalizer.
+            if "streaming_output" in stage_zero_overrides:
+                default_stage_kwargs["diffusion_streaming_output"] = stage_zero_overrides["streaming_output"]
+            if (
+                "diffusion_quantization_config" in stage_zero_overrides
+                and "quantization_config" not in stage_zero_overrides
+            ):
+                default_stage_kwargs["quantization_config"] = stage_zero_overrides["diffusion_quantization_config"]
 
         def create_default_stage_config() -> list:
             fallback_kwargs = dict(default_stage_kwargs)
             if not fallback_kwargs.get("model_class_name"):
-                model_class_name = resolve_model_class_name(
-                    model,
-                    fallback_kwargs.get("diffusion_load_format", "default"),
-                )
+                diffusion_load_format = fallback_kwargs.get("diffusion_load_format", "default")
+                resolve_kwargs: dict[str, Any] = {}
+                # Keep the historical two-argument call shape when no
+                # revision was supplied; integrations commonly monkeypatch
+                # this read-only helper with that signature.
+                if fallback_kwargs.get("revision") is not None:
+                    resolve_kwargs["revision"] = fallback_kwargs["revision"]
+                model_class_name = resolve_model_class_name(model, diffusion_load_format, **resolve_kwargs)
                 if model_class_name is not None:
                     fallback_kwargs["model_class_name"] = model_class_name
             return self._create_default_diffusion_stage_cfg(fallback_kwargs)
 
-        config_path, stage_configs, strategy_lb_policy = load_and_resolve_stage_configs(
+        resolved: ResolvedStageConfigs = load_and_resolve_stage_config_views(
             model,
             kwargs,
             trust_remote_code=trust_remote_code,
@@ -1309,105 +1464,14 @@ class AsyncOmniEngine:
             stage_overrides=stage_overrides,
             strategy_config_path=strategy_config_path,
         )
+        self.vllm_omni_config = resolved.omni_config
+        self._resolved_stage_configs = resolved
 
         # A strategy.yaml may derive a pipeline-wide load-balancer policy. It is
         # an orchestrator-level knob (read once at construction), so apply it here
         # rather than as a per-stage config field.
-        self._apply_strategy_lb_policy(strategy_lb_policy, kwargs)
-
-        # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
-        for cfg in stage_configs:
-            try:
-                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
-                    cfg.engine_args = OmegaConf.create({})
-                global_sleep_mode = kwargs.get("enable_sleep_mode")
-                if global_sleep_mode is not None:
-                    if not hasattr(cfg.engine_args, "enable_sleep_mode") or cfg.engine_args.enable_sleep_mode is None:
-                        cfg.engine_args.enable_sleep_mode = global_sleep_mode
-                if getattr(cfg, "stage_type", None) != "diffusion":
-                    continue
-                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
-                    cfg.engine_args = OmegaConf.create({})
-                additional_config = kwargs.get("additional_config")
-                if additional_config is not None:
-                    current_additional_config = getattr(cfg.engine_args, "additional_config", None)
-                    if current_additional_config in (None, {}):
-                        cfg.engine_args.additional_config = additional_config
-                if kwargs.get("lora_path") is not None:
-                    if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
-                        cfg.engine_args.lora_path = kwargs["lora_path"]
-                lora_scale = kwargs.get("lora_scale")
-                if lora_scale is None:
-                    # Backwards compatibility for older callers.
-                    lora_scale = kwargs.get("static_lora_scale")
-                if lora_scale is not None:
-                    if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
-                        cfg.engine_args.lora_scale = lora_scale
-                if kwargs.get("lora_backend") is not None:
-                    if not hasattr(cfg.engine_args, "lora_backend") or cfg.engine_args.lora_backend is None:
-                        cfg.engine_args.lora_backend = kwargs["lora_backend"]
-                if (
-                    kwargs.get("diffusion_attention_config") is not None
-                    or kwargs.get("diffusion_attention_backend") is not None
-                    or kwargs.get("fastvideo_vsa_topk") is not None
-                ):
-                    has_stage_attention = (
-                        hasattr(cfg.engine_args, "diffusion_attention_config")
-                        and cfg.engine_args.diffusion_attention_config is not None
-                    )
-                    if not has_stage_attention:
-                        cfg.engine_args.diffusion_attention_config = parse_attention_config(
-                            kwargs.get("diffusion_attention_config"),
-                            attention_backend=kwargs.get("diffusion_attention_backend"),
-                            fastvideo_vsa_topk=kwargs.get("fastvideo_vsa_topk"),
-                        )
-                quantization_config = kwargs.get("diffusion_quantization_config") or kwargs.get("quantization_config")
-                if quantization_config is not None:
-                    if (
-                        not hasattr(cfg.engine_args, "quantization_config")
-                        or cfg.engine_args.quantization_config is None
-                    ):
-                        cfg.engine_args.quantization_config = quantization_config
-                # Inject profiler flags for diffusion stages
-                for profiler_key in (
-                    "enable_diffusion_pipeline_profiler",
-                    "enable_ar_profiler",
-                ):
-                    val = kwargs.get(profiler_key)
-                    if val:
-                        if not hasattr(cfg.engine_args, profiler_key) or not getattr(
-                            cfg.engine_args, profiler_key, False
-                        ):
-                            setattr(cfg.engine_args, profiler_key, val)
-                quantization = kwargs.get("quantization")
-                if quantization is not None:
-                    if not hasattr(cfg.engine_args, "quantization") or cfg.engine_args.quantization is None:
-                        cfg.engine_args.quantization = quantization
-                diffusion_kv_cache_dtype = kwargs.get("diffusion_kv_cache_dtype")
-                if diffusion_kv_cache_dtype is not None:
-                    if (
-                        not hasattr(cfg.engine_args, "diffusion_kv_cache_dtype")
-                        or cfg.engine_args.diffusion_kv_cache_dtype is None
-                    ):
-                        cfg.engine_args.diffusion_kv_cache_dtype = diffusion_kv_cache_dtype
-                diffusion_kv_cache_skip_steps = kwargs.get("diffusion_kv_cache_skip_steps")
-                if diffusion_kv_cache_skip_steps is not None:
-                    if (
-                        not hasattr(cfg.engine_args, "diffusion_kv_cache_skip_steps")
-                        or cfg.engine_args.diffusion_kv_cache_skip_steps is None
-                    ):
-                        cfg.engine_args.diffusion_kv_cache_skip_steps = diffusion_kv_cache_skip_steps
-                diffusion_kv_cache_skip_layers = kwargs.get("diffusion_kv_cache_skip_layers")
-                if diffusion_kv_cache_skip_layers is not None:
-                    if (
-                        not hasattr(cfg.engine_args, "diffusion_kv_cache_skip_layers")
-                        or cfg.engine_args.diffusion_kv_cache_skip_layers is None
-                    ):
-                        cfg.engine_args.diffusion_kv_cache_skip_layers = diffusion_kv_cache_skip_layers
-            except Exception as e:
-                logger.warning("Failed to inject LoRA config for stage: %s", e)
-
-        return config_path, stage_configs
+        self._apply_strategy_lb_policy(resolved.omni_lb_policy, kwargs)
+        return resolved.config_path, resolved.stage_configs
 
     # ==================== Public API ====================
 

@@ -145,7 +145,12 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-def load_transformer_config(model_path: str, subfolder: str = "transformer", local_files_only: bool = True) -> dict:
+def load_transformer_config(
+    model_path: str,
+    subfolder: str = "transformer",
+    local_files_only: bool = True,
+    revision: str | None = None,
+) -> dict:
     """Load transformer config from model directory or HF Hub."""
     if local_files_only:
         config_path = os.path.join(model_path, subfolder, "config.json")
@@ -157,10 +162,13 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
         try:
             from huggingface_hub import hf_hub_download
 
-            config_path = hf_hub_download(
-                repo_id=model_path,
-                filename=f"{subfolder}/config.json",
-            )
+            download_kwargs = {
+                "repo_id": model_path,
+                "filename": f"{subfolder}/config.json",
+            }
+            if revision is not None:
+                download_kwargs["revision"] = revision
+            config_path = hf_hub_download(**download_kwargs)
             with open(config_path) as f:
                 return json.load(f)
         except Exception:
@@ -334,6 +342,7 @@ class Wan22Pipeline(
 
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
+        revision = getattr(od_config, "revision", None)
 
         model = od_config.model
         local_files_only = os.path.exists(model)
@@ -357,7 +366,10 @@ class Wan22Pipeline(
             try:
                 from huggingface_hub import hf_hub_download
 
-                model_index_path = hf_hub_download(repo_id=model, filename="model_index.json")
+                download_kwargs = {"repo_id": model, "filename": "model_index.json"}
+                if revision is not None:
+                    download_kwargs["revision"] = revision
+                model_index_path = hf_hub_download(**download_kwargs)
                 with open(model_index_path) as f:
                     model_index = json.load(f)
                     self.expand_timesteps = model_index.get("expand_timesteps", False)
@@ -386,7 +398,7 @@ class Wan22Pipeline(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=od_config.model,
                     subfolder="transformer",
-                    revision=None,
+                    revision=revision,
                     prefix="transformer.",
                     fall_back_to_pt=True,
                 )
@@ -396,7 +408,7 @@ class Wan22Pipeline(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=od_config.model,
                     subfolder="transformer_2",
-                    revision=None,
+                    revision=revision,
                     prefix="transformer_2.",
                     fall_back_to_pt=True,
                 )
@@ -408,7 +420,10 @@ class Wan22Pipeline(
             model,
             component_subfolders,
             local_files_only=local_files_only,
+            revision=revision,
         )
+
+        revision_kwargs = {"revision": revision} if revision is not None else {}
 
         # ``from_pretrained_with_prefetch`` re-prefetches and retries if the
         # cache is still half-written (the missing-shard ``OSError`` and the
@@ -420,6 +435,7 @@ class Wan22Pipeline(
             subfolder="tokenizer",
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
+            **revision_kwargs,
         )
         self.text_encoder = from_pretrained_with_prefetch(
             UMT5EncoderModel.from_pretrained,
@@ -428,6 +444,7 @@ class Wan22Pipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
+            **revision_kwargs,
         ).to(self.device)
         self.vae = from_pretrained_with_prefetch(
             DistributedAutoencoderKLWan.from_pretrained,
@@ -436,17 +453,28 @@ class Wan22Pipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
+            **revision_kwargs,
         ).to(self.device)
 
         # Initialize transformers with correct config (weights loaded via load_weights)
         if load_transformer:
-            transformer_config = load_transformer_config(model, "transformer", local_files_only)
+            transformer_config = load_transformer_config(
+                model,
+                "transformer",
+                local_files_only,
+                revision=revision,
+            )
             self.transformer = self._create_transformer(transformer_config)
         else:
             self.transformer = None
 
         if load_transformer_2:
-            transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
+            transformer_2_config = load_transformer_config(
+                model,
+                "transformer_2",
+                local_files_only,
+                revision=revision,
+            )
             self.transformer_2 = self._create_transformer(transformer_2_config)
         else:
             self.transformer_2 = None

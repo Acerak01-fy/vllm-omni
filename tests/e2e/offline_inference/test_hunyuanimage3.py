@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: E501
 from collections.abc import Generator
 
@@ -7,6 +10,7 @@ import torch.nn.functional as F
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
+from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
@@ -16,7 +20,7 @@ from vllm_omni.platforms import current_omni_platform
 PROMPT = "A brown and white dog is running on the grass"
 MODEL_NAME = "tencent/HunyuanImage-3.0"
 LOCAL_CLIP_PATH = "openai/clip-vit-base-patch32"
-DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image3.yaml")
+DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image_3_moe.yaml")
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
 
@@ -330,6 +334,7 @@ def _generate_image(omni: Omni, use_system_prompt: str | None) -> Image.Image:
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 8, reason="Need at least 8 CUDA GPUs for this test.")
 @pytest.mark.parametrize("system_prompt_name,use_system_prompt,expected_embedding", SYSTEM_PROMPT_CASES)
+@hardware_test(res={"cuda": "H100"}, num_cards=8)
 def test_system_prompt_scores(
     omni: Omni,
     clip_bundle: tuple[CLIPModel, CLIPProcessor],

@@ -15,6 +15,14 @@ from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 
 from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
 from vllm_omni.config import config_factory as config_factory_module
+from vllm_omni.config.composable_parallel import (
+    Broadcast,
+    FanInByStage,
+    MeshAxisSpec,
+    RouteByStage,
+    StrategySpec,
+    TakeRank,
+)
 from vllm_omni.config.config_factory import StageConfigFactory, _materialize_object_storage_configs
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.omni_config import VllmOmniConfig
@@ -612,6 +620,75 @@ class TestPipelineDiscovery:
         assert OMNI_PIPELINES.get("definitely_not_a_real_model") is None
         assert resolve_pipeline_config("definitely_not_a_real_model") is None
 
+    def test_pipeline_discovery_is_revision_aware(self, clean_pipeline_registry, monkeypatch):
+        """A pinned Hub revision must shape both discovery and its cache key."""
+        pipeline_key = "revision_aware_pipeline"
+        pipeline = PipelineConfig(model_type=pipeline_key)
+        register_pipeline(pipeline)
+        observed_revisions: list[str | None] = []
+
+        class FakeConfig(PretrainedConfig):
+            model_type = pipeline_key
+
+        def fake_get_config(_model, *, trust_remote_code, **kwargs):
+            assert trust_remote_code is False
+            observed_revisions.append(kwargs.get("revision"))
+            return FakeConfig()
+
+        monkeypatch.setattr(config_factory_module, "get_config", fake_get_config)
+        StageConfigFactory.get_hf_config.cache_clear()
+        StageConfigFactory.try_infer_model_type.cache_clear()
+
+        first = StageConfigFactory.get_pipeline_config(
+            "org/revision-aware",
+            trust_remote_code=False,
+            revision="refs/pr/41",
+        )
+        second = StageConfigFactory.get_pipeline_config(
+            "org/revision-aware",
+            trust_remote_code=False,
+            revision="refs/pr/42",
+        )
+
+        assert first is pipeline
+        assert second is pipeline
+        assert observed_revisions == ["refs/pr/41", "refs/pr/42"]
+
+    def test_diffusers_model_index_discovery_preserves_revision(self, clean_pipeline_registry, monkeypatch):
+        """The config-less Diffusers fallback must read the requested revision."""
+        pipeline = PipelineConfig(
+            model_type="revision_diffusers_pipeline",
+            diffusers_class_name="RevisionPipeline",
+        )
+        register_pipeline(pipeline)
+        observed: list[tuple[str, str | None]] = []
+
+        def fail_get_config(*_args, **_kwargs):
+            raise ValueError("custom config parser unavailable")
+
+        def fake_get_hf_file_to_dict(filename, _model, *, revision):
+            observed.append((filename, revision))
+            if filename == "model_index.json":
+                return {"_class_name": "RevisionPipeline"}
+            return None
+
+        monkeypatch.setattr(config_factory_module, "get_config", fail_get_config)
+        monkeypatch.setattr(config_factory_module, "get_hf_file_to_dict", fake_get_hf_file_to_dict)
+        StageConfigFactory.get_hf_config.cache_clear()
+        StageConfigFactory.try_infer_model_type.cache_clear()
+
+        resolved = StageConfigFactory.get_pipeline_config(
+            "org/revision-diffusers",
+            trust_remote_code=False,
+            revision="refs/pr/99",
+        )
+
+        assert resolved is pipeline
+        assert observed == [
+            ("config.json", "refs/pr/99"),
+            ("model_index.json", "refs/pr/99"),
+        ]
+
     def test_pipeline_config_supports_hf_architectures(self):
         """PipelineConfig accepts hf_architectures for HF-arch fallback
         (replaces the old _ARCHITECTURE_MODELS dict)."""
@@ -1049,6 +1126,138 @@ class TestPipelineRegistration:
         assert len(legacy_configs) == 1
         assert legacy_configs[0].yaml_engine_args["model_arch"] == "DeployOnlyArch"
 
+    def test_shared_resolver_aligns_effective_stage_views(self, clean_pipeline_registry, monkeypatch, tmp_path):
+        from vllm_omni.config import omni_config as omni_config_module
+        from vllm_omni.config import stage_config as stage_config_module
+
+        pipeline_key = "shared_stage_views"
+        pipeline = PipelineConfig(
+            model_type=pipeline_key,
+            model_arch="SharedViewsModel",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="ar",
+                    execution_type=StageExecutionType.LLM_AR,
+                ),
+                StagePipelineConfig(
+                    stage_id=1,
+                    model_stage="generation",
+                    execution_type=StageExecutionType.LLM_GENERATION,
+                    input_sources=(0,),
+                ),
+                StagePipelineConfig(
+                    stage_id=2,
+                    model_stage="dit",
+                    execution_type=StageExecutionType.DIFFUSION,
+                    input_sources=(1,),
+                    final_output=True,
+                    final_output_type="image",
+                    model_arch="SharedViewsDiT",
+                ),
+            ),
+        )
+        register_pipeline(pipeline)
+        deploy_path = tmp_path / "shared_views.yaml"
+        deploy_path.write_text(
+            f"pipeline: {pipeline_key}\n"
+            "async_chunk: false\n"
+            "stages:\n"
+            "  - stage_id: 0\n"
+            "    runtime:\n"
+            '      devices: "0"\n'
+            "  - stage_id: 1\n"
+            "    runtime:\n"
+            '      devices: "1"\n'
+            "  - stage_id: 2\n"
+            "    runtime:\n"
+            '      devices: "2,3"\n'
+            "      env:\n"
+            "        BASE_ENV: base\n"
+            "platforms:\n"
+            "  cpu:\n"
+            "    stages:\n"
+            "      - stage_id: 2\n"
+            "        engine_args: {}\n"
+            "        runtime:\n"
+            '          devices: "4,5"\n'
+            "          env:\n"
+            "            PLATFORM_ENV: cpu\n",
+            encoding="utf-8",
+        )
+
+        # Standalone builders retain their own platform resolution. In the
+        # shared path only the factory receives a deploy with an unmaterialized
+        # platform block; both downstream views receive effective copies.
+        apply_platform_overrides = stage_config_module._apply_platform_overrides
+        platform_block_seen: list[bool] = []
+
+        def tracked_platform_overrides(deploy, platform=None):
+            platform_block_seen.append(deploy.platforms is not None)
+            return apply_platform_overrides(deploy, platform)
+
+        monkeypatch.setattr(config_factory_module, "_apply_platform_overrides", tracked_platform_overrides)
+        monkeypatch.setattr(stage_config_module, "_apply_platform_overrides", tracked_platform_overrides)
+        monkeypatch.setattr(omni_config_module, "_apply_platform_overrides", tracked_platform_overrides)
+
+        tp = StrategySpec("tp", MeshAxisSpec("tp", 2), Broadcast(), TakeRank())
+        stage_replica = StrategySpec(
+            "stage_replica",
+            MeshAxisSpec("stage_replica", 2),
+            RouteByStage("round_robin"),
+            FanInByStage(),
+        )
+
+        class FakeConfig(PretrainedConfig):
+            model_type = "unregistered"
+
+        with patch("vllm_omni.config.config_factory.get_config", return_value=FakeConfig()):
+            resolved = StageConfigFactory.create_config_views_from_model(
+                "fake/model",
+                trust_remote_code=False,
+                cli_overrides={
+                    "stage_0_max_num_seqs": 7,
+                    "num_gpus": 8,
+                    "stage_2_num_gpus": 4,
+                    "stage_2_diffusion_quantization_config": "fp8",
+                },
+                deploy_config_path=str(deploy_path),
+                strategy_specs={"dit": [tp, stage_replica]},
+            )
+
+        assert resolved.omni_config is not None
+        assert resolved.legacy_stage_configs is not None
+        typed_stages = resolved.omni_config.stage_configs
+        legacy_stages = resolved.legacy_stage_configs
+        assert [(stage.stage_id, StageType(stage.stage_type), stage.model_stage) for stage in typed_stages] == [
+            (stage.stage_id, StageType(stage.stage_type), stage.model_stage) for stage in legacy_stages
+        ]
+        assert [stage.worker_type for stage in legacy_stages[:2]] == ["ar", "generation"]
+        assert legacy_stages[0].to_omegaconf().engine_args.max_num_seqs == 7
+        assert all("num_gpus" not in stage.to_omegaconf().engine_args for stage in legacy_stages[:2])
+        assert [stage.runtime_config.num_gpus for stage in typed_stages[:2]] == [
+            stage.parallel_config.world_size for stage in typed_stages[:2]
+        ]
+
+        typed_dit = resolved.omni_config.stage_by_id(2)
+        legacy_dit = legacy_stages[2].to_omegaconf()
+        assert typed_dit.runtime_config.devices == legacy_dit.runtime.devices == "4,5"
+        assert (
+            typed_dit.runtime_config.env
+            == legacy_dit.runtime.env
+            == {
+                "BASE_ENV": "base",
+                "PLATFORM_ENV": "cpu",
+            }
+        )
+        assert typed_dit.runtime_config.num_replicas == legacy_dit.runtime.num_replicas == 2
+        assert typed_dit.parallel_config.tensor_parallel_size == legacy_dit.engine_args.tensor_parallel_size == 2
+        assert typed_dit.runtime_config.num_gpus == legacy_dit.engine_args.num_gpus == 4
+        assert typed_dit.quantization_config == legacy_dit.engine_args.quantization_config == "fp8"
+        assert resolved.omni_lb_policy == "round-robin"
+        assert resolved.deploy_config is not None and resolved.deploy_config.platforms is not None
+        assert platform_block_seen == [True, False, False]
+
     def test_structured_path_loads_explicit_deploy_config_once(self, clean_pipeline_registry, tmp_path):
         pipeline_key = "single_load_pipeline"
         register_pipeline(PipelineConfig(model_type=pipeline_key))
@@ -1474,6 +1683,89 @@ stages:
 
         with pytest.raises(ValueError, match="stage_1_text_encoder_tp_size cannot be set"):
             normalize_pipeline_cli_overrides(pipeline, {"stage_1_text_encoder_tp_size": 4})
+
+    def test_resolve_user_deploy_path_adds_yaml_suffix_for_bare_name(self):
+        resolved = StageConfigFactory._resolve_user_deploy_path("dreamzero_tp1_cfg2")
+
+        assert resolved == _DEPLOY_DIR / "dreamzero_tp1_cfg2.yaml"
+
+    def test_diffusion_only_cli_values_route_to_diffusion_stages(self):
+        pipeline = PipelineConfig(
+            model_type="mixed_diffusion_cli",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="ar",
+                    execution_type=StageExecutionType.LLM_AR,
+                ),
+                StagePipelineConfig(
+                    stage_id=1,
+                    model_stage="dit",
+                    execution_type=StageExecutionType.DIFFUSION,
+                    input_sources=(0,),
+                    final_output=True,
+                    final_output_type="image",
+                ),
+            ),
+        )
+
+        normalized = normalize_pipeline_cli_overrides(
+            pipeline,
+            {
+                "diffusion_streaming_output": False,
+                "auxiliary_text_encoder": "/models/llama",
+                "cache_backend": "cache_dit",
+                "diffusion_quantization_config": "fp8",
+                "stage_1_cache_backend": "tea_cache",
+            },
+        )
+
+        assert normalized == {
+            "stage_1_streaming_output": False,
+            "stage_1_auxiliary_text_encoder": "/models/llama",
+            "stage_1_cache_backend": "tea_cache",
+            "stage_1_diffusion_quantization_config": "fp8",
+        }
+
+    def test_diffusion_only_cli_values_are_dropped_without_diffusion_stage(self):
+        pipeline = PipelineConfig(
+            model_type="llm_only_cli",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="ar",
+                    execution_type=StageExecutionType.LLM_AR,
+                    final_output=True,
+                ),
+            ),
+        )
+
+        assert (
+            normalize_pipeline_cli_overrides(
+                pipeline,
+                {
+                    "diffusion_streaming_output": True,
+                    "cache_backend": "cache_dit",
+                    "model_class_name": "DiffusionPipeline",
+                },
+            )
+            == {}
+        )
+
+    def test_shared_sleep_mode_override_reaches_all_stage_views(self):
+        pipeline = OMNI_PIPELINES["hunyuan_image_3_moe"]
+
+        legacy_stages, _ = StageConfigFactory._create_legacy_from_registry(
+            pipeline,
+            {"enable_sleep_mode": True},
+        )
+        assert all(stage.to_omegaconf().engine_args.get("enable_sleep_mode") is True for stage in legacy_stages)
+
+        typed = VllmOmniConfig.from_pipeline_config(
+            pipeline,
+            cli_overrides={"model": "hy3", "enable_sleep_mode": True},
+        )
+        assert all(stage.model_config.enable_sleep_mode is True for stage in typed.stage_configs)
 
     @pytest.mark.parametrize(
         ("config_json", "model_index", "expected_pipeline"),

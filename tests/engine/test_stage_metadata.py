@@ -1,10 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import copy
 import operator
 
 import pytest
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.omni_config import OmniStageRuntimeConfig, VllmOmniConfig
 from vllm_omni.config.stage_config import (
     DeployConfig,
     PipelineConfig,
@@ -17,13 +20,14 @@ from vllm_omni.engine.stage_init_utils import (
     extract_legacy_stage_metadata,
     extract_stage_metadata,
     extract_stage_metadata_from_omni_stage_config,
+    setup_stage_devices,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _metadata_inputs() -> tuple[PipelineConfig, DeployConfig]:
+def _metadata_inputs(*, diffusion_requires_multimodal_data: bool = False) -> tuple[PipelineConfig, DeployConfig]:
     pipeline = PipelineConfig(
         model_type="metadata-test",
         stages=(
@@ -53,6 +57,7 @@ def _metadata_inputs() -> tuple[PipelineConfig, DeployConfig]:
                 input_sources=(1,),
                 final_output=True,
                 final_output_type="image",
+                requires_multimodal_data=diffusion_requires_multimodal_data,
                 custom_process_input_func="operator.neg",
                 cfg_kv_collect_func="operator.concat",
             ),
@@ -158,6 +163,35 @@ def test_extract_stage_metadata_preserves_legacy_one_argument_api():
     assert metadata.stage_id == 0
     assert metadata.model_stage == "thinker"
     assert metadata.custom_process_input_func is operator.add
+
+
+def test_extract_typed_diffusion_metadata_preserves_multimodal_requirement():
+    """Typed DiT metadata must retain topology-owned multimodal forwarding."""
+    pipeline, deploy = _metadata_inputs(diffusion_requires_multimodal_data=True)
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=copy.deepcopy(deploy),
+    )
+
+    metadata = extract_stage_metadata_from_omni_stage_config(omni_config.stage_by_id(2))
+
+    assert metadata.stage_type == "diffusion"
+    assert metadata.requires_multimodal_data is True
+
+
+def test_setup_stage_devices_accepts_typed_runtime_config(monkeypatch):
+    """Typed diffusion startup must use the same device setup helper."""
+    captured: dict[str, object] = {}
+
+    def capture(stage_id, devices):
+        captured.update(stage_id=stage_id, devices=devices)
+        return devices
+
+    monkeypatch.setattr("vllm_omni.engine.stage_init_utils.set_stage_devices", capture)
+
+    setup_stage_devices(2, OmniStageRuntimeConfig(devices="3,4"))
+
+    assert captured == {"stage_id": 2, "devices": "3,4"}
 
 
 def test_extract_stage_metadata_defaults_missing_engine_input_source():

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import os
 from collections.abc import Mapping
 from functools import lru_cache
@@ -26,17 +29,19 @@ def get_diffusion_model_index(
     return None
 
 
-def load_diffusers_config(model_name) -> dict:
+def load_diffusers_config(model_name, *, revision: str | None = None) -> dict:
     from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 
-    config = DiffusionPipeline.load_config(model_name)
+    load_kwargs = {"revision": revision} if revision is not None else {}
+    config = DiffusionPipeline.load_config(model_name, **load_kwargs)
     return config
 
 
-def _looks_like_bagel(model_name: str) -> bool:
+def _looks_like_bagel(model_name: str, *, revision: str | None = None) -> bool:
     """Best-effort detection for Bagel (non-diffusers) diffusion models."""
     try:
-        cfg = get_hf_file_to_dict("config.json", model_name)
+        file_kwargs = {"revision": revision} if revision is not None else {}
+        cfg = get_hf_file_to_dict("config.json", model_name, **file_kwargs)
         model_type = cfg.get("model_type")
         if model_type == "bagel":
             return True
@@ -46,10 +51,11 @@ def _looks_like_bagel(model_name: str) -> bool:
         return False
 
 
-def _looks_like_dreamzero(model_name: str) -> bool:
+def _looks_like_dreamzero(model_name: str, *, revision: str | None = None) -> bool:
     """Best-effort detection for DreamZero-style VLA diffusion checkpoints."""
     try:
-        cfg = get_hf_file_to_dict("config.json", model_name)
+        file_kwargs = {"revision": revision} if revision is not None else {}
+        cfg = get_hf_file_to_dict("config.json", model_name, **file_kwargs)
         if cfg.get("model_type") != "vla":
             return False
         action_head_cfg = cfg.get("action_head_cfg") or {}
@@ -77,14 +83,20 @@ HIDREAM_O1_SIGNATURE_WEIGHTS = (
 )
 
 
-def _looks_like_hidream_o1(model_name: str, config: Mapping | None = None) -> bool:
+def _looks_like_hidream_o1(
+    model_name: str,
+    config: Mapping | None = None,
+    *,
+    revision: str | None = None,
+) -> bool:
     """Detect HiDream-O1 without matching regular Qwen3-VL checkpoints."""
     try:
-        cfg = config if config is not None else get_hf_file_to_dict("config.json", model_name)
+        file_kwargs = {"revision": revision} if revision is not None else {}
+        cfg = config if config is not None else get_hf_file_to_dict("config.json", model_name, **file_kwargs)
         if not isinstance(cfg, Mapping) or cfg.get("model_type") != "qwen3_vl":
             return False
 
-        index = get_hf_file_to_dict("model.safetensors.index.json", model_name)
+        index = get_hf_file_to_dict("model.safetensors.index.json", model_name, **file_kwargs)
         if not isinstance(index, Mapping):
             return False
         weight_map = index.get("weight_map")
@@ -96,7 +108,7 @@ def _looks_like_hidream_o1(model_name: str, config: Mapping | None = None) -> bo
 
 
 @lru_cache
-def is_diffusion_model(model_name: str) -> bool:
+def is_diffusion_model(model_name: str, revision: str | None = None) -> bool:
     """Check if a model is a diffusion model.
 
     Uses multiple fallback strategies to detect diffusion models:
@@ -122,7 +134,10 @@ def is_diffusion_model(model_name: str) -> bool:
                 logger.debug("Failed to read local %s: %s", filename, e)
 
     # Strategy 2: Check using vllm's utility (works for both local and remote models)
-    config_dict = get_diffusion_model_index(model_name)
+    if revision is None:
+        config_dict = get_diffusion_model_index(model_name)
+    else:
+        config_dict = get_diffusion_model_index(model_name, revision=revision)
     if config_dict is not None and config_dict.get("_class_name") and config_dict.get("_diffusers_version"):
         logger.debug("Detected diffusion model via a standard Diffusers index")
         return True
@@ -131,7 +146,10 @@ def is_diffusion_model(model_name: str) -> bool:
     # This is last because it requires importing diffusers/xformers/flash_attn
     # which may have compatibility issues
     try:
-        load_diffusers_config(model_name)
+        if revision is None:
+            load_diffusers_config(model_name)
+        else:
+            load_diffusers_config(model_name, revision=revision)
         return True
     except (ImportError, ModuleNotFoundError) as e:
         logger.debug("Failed to import diffusers dependencies: %s", e)
@@ -139,4 +157,12 @@ def is_diffusion_model(model_name: str) -> bool:
     except Exception as e:
         logger.debug("Failed to load diffusers config via DiffusionPipeline: %s", e)
 
-    return _looks_like_bagel(model_name) or _looks_like_dreamzero(model_name) or _looks_like_hidream_o1(model_name)
+    if revision is None:
+        looks_like_bagel = _looks_like_bagel(model_name)
+        looks_like_dreamzero = _looks_like_dreamzero(model_name)
+        looks_like_hidream = _looks_like_hidream_o1(model_name)
+    else:
+        looks_like_bagel = _looks_like_bagel(model_name, revision=revision)
+        looks_like_dreamzero = _looks_like_dreamzero(model_name, revision=revision)
+        looks_like_hidream = _looks_like_hidream_o1(model_name, revision=revision)
+    return looks_like_bagel or looks_like_dreamzero or looks_like_hidream

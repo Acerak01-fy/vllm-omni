@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 from types import SimpleNamespace
@@ -58,6 +58,33 @@ def test_load_transformer_config_reads_local_subfolder_config(tmp_path) -> None:
 
     assert load_transformer_config(str(tmp_path), "transformer_2") == {"patch_size": [1, 2, 2], "num_layers": 2}
     assert load_transformer_config(str(tmp_path), "missing") == {}
+
+
+def test_load_transformer_config_passes_revision_for_hub_model(monkeypatch, tmp_path) -> None:
+    calls = []
+    config_path = tmp_path / "transformer" / "config.json"
+    config_path.parent.mkdir()
+    config_path.write_text(json.dumps({"model_type": "wan"}))
+
+    def fake_hf_hub_download(**kwargs):
+        calls.append(kwargs)
+        return str(config_path)
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_hf_hub_download)
+
+    assert load_transformer_config(
+        "org/wan22",
+        "transformer",
+        local_files_only=False,
+        revision="refs/pr/42",
+    ) == {"model_type": "wan"}
+    assert calls == [
+        {
+            "repo_id": "org/wan22",
+            "filename": "transformer/config.json",
+            "revision": "refs/pr/42",
+        }
+    ]
 
 
 def test_create_transformer_from_config_maps_supported_keys(monkeypatch) -> None:

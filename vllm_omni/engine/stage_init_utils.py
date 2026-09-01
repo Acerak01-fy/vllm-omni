@@ -76,6 +76,7 @@ class ReplicaInitPlan:
     stage_vllm_config: Any | None = None
     executor_class: type | None = None
     engine_args_dict: dict[str, Any] | None = None
+    omni_stage_config: BaseVllmOmniStageConfig | None = None
 
 
 @dataclass
@@ -398,6 +399,11 @@ def _tp_size_for_stage(stage_configs: Sequence[Any], stage_id: Any) -> int | Non
     for stage_cfg in stage_configs:
         if str(getattr(stage_cfg, "stage_id", None)) not in id_strs:
             continue
+        if isinstance(stage_cfg, BaseVllmOmniStageConfig):
+            try:
+                return max(1, int(stage_cfg.parallel_config.tensor_parallel_size))
+            except (TypeError, ValueError):
+                return 1
         engine_args = getattr(stage_cfg, "engine_args", None)
         if engine_args is None:
             return 1
@@ -522,19 +528,30 @@ def inject_omni_kv_connector_config(
     engine_args_dict: dict[str, Any],
     omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None],
     stage_id: int,
+    engine_input_source: Sequence[int] | None = None,
 ) -> None:
-    """Inject resolved connector config into a stage engine-args dict."""
+    """Inject resolved connector and stage identity into engine arguments.
+
+    The legacy stage-init path populated ``stage_id`` and
+    ``engine_input_source`` in a second mutation pass. Typed consumers build a
+    detached argument dictionary, so keep those identity fields in the same
+    helper and preserve existing user values with ``setdefault``.
+    """
     omni_conn_cfg, omni_from, omni_to = omni_kv_connector
-    if not omni_conn_cfg:
+    omni_kv = engine_args_dict.get("omni_kv_config")
+    if omni_kv is None and not omni_conn_cfg:
         return
 
-    omni_kv = engine_args_dict.get("omni_kv_config") or {}
+    omni_kv = omni_kv or {}
     if not isinstance(omni_kv, dict):
         omni_kv = dict(omni_kv)
-    omni_kv["connector_config"] = omni_conn_cfg
-    omni_kv["omni_from_stage"] = omni_from
-    omni_kv["omni_to_stage"] = omni_to
+    if omni_conn_cfg:
+        omni_kv["connector_config"] = omni_conn_cfg
+        omni_kv["omni_from_stage"] = omni_from
+        omni_kv["omni_to_stage"] = omni_to
     omni_kv.setdefault("stage_id", stage_id)
+    if engine_input_source is not None:
+        omni_kv.setdefault("engine_input_source", list(engine_input_source))
     engine_args_dict["omni_kv_config"] = omni_kv
 
 
@@ -699,12 +716,7 @@ def _resolve_omni_metadata_hook(path: str | None) -> Callable | None:
 def extract_stage_metadata_from_omni_stage_config(
     stage_config: BaseVllmOmniStageConfig,
 ) -> StageMetadata:
-    """Project one typed stage config into metadata for a future cutover.
-
-    This projection is not used by production startup yet. Current replica
-    layout, engine-argument, remote-diffusion, and platform setup paths still
-    require the legacy StageConfig/OmegaConf shape.
-    """
+    """Project one typed stage config into runtime metadata."""
     stage_type: Literal["llm", "diffusion"] = "diffusion" if stage_config.stage_type == StageType.DIFFUSION else "llm"
     sampling_params_cls = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
     sampling_params: OmniSamplingParams = sampling_params_cls(
@@ -718,7 +730,11 @@ def extract_stage_metadata_from_omni_stage_config(
             stage_type="diffusion",
             engine_output_type=None,
             is_comprehension=False,
-            requires_multimodal_data=False,
+            # Diffusion stages such as HY3's DiT consume the original image
+            # payload alongside AR-produced tokens.  Preserve the topology
+            # declaration instead of assuming every diffusion stage is text
+            # only; the legacy extractor remains unchanged for compatibility.
+            requires_multimodal_data=stage_config.requires_multimodal_data,
             engine_input_source=stage_config.input_sources,
             final_output=stage_config.final_output,
             final_output_type=stage_config.final_output_type,
@@ -817,7 +833,6 @@ def split_devices_for_replicas(
         # ``get_headless_replica_devices``. Returning a single-element list here
         # made callers index past the end for every replica after the first.
         return [None] * max(1, num_replicas)
-
     if num_replicas <= 1:
         return [devices_str]
 
@@ -884,6 +899,10 @@ def get_stage_devices_per_replica(stage_cfg: Any, engine_args: Any | None = None
     if engine_args is None:
         engine_args = getattr(stage_cfg, "engine_args", {})
     if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
+        num_gpus = _get_attr_or_item(engine_args, "num_gpus")
+        if num_gpus is not None:
+            return max(1, int(num_gpus))
+
         parallel_config = _get_attr_or_item(engine_args, "parallel_config")
         if parallel_config is None:
             return 1
@@ -966,7 +985,7 @@ def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
     """Device mapping via set_stage_devices for a single stage."""
     physical_devices = set_stage_devices(
         stage_id,
-        runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else None,
+        _get_attr_or_item(runtime_cfg, "devices"),
     )
     # Only log if we actually set the env vars in the stage
     if physical_devices:
@@ -1085,7 +1104,7 @@ def _project_omni_stage_engine_args(
         ),
         (
             stage_config.runtime_config,
-            frozenset({"devices", "num_replicas", "env", "num_gpus"}),
+            frozenset({"devices", "num_replicas", "env"}) | (frozenset() if is_diffusion else frozenset({"num_gpus"})),
         ),
     ):
         engine_args.update(
@@ -1140,10 +1159,14 @@ def _project_omni_stage_engine_args(
         engine_args["omni_kv_config"] = copy.deepcopy(connector_config.omni_kv_config)
 
     if is_diffusion:
+        parallel_excludes = {"world_size"}
+        explicit_parallel_fields = getattr(stage_config.parallel_config, "_omni_explicit_fields", frozenset())
+        if "data_parallel_size" not in explicit_parallel_fields:
+            parallel_excludes.add("data_parallel_size")
         engine_args["parallel_config"] = _project_omni_config_fields(
             stage_config.parallel_config,
             field_map={name: name for name in _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS},
-            exclude=frozenset({"world_size"}),
+            exclude=frozenset(parallel_excludes),
         )
     else:
         engine_args.update(
@@ -1329,13 +1352,7 @@ def build_engine_args_dict_from_omni_stage_config(
     stage_connector_spec: dict[str, Any] | None = None,
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
-    """Project one typed stage config into backend engine arguments.
-
-    This projection is prepared for the RFC #4021 stage-init cutover. Current
-    production startup reaches the legacy implementation through
-    ``build_engine_args_dict`` while strategy and startup-plan inputs still
-    use the legacy representation.
-    """
+    """Project one typed stage config into backend engine arguments."""
     engine_args_dict = _project_omni_stage_engine_args(stage_config)
     _apply_rocm_attention_backend(engine_args_dict, stage_config.stage_type)
     return _finalize_engine_args_dict(
@@ -1729,7 +1746,12 @@ def release_device_locks(lock_fds: list[int]) -> None:
             pass
 
 
-def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:
+def load_omni_transfer_config_for_model(
+    model: str,
+    config_path: str | None,
+    *,
+    revision: str | None = None,
+) -> Any:
     """Load omni transfer config from an explicit path or resolved model config.
 
     Resolves ``base_config`` inheritance (CI overlay → base deploy YAML) so
@@ -1739,7 +1761,14 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
     from vllm_omni.distributed.omni_connectors import load_omni_transfer_config
 
     try:
-        resolved_config_path = config_path or resolve_model_config_path(model)
+        if config_path is not None:
+            resolved_config_path = config_path
+        elif revision is None:
+            # Preserve the historical call shape for integrations that patch
+            # the ancillary path resolver with a model-only signature.
+            resolved_config_path = resolve_model_config_path(model)
+        else:
+            resolved_config_path = resolve_model_config_path(model, revision=revision)
         if resolved_config_path is None:
             return None
         from vllm_omni.config.stage_config import resolve_deploy_yaml
@@ -1781,12 +1810,85 @@ def build_diffusion_config(
     stage_cfg: Any,
     metadata: StageMetadata,
 ) -> Any:
-    """Build diffusion config for a stage."""
+    """Build diffusion config from the legacy compatibility representation."""
 
     engine_args_dict = build_engine_args_dict(stage_cfg, model)
     od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
 
-    num_devices_per_stage = od_config.parallel_config.world_size
+    _validate_diffusion_device_capacity(od_config, metadata.stage_id)
+    # Preserve the legacy adapter's terminal device projection. The typed
+    # Phase-3 builder intentionally leaves an explicit ``num_gpus`` untouched,
+    # but callers that still use this compatibility entry point expect the
+    # resolved parallel world size to become the terminal GPU count.
+    od_config.num_gpus = int(od_config.parallel_config.world_size)
+    if metadata.cfg_kv_collect_func is not None:
+        od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
+    return od_config
+
+
+def build_diffusion_engine_args_from_omni_stage_config(
+    stage_config: VllmOmniDiffusionStageConfig,
+    model: str,
+    *,
+    stage_connector_spec: dict[str, Any] | None = None,
+    omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None] = (None, None, None),
+    stage_configs: Sequence[BaseVllmOmniStageConfig] = (),
+) -> dict[str, Any]:
+    """Build and enrich detached diffusion engine args from the typed stage."""
+    if not isinstance(stage_config, VllmOmniDiffusionStageConfig):
+        raise TypeError(f"Diffusion startup requires VllmOmniDiffusionStageConfig, got {type(stage_config).__name__}")
+
+    engine_args_dict = build_engine_args_dict_from_omni_stage_config(
+        stage_config,
+        model,
+        stage_connector_spec=stage_connector_spec,
+    )
+    inject_omni_kv_connector_config(
+        engine_args_dict,
+        omni_kv_connector,
+        stage_config.stage_id,
+        engine_input_source=stage_config.input_sources,
+    )
+    _inject_inferred_kv_tp_topology(
+        engine_args_dict.get("omni_kv_config"),
+        stage_id=stage_config.stage_id,
+        stage_configs=stage_configs,
+        engine_input_source=stage_config.input_sources,
+    )
+    return engine_args_dict
+
+
+def build_diffusion_config_from_omni_stage_config(
+    model: str,
+    stage_config: VllmOmniDiffusionStageConfig,
+    metadata: StageMetadata,
+    *,
+    stage_connector_spec: dict[str, Any] | None = None,
+    omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None] = (None, None, None),
+    stage_configs: Sequence[BaseVllmOmniStageConfig] = (),
+) -> OmniDiffusionConfig:
+    """Materialize the terminal diffusion config from one typed stage."""
+    engine_args_dict = build_diffusion_engine_args_from_omni_stage_config(
+        stage_config,
+        model,
+        stage_connector_spec=stage_connector_spec,
+        omni_kv_connector=omni_kv_connector,
+        stage_configs=stage_configs,
+    )
+    od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
+    _validate_diffusion_device_capacity(od_config, metadata.stage_id)
+    if metadata.cfg_kv_collect_func is not None:
+        od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
+    return od_config
+
+
+def _validate_diffusion_device_capacity(
+    od_config: OmniDiffusionConfig,
+    stage_id: int,
+) -> None:
+    """Validate device availability without rewriting terminal topology."""
+    num_devices_per_stage = int(od_config.num_gpus or od_config.parallel_config.world_size)
+
     device_control_env = current_omni_platform.device_control_env_var
     visible_devices_str = os.environ.get(device_control_env) if device_control_env else None
     physical_devices: list[str | int]
@@ -1797,14 +1899,9 @@ def build_diffusion_config(
 
     if len(physical_devices) < num_devices_per_stage:
         raise ValueError(
-            f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
+            f"Stage {stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
             f"but {len(physical_devices)} device(s) are available: {physical_devices}"
         )
-
-    od_config.num_gpus = num_devices_per_stage
-    if metadata.cfg_kv_collect_func is not None:
-        od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
-    return od_config
 
 
 def initialize_diffusion_stage(
@@ -1831,6 +1928,32 @@ def initialize_diffusion_stage(
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
+    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
+
+
+def initialize_diffusion_stage_from_omni_stage_config(
+    model: str,
+    stage_config: VllmOmniDiffusionStageConfig,
+    metadata: StageMetadata,
+    stage_init_timeout: int,
+    *,
+    batch_size: int = 1,
+    use_inline: bool = False,
+    stage_connector_spec: dict[str, Any] | None = None,
+    omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None] = (None, None, None),
+    stage_configs: Sequence[BaseVllmOmniStageConfig] = (),
+) -> Any:
+    """Build a diffusion client from the typed stage representation."""
+    from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
+
+    od_config = build_diffusion_config_from_omni_stage_config(
+        model,
+        stage_config,
+        metadata,
+        stage_connector_spec=stage_connector_spec,
+        omni_kv_connector=omni_kv_connector,
+        stage_configs=stage_configs,
+    )
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
 
 

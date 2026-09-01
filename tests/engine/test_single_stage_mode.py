@@ -16,7 +16,15 @@ from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.stage_config import (
+    DeployConfig,
+    DuplexSessionRuntimeConfig,
+    PipelineConfig,
+    StageDeployConfig,
+    StageExecutionType,
+    StagePipelineConfig,
+)
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClientBase
 from vllm_omni.engine.stage_engine_startup import (
@@ -47,6 +55,34 @@ def _make_stage_cfg(stage_id: int, stage_type: str = "llm"):
             engine_output_type=None,
         ),
     )
+
+
+def _make_typed_diffusion_stage(
+    stage_id: int,
+    *,
+    devices: str = "0",
+    num_replicas: int = 1,
+) -> tuple[VllmOmniConfig, object]:
+    topology = StagePipelineConfig(
+        stage_id=stage_id,
+        model_stage="diffusion",
+        execution_type=StageExecutionType.DIFFUSION,
+        final_output=True,
+        final_output_type="image",
+        model_arch="TestDiffusion",
+    )
+    pipeline = PipelineConfig(
+        model_type=f"test_diffusion_{stage_id}",
+        model_arch="TestDiffusion",
+        stages=(topology,),
+    )
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=stage_id, devices=devices, num_replicas=num_replicas)])
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"model": "dummy-model"},
+    )
+    return omni_config, omni_config.stage_by_id(stage_id)
 
 
 def _make_llm_plan(
@@ -98,6 +134,7 @@ def _make_diffusion_plan(
     launch_mode: str,
 ) -> LogicalStageInitPlan:
     stage_cfg = _make_stage_cfg(stage_id, stage_type="diffusion")
+    _, typed_stage = _make_typed_diffusion_stage(stage_id)
     metadata = SimpleNamespace(
         stage_id=stage_id,
         stage_type="diffusion",
@@ -123,6 +160,7 @@ def _make_diffusion_plan(
                 metadata=metadata,
                 stage_connector_spec={},
                 omni_kv_connector=(None, None, None),
+                omni_stage_config=typed_stage,
             )
         ],
     )
@@ -569,11 +607,18 @@ class TestEndpointRestrictionsTrustRemoteCode:
 
 
 class TestSingleStageInitialization:
-    def _build_runtime(self, stage_cfgs: list[Any], *, stage_id_filter: int | None) -> DistStageRuntime:
+    def _build_runtime(
+        self,
+        stage_cfgs: list[Any],
+        *,
+        stage_id_filter: int | None,
+        omni_config: VllmOmniConfig | None = None,
+    ) -> DistStageRuntime:
         return DistStageRuntime(
             stage_configs=stage_cfgs,
             model="fake-model",
             config_path="/fake/stages.yaml",
+            omni_config=omni_config,
             stage_init_timeout=60,
             diffusion_batch_size=2,
             async_chunk=False,
@@ -745,7 +790,8 @@ class TestSingleStageInitialization:
 
         stage_cfg = _make_stage_cfg(0, stage_type="diffusion")
         stage_cfg.runtime.devices = "0,1"
-        runtime = self._build_runtime([stage_cfg], stage_id_filter=0)
+        omni_config, _ = _make_typed_diffusion_stage(0, devices="0,1", num_replicas=2)
+        runtime = self._build_runtime([stage_cfg], stage_id_filter=0, omni_config=omni_config)
 
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(
@@ -775,7 +821,8 @@ class TestSingleStageInitialization:
         replicas = stage_plans[0].replicas
         assert [replica.replica_id for replica in replicas] == [0, 1]
         assert [replica.stage_cfg.runtime.devices for replica in replicas] == ["0", "1"]
-        assert [replica.metadata.runtime_cfg for replica in replicas] == [{"devices": "0"}, {"devices": "1"}]
+        assert [replica.metadata.runtime_cfg.devices for replica in replicas] == ["0", "1"]
+        assert all(replica.omni_stage_config is not None for replica in replicas)
 
     def test_initialize_stages_calls_master_server_only_in_single_stage_mode(self, mocker: MockerFixture):
         import vllm_omni.engine.stage_runtime as runtime_mod
@@ -1142,7 +1189,10 @@ class TestSingleStageReplicaInitialization:
 
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
         od_config = SimpleNamespace(max_num_seqs=None, parallel_config=SimpleNamespace(world_size=1))
-        mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value=od_config)
+        mocker.patch(
+            "vllm_omni.engine.stage_engine_startup.build_diffusion_config_from_omni_stage_config",
+            return_value=od_config,
+        )
         mock_register = mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
             return_value=StageRegistrationResponse(
@@ -1278,7 +1328,10 @@ class TestSingleStageReplicaInitialization:
 
         mocker.patch.object(runtime_mod, "inject_kv_stage_info")
         od_config = SimpleNamespace(max_num_seqs=None, parallel_config=SimpleNamespace(world_size=1))
-        mocker.patch("vllm_omni.engine.stage_engine_startup.build_diffusion_config", return_value=od_config)
+        mocker.patch(
+            "vllm_omni.engine.stage_engine_startup.build_diffusion_config_from_omni_stage_config",
+            return_value=od_config,
+        )
         mocker.patch(
             "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
             return_value=StageRegistrationResponse(

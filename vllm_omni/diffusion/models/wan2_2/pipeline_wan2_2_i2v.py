@@ -204,6 +204,7 @@ class Wan22I2VPipeline(
 
         self.device = get_local_device()
         dtype = getattr(od_config, "dtype", torch.bfloat16)
+        revision = getattr(od_config, "revision", None)
 
         model = od_config.model
         local_files_only = os.path.exists(model)
@@ -213,7 +214,7 @@ class Wan22I2VPipeline(
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
                 subfolder="transformer",
-                revision=None,
+                revision=revision,
                 prefix="transformer.",
                 fall_back_to_pt=True,
             ),
@@ -233,7 +234,7 @@ class Wan22I2VPipeline(
                 DiffusersPipelineLoader.ComponentSource(
                     model_or_path=od_config.model,
                     subfolder="transformer_2",
-                    revision=None,
+                    revision=revision,
                     prefix="transformer_2.",
                     fall_back_to_pt=True,
                 )
@@ -250,7 +251,14 @@ class Wan22I2VPipeline(
         subfolders = ["tokenizer", "text_encoder", "vae"]
         if self.has_image_encoder:
             subfolders.extend(["image_processor", "image_encoder"])
-        prefetch_subfolders(model, subfolders, local_files_only=local_files_only)
+        prefetch_subfolders(
+            model,
+            subfolders,
+            local_files_only=local_files_only,
+            revision=revision,
+        )
+
+        revision_kwargs = {"revision": revision} if revision is not None else {}
 
         # Text encoder
         self.tokenizer = from_pretrained_with_prefetch(
@@ -259,6 +267,7 @@ class Wan22I2VPipeline(
             subfolder="tokenizer",
             prefetch_list=subfolders,
             local_files_only=local_files_only,
+            **revision_kwargs,
         )
         self.text_encoder = from_pretrained_with_prefetch(
             UMT5EncoderModel.from_pretrained,
@@ -267,6 +276,7 @@ class Wan22I2VPipeline(
             prefetch_list=subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
+            **revision_kwargs,
         ).to(self.device)
 
         if self.has_image_encoder:
@@ -276,6 +286,7 @@ class Wan22I2VPipeline(
                 subfolder="image_processor",
                 prefetch_list=subfolders,
                 local_files_only=local_files_only,
+                **revision_kwargs,
             )
             self.image_encoder = from_pretrained_with_prefetch(
                 CLIPVisionModel.from_pretrained,
@@ -284,6 +295,7 @@ class Wan22I2VPipeline(
                 prefetch_list=subfolders,
                 local_files_only=local_files_only,
                 torch_dtype=dtype,
+                **revision_kwargs,
             ).to(self.device)
         else:
             self.image_processor = None
@@ -297,17 +309,28 @@ class Wan22I2VPipeline(
             prefetch_list=subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
+            **revision_kwargs,
         ).to(self.device)
 
         # Transformers (weights loaded via load_weights)
         # Load config from model directory or HF Hub to get correct in_channels for I2V models
-        transformer_config = load_transformer_config(model, "transformer", local_files_only)
+        transformer_config = load_transformer_config(
+            model,
+            "transformer",
+            local_files_only,
+            revision=revision,
+        )
         self.transformer = create_transformer_from_config(
             transformer_config,
             quant_config=od_config.quantization_config,
         )
         if self.has_transformer_2:
-            transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
+            transformer_2_config = load_transformer_config(
+                model,
+                "transformer_2",
+                local_files_only,
+                revision=revision,
+            )
             t2_quant = transformer_2_config.get("quantization_config")
             if isinstance(t2_quant, dict) and "quant_method" in t2_quant:
                 from vllm_omni.quantization.factory import build_quant_config

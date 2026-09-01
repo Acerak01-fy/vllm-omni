@@ -10,7 +10,7 @@ import dataclasses
 import os
 import socket
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from multiprocessing import connection
 from types import SimpleNamespace
@@ -33,18 +33,28 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.executor import Executor
 
+from vllm_omni.config.omni_config import (
+    BaseVllmOmniStageConfig,
+    VllmOmniDiffusionStageConfig,
+)
 from vllm_omni.distributed.omni_connectors.utils import initialization
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.stage_init_utils import (
     acquire_device_locks,
-    build_diffusion_config,
-    initialize_diffusion_stage,
+    build_diffusion_config_from_omni_stage_config,
+    initialize_diffusion_stage_from_omni_stage_config,
     release_device_locks,
 )
-from vllm_omni.entrypoints.utils import inject_omni_kv_config
+from vllm_omni.engine.stage_init_utils import (
+    build_diffusion_config as _legacy_build_diffusion_config,
+)
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+# Compatibility symbol for callers that imported the pre-Phase-3 builder.
+# Diffusion startup below intentionally uses the typed builder.
+build_diffusion_config = _legacy_build_diffusion_config
 
 StageRoute = tuple[int, int]
 
@@ -1323,7 +1333,10 @@ def launch_headless_diffusion_replica(
     *,
     model: str,
     od_config: Any,
-    stage_config: Any,
+    legacy_registration_config: Any | None = None,
+    # Keep accepting the pre-PR9 keyword while the registration protocol still
+    # carries the compatibility StageConfig payload.
+    stage_config: Any | None = None,
     stage_id: int,
     omni_master_address: str,
     omni_master_port: int,
@@ -1334,11 +1347,16 @@ def launch_headless_diffusion_replica(
     Headless diffusion follows the LLM remote-attach model: the head binds
     handshake/input/output sockets, while this backend process only connects.
     """
+    if legacy_registration_config is None:
+        legacy_registration_config = stage_config
+    if legacy_registration_config is None:
+        raise TypeError("headless diffusion registration requires a legacy stage config payload")
+
     response = register_stage_with_omni_master(
         omni_master_address=omni_master_address,
         omni_master_port=omni_master_port,
         omni_stage_id=stage_id,
-        omni_stage_config=stage_config,
+        omni_stage_config=legacy_registration_config,
         replica_id=None,
         replica_bind_address=replica_bind_address,
     )
@@ -1476,8 +1494,12 @@ def launch_headless_replica_group(
 def launch_headless_diffusion_replicas(
     *,
     model: str,
-    stage_cfg: Any,
-    stage_configs: list[Any],
+    stage_config: VllmOmniDiffusionStageConfig | None = None,
+    legacy_registration_config: Any | None = None,
+    # ``stage_cfg`` was the old name for the registration payload. It remains
+    # an input alias, but the actual diffusion consumer must be typed.
+    stage_cfg: Any | None = None,
+    stage_configs: list[BaseVllmOmniStageConfig] | tuple[BaseVllmOmniStageConfig, ...] = (),
     stage_id: int,
     omni_master_address: str,
     omni_master_port: int,
@@ -1487,23 +1509,45 @@ def launch_headless_diffusion_replicas(
     replica_bind_address: str | None = None,
 ) -> None:
     """Prepare diffusion config, launch replicas, monitor, and clean up."""
-    omni_transfer_config = stage_init_utils.load_omni_transfer_config_for_model(model, config_path)
+    if stage_config is None and isinstance(stage_cfg, VllmOmniDiffusionStageConfig):
+        stage_config = stage_cfg
+    if legacy_registration_config is None:
+        legacy_registration_config = stage_cfg
+    if legacy_registration_config is None:
+        legacy_registration_config = stage_config
+    if not isinstance(stage_config, VllmOmniDiffusionStageConfig):
+        raise TypeError("headless diffusion startup requires VllmOmniDiffusionStageConfig")
+    if legacy_registration_config is None:
+        raise TypeError("headless diffusion registration requires a legacy stage config payload")
+
+    revision = getattr(getattr(stage_config, "diffusion_config", None), "revision", None)
+    if revision is None:
+        omni_transfer_config = stage_init_utils.load_omni_transfer_config_for_model(model, config_path)
+    else:
+        omni_transfer_config = stage_init_utils.load_omni_transfer_config_for_model(
+            model,
+            config_path,
+            revision=revision,
+        )
     omni_conn_cfg, omni_from, omni_to = initialization.resolve_omni_kv_config_for_stage(
         omni_transfer_config,
         stage_id,
     )
 
-    # Headless diffusion startup and its downstream helpers still consume the
-    # legacy StageConfig shape; switch this with the coordinated RFC #4021
-    # stage-init cutover.
-    metadata = stage_init_utils.extract_legacy_stage_metadata(stage_cfg)
-    if omni_conn_cfg:
-        inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
-    # Headless single-stage launch must still infer cross-stage TP topology
-    # from the loaded deploy config so heterogeneous KV routing keys match the
-    # head process (e.g. from_tp=2, to_tp=1).
-    stage_init_utils.inject_kv_stage_info(stage_cfg, stage_id, stage_configs)
-    od_config = stage_init_utils.build_diffusion_config(model, stage_cfg, metadata)
+    metadata = stage_init_utils.extract_stage_metadata_from_omni_stage_config(stage_config)
+    stage_connector_spec = stage_init_utils.get_stage_connector_spec(
+        omni_transfer_config=omni_transfer_config,
+        stage_id=stage_id,
+        async_chunk=stage_config.connector_config.async_chunk,
+    )
+    od_config = stage_init_utils.build_diffusion_config_from_omni_stage_config(
+        model,
+        stage_config,
+        metadata,
+        stage_connector_spec=stage_connector_spec,
+        omni_kv_connector=(omni_conn_cfg, omni_from, omni_to),
+        stage_configs=stage_configs,
+    )
 
     logger.info(
         "[Headless] Launching %d diffusion replica(s) for stage %d via OmniMasterServer at %s:%d",
@@ -1524,7 +1568,7 @@ def launch_headless_diffusion_replicas(
         return launch_headless_diffusion_replica(
             model=model,
             od_config=od_config,
-            stage_config=stage_cfg,
+            legacy_registration_config=legacy_registration_config,
             stage_id=stage_id,
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
@@ -1543,8 +1587,12 @@ def launch_headless_diffusion_replicas(
 def launch_diffusion_stage_replica(
     *,
     model: str,
-    stage_config: Any,
+    stage_config: VllmOmniDiffusionStageConfig,
+    legacy_registration_config: Any,
     metadata: Any,
+    stage_connector_spec: dict[str, Any] | None,
+    omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None],
+    stage_configs: Sequence[BaseVllmOmniStageConfig],
     stage_init_timeout: int,
     batch_size: int,
     use_inline: bool,
@@ -1554,26 +1602,35 @@ def launch_diffusion_stage_replica(
 ) -> tuple[Any, StageReplicaResources]:
     """Launch a local diffusion stage replica.
 
-    Colocated mode delegates to ``initialize_diffusion_stage``. Distributed
+    Colocated mode delegates to typed diffusion initialization. Distributed
     local mode registers with ``OmniMasterServer`` and spawns a
     ``StageDiffusionProc`` that heartbeats to ``OmniCoordinator``.
     """
     if omni_master_server is None:
-        client = initialize_diffusion_stage(
-            metadata.stage_id,
+        client = initialize_diffusion_stage_from_omni_stage_config(
             model,
             stage_config,
             metadata,
             stage_init_timeout=stage_init_timeout,
             batch_size=batch_size,
             use_inline=use_inline,
+            stage_connector_spec=stage_connector_spec,
+            omni_kv_connector=omni_kv_connector,
+            stage_configs=stage_configs,
         )
         return client, StageReplicaResources()
 
     from vllm_omni.diffusion import stage_diffusion_proc
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
-    od_config = build_diffusion_config(model, stage_config, metadata)
+    od_config = build_diffusion_config_from_omni_stage_config(
+        model,
+        stage_config,
+        metadata,
+        stage_connector_spec=stage_connector_spec,
+        omni_kv_connector=omni_kv_connector,
+        stage_configs=stage_configs,
+    )
     parallel_config = getattr(od_config, "parallel_config", None)
     world_size = getattr(parallel_config, "world_size", 1)
     try:
@@ -1591,7 +1648,7 @@ def launch_diffusion_stage_replica(
             omni_master_address=omni_master_server.address,
             omni_master_port=omni_master_server.port,
             omni_stage_id=metadata.stage_id,
-            omni_stage_config=stage_config,
+            omni_stage_config=legacy_registration_config,
             replica_id=replica_id,
         )
         omni_master_server.release_route_port_reservations(

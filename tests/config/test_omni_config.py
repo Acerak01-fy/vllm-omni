@@ -45,12 +45,16 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
+    StagePipelineConfig,
     load_deploy_config,
     merge_pipeline_deploy,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
-from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
+from vllm_omni.engine.stage_init_utils import (
+    build_engine_args_dict_from_omni_stage_config,
+    build_legacy_engine_args_dict,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -90,6 +94,139 @@ def _from_pipeline_key(
         deploy_config_path=deploy_config_path,
         cli_overrides=cli_overrides,
     )
+
+
+def test_qwen3_omni_full_pipeline_keeps_all_consumers_on_llm_views() -> None:
+    pipeline = _resolve_pipeline_or_skip("qwen3_omni_moe", Qwen3OmniMoeConfig(enable_audio_output=True))
+    omni_config = VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides={"model": "qwen3-omni"})
+
+    assert [type(stage).__name__ for stage in omni_config.stage_configs] == [
+        "VllmOmniARStageConfig",
+        "VllmOmniARStageConfig",
+        "VllmOmniGenerationStageConfig",
+    ]
+    assert all(stage.stage_type != StageExecutionType.DIFFUSION for stage in omni_config.stage_configs)
+    assert [stage.stage_id for stage in omni_config.stage_configs] == [0, 1, 2]
+
+
+def test_wan22_default_deploy_is_consumed_by_typed_diffusion_stage() -> None:
+    omni_config = _from_pipeline_key("wan2_2_ti2v", cli_overrides={"model": "wan22"})
+    stage = omni_config.stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.model_config.model_arch == "WanPipeline"
+    assert stage.diffusion_config.model_class_name == "WanPipeline"
+    assert stage.diffusion_config.vae_use_tiling is True
+    assert stage.scheduler_config.max_num_seqs == 4
+    assert stage.runtime_config.devices == "0"
+    assert stage.runtime_config.num_gpus == 1
+    assert stage.diffusion_config.revision is None
+    # HiDream's auxiliary encoder settings are model-private and must not be
+    # injected into unrelated diffusion stages.
+    assert stage.diffusion_config.extras == {}
+
+
+def test_hidream_diffusion_projection_keeps_model_specific_defaults() -> None:
+    topology = StagePipelineConfig(
+        stage_id=0,
+        model_stage="dit",
+        execution_type=StageExecutionType.DIFFUSION,
+        final_output=True,
+        final_output_type="image",
+        model_arch="HiDreamImagePipeline",
+    )
+    pipeline = PipelineConfig(
+        model_type="hidream_projection_test",
+        model_arch="HiDreamImagePipeline",
+        stages=(topology,),
+    )
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, devices="0")])
+
+    stage = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"model": "hidream-checkpoint"},
+    ).stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.diffusion_config.extras["auxiliary_text_encoder"] is None
+    assert stage.diffusion_config.extras["default_llama_model_id"] == ("meta-llama/Meta-Llama-3.1-8B-Instruct")
+
+
+def test_hunyuan_image3_dit_only_consumes_typed_parallel_and_sampling_config() -> None:
+    omni_config = _from_pipeline_key("hunyuan_image3_dit", cli_overrides={"model": "hy3-dit"})
+    stage = omni_config.stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.model_stage == "dit"
+    assert stage.input_sources == []
+    assert stage.runtime_config.devices == "0,1,2,3"
+    assert stage.runtime_config.num_gpus == 4
+    assert stage.parallel_config.tensor_parallel_size == 4
+    assert stage.parallel_config.enable_expert_parallel is True
+    assert stage.model_config.default_sampling_params == {"seed": 42}
+
+
+def test_hunyuan_image3_ar_dit_keeps_ar_legacy_and_dit_typed() -> None:
+    omni_config = _from_pipeline_key(
+        "hunyuan_image_3_moe",
+        cli_overrides={
+            "model": "hy3-mixed",
+            "diffusion_streaming_output": True,
+            "auxiliary_text_encoder": "/models/llama",
+        },
+    )
+    ar_stage = omni_config.stage_by_id(0)
+    dit_stage = omni_config.stage_by_id(1)
+
+    assert isinstance(ar_stage, VllmOmniARStageConfig)
+    assert isinstance(dit_stage, VllmOmniDiffusionStageConfig)
+    assert ar_stage.model_stage == "AR"
+    assert dit_stage.model_stage == "dit"
+    assert dit_stage.input_sources == [0]
+    assert dit_stage.runtime_config.devices == "2,3"
+    assert dit_stage.runtime_config.num_gpus == 2
+    assert dit_stage.parallel_config.tensor_parallel_size == 2
+    assert dit_stage.parallel_config.enable_expert_parallel is True
+    assert dit_stage.connector_config.input_connectors == {"from_stage_0": "rdma_connector"}
+    assert dit_stage.connector_config.omni_kv_config["need_recv_cache"] is True
+    assert dit_stage.diffusion_config.streaming_output is True
+    assert dit_stage.diffusion_config.extras["auxiliary_text_encoder"] == "/models/llama"
+    assert "auxiliary_text_encoder" not in ar_stage.model_config.__dict__
+
+
+def test_global_num_gpus_routes_only_to_typed_dit_in_mixed_pipeline() -> None:
+    omni_config = _from_pipeline_key(
+        "hunyuan_image_3_moe",
+        cli_overrides={"model": "hy3-mixed", "num_gpus": 8},
+    )
+    ar_stage = omni_config.stage_by_id(0)
+    dit_stage = omni_config.stage_by_id(1)
+
+    assert ar_stage.runtime_config.num_gpus == ar_stage.parallel_config.world_size == 2
+    assert dit_stage.runtime_config.num_gpus == 8
+
+
+def test_typed_diffusion_projection_preserves_revision_family() -> None:
+    omni_config = _from_pipeline_key(
+        "wan2_2_ti2v",
+        cli_overrides={
+            "model": "wan22",
+            "revision": "model-rev",
+            "tokenizer_revision": "tokenizer-rev",
+            "code_revision": "code-rev",
+        },
+    )
+    stage = omni_config.stage_by_id(0)
+
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.diffusion_config.revision == "model-rev"
+    assert stage.model_config.tokenizer_revision == "tokenizer-rev"
+    assert stage.model_config.code_revision == "code-rev"
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, "wan22")
+    assert engine_args["revision"] == "model-rev"
+    assert engine_args["tokenizer_revision"] == "tokenizer-rev"
+    assert engine_args["code_revision"] == "code-rev"
 
 
 def test_minimax_h3_text_encoder_tp_targets_only_structured_stage_zero() -> None:
@@ -347,17 +484,31 @@ def test_runtime_num_gpus_is_derived_from_parallel_world_size():
     assert stage.runtime_config.num_gpus == 4
 
 
-def test_runtime_num_gpus_ignores_stale_runtime_override():
+def test_diffusion_runtime_preserves_explicit_num_gpus_for_terminal_dp_resolution():
     omni_config = _from_pipeline_key(
-        "hunyuan_image3_dit",
+        "hunyuan_video_15",
         cli_overrides={
-            "stage_0_num_gpus": 1,
+            "stage_0_num_gpus": 8,
         },
     )
     stage = omni_config.stage_by_id(0)
 
-    assert stage.parallel_config.world_size == 4
-    assert stage.runtime_config.num_gpus == 4
+    assert stage.parallel_config.world_size == 1
+    assert stage.parallel_config.data_parallel_size == 1
+    assert "data_parallel_size" not in stage.parallel_config._omni_explicit_fields
+    assert stage.runtime_config.num_gpus == 8
+    engine_args = build_engine_args_dict_from_omni_stage_config(stage, "/tmp")
+    assert engine_args["num_gpus"] == 8
+    assert "data_parallel_size" not in engine_args["parallel_config"]
+
+
+def test_diffusion_quantization_cli_alias_maps_to_structured_owner():
+    stage = _from_pipeline_key(
+        "hunyuan_image3_dit",
+        cli_overrides={"diffusion_quantization_config": "fp8"},
+    ).stage_by_id(0)
+
+    assert stage.quantization_config == "fp8"
 
 
 def test_from_pipeline_config_does_not_route_server_cli_keys_to_diffusion_stage():

@@ -656,7 +656,8 @@ def resolve_model_class_name(
 
     from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
 
-    if _looks_like_hidream_o1(model, cfg):
+    hidream_kwargs = {"revision": revision} if revision is not None else {}
+    if _looks_like_hidream_o1(model, cfg, **hidream_kwargs):
         return "HiDreamO1ImagePipeline"
     if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
         return "BagelPipeline"
@@ -682,7 +683,11 @@ def resolve_model_class_name(
     if model_type == "vla":
         from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
-        return "DreamZeroPipeline" if _looks_like_dreamzero(model) else None
+        if revision is None:
+            looks_like_dreamzero = _looks_like_dreamzero(model)
+        else:
+            looks_like_dreamzero = _looks_like_dreamzero(model, revision=revision)
+        return "DreamZeroPipeline" if looks_like_dreamzero else None
     if len(architectures) == 1:
         return architectures[0]
     return None
@@ -1415,7 +1420,14 @@ class OmniDiffusionConfig:
                 from vllm_omni.diffusion.utils.hf_utils import _looks_like_hidream_o1
 
                 assert self.model is not None
-                is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg)
+                # ``cfg`` was loaded from ``self.revision`` above, but the
+                # HiDream signature check reads the weight index separately.
+                # Keep that lookup on the same revision so a non-default
+                # checkpoint cannot be classified using another commit's
+                # index. Preserve the historical call shape when no revision
+                # is pinned for integrations that provide a narrow detector.
+                hidream_kwargs = {"revision": self.revision} if self.revision is not None else {}
+                is_hidream_o1 = _looks_like_hidream_o1(self.model, cfg, **hidream_kwargs)
                 if self.model_class_name == "HiDreamO1ImagePipeline" and not is_hidream_o1:
                     raise ValueError(f"Checkpoint {self.model} does not have the HiDream-O1 signature")
 
@@ -1473,7 +1485,11 @@ class OmniDiffusionConfig:
                     from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
                     assert self.model is not None
-                    if _looks_like_dreamzero(self.model):
+                    if self.revision is None:
+                        looks_like_dreamzero = _looks_like_dreamzero(self.model)
+                    else:
+                        looks_like_dreamzero = _looks_like_dreamzero(self.model, revision=self.revision)
+                    if looks_like_dreamzero:
                         self.model_class_name = "DreamZeroPipeline"
                         self.set_tf_model_config(TransformerConfig())
                         self.update_multimodal_support()

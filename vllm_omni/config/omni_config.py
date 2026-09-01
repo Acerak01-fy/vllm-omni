@@ -329,6 +329,28 @@ def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dic
     return result
 
 
+def _diffusion_stage_cli_overrides(
+    stage_id: int,
+    cli_overrides: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Add diffusion-only aliases excluded from generic stage CLI routing."""
+    result = _stage_cli_overrides(stage_id, cli_overrides)
+
+    stage_num_gpus = cli_overrides.get(f"stage_{stage_id}_num_gpus")
+    global_num_gpus = cli_overrides.get("num_gpus")
+    if stage_num_gpus is not None or global_num_gpus is not None:
+        result["num_gpus"] = stage_num_gpus if stage_num_gpus is not None else global_num_gpus
+
+    diffusion_quantization = cli_overrides.get(
+        f"stage_{stage_id}_diffusion_quantization_config",
+        cli_overrides.get("diffusion_quantization_config"),
+    )
+    if diffusion_quantization is not None and result.get("quantization_config") is None:
+        result["quantization_config"] = _copy_value(diffusion_quantization)
+    result.pop("diffusion_quantization_config", None)
+    return result
+
+
 def _resolve_deploy_path(deploy_config_path: str) -> Path:
     deploy_path = Path(deploy_config_path)
     if not deploy_path.exists() and deploy_path.parent == Path("."):
@@ -985,7 +1007,19 @@ _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS = frozenset(
         "static_lora_scale",
     }
 )
-_DIFFUSION_STAGE_ENGINE_FIELDS = (_DIFFUSION_CONFIG_FIELDS | _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS) - {
+# These are legacy top-level EngineArgs spellings for model-specific values
+# that OmniDiffusionConfig intentionally stores under ``extras``.  Keep them
+# explicit here so the typed owner can preserve the old API without pretending
+# they are generic diffusion fields.
+_DIFFUSION_EXTRA_ENGINE_FIELDS = frozenset(
+    {
+        "auxiliary_text_encoder",
+        "default_llama_model_id",
+    }
+)
+_DIFFUSION_STAGE_ENGINE_FIELDS = (
+    _DIFFUSION_CONFIG_FIELDS | _DIFFUSION_BACKCOMPAT_ENGINE_FIELDS | _DIFFUSION_EXTRA_ENGINE_FIELDS
+) - {
     "model",
     "stage_id",
 }
@@ -1208,6 +1242,10 @@ def _stage_engine_values(
         engine["omni_kv_config"] = _copy_value(topology.omni_kv_config)
     if stage_cli_overrides:
         engine.update(_copy_value(stage_cli_overrides))
+    if topology.execution_type == StageExecutionType.DIFFUSION:
+        diffusion_quantization = engine.pop("diffusion_quantization_config", None)
+        if diffusion_quantization is not None and engine.get("quantization_config") is None:
+            engine["quantization_config"] = diffusion_quantization
     _validate_stage_engine_override_ownership(
         topology.stage_id,
         topology.execution_type,
@@ -1754,7 +1792,8 @@ def _build_runtime_config(
         kwargs["num_replicas"] = stage_deploy.num_replicas
     if "env" not in kwargs and stage_deploy is not None and stage_deploy.env is not None:
         kwargs["env"] = _copy_value(stage_deploy.env)
-    kwargs["num_gpus"] = parallel_config.world_size
+    if "num_gpus" not in kwargs:
+        kwargs["num_gpus"] = parallel_config.world_size
     return OmniStageRuntimeConfig(**kwargs)
 
 
@@ -1815,6 +1854,26 @@ def _build_diffusion_config_projection(
     if quantization_config is not None:
         diffusion_kwargs["quantization_config"] = _copy_value(quantization_config)
 
+    # HiDream historically received these values as top-level EngineArgs, while
+    # OmniDiffusionConfig exposes them through its model-specific ``extras``
+    # mapping. Preserve explicit values for every diffusion adapter, but only
+    # synthesize HiDream's fallback defaults for a HiDream pipeline. Injecting
+    # those model-private keys into every registered DiT changes the effective
+    # config (and can make backend parity checks fail).
+    extras = dict(diffusion_kwargs.pop("extras", {}) or {})
+    for name in ("auxiliary_text_encoder", "default_llama_model_id"):
+        value = diffusion_kwargs.pop(name, None)
+        if value is not None:
+            extras[name] = _copy_value(value)
+
+    model_class_name = diffusion_kwargs.get("model_class_name")
+    short_model_class_name = model_class_name.rsplit(".", 1)[-1].lower() if isinstance(model_class_name, str) else ""
+    if short_model_class_name.startswith("hidream"):
+        extras.setdefault("auxiliary_text_encoder", None)
+        extras.setdefault("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct")
+    if extras:
+        diffusion_kwargs["extras"] = extras
+
     return _DiffusionConfigProjection.from_kwargs(**{k: v for k, v in diffusion_kwargs.items() if v is not None})
 
 
@@ -1874,7 +1933,11 @@ class VllmOmniConfig:
                 _stage_engine_values(
                     deploy_by_id.get(topology.stage_id),
                     topology,
-                    _stage_cli_overrides(topology.stage_id, cli_overrides),
+                    (
+                        _diffusion_stage_cli_overrides(topology.stage_id, cli_overrides)
+                        if topology.execution_type == StageExecutionType.DIFFUSION
+                        else _stage_cli_overrides(topology.stage_id, cli_overrides)
+                    ),
                 ),
                 model=model,
             )

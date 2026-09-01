@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import random
 import warnings
@@ -45,9 +45,10 @@ class Conversation:
 
 
 class TokenizerWrapper:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, *, revision: str | None = None):
         if isinstance(tokenizer, str):
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+            tokenizer_kwargs = {"revision": revision} if revision is not None else {}
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer, **tokenizer_kwargs)
         else:
             self.tokenizer = tokenizer
 

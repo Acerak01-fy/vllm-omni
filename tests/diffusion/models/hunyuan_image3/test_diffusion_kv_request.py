@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
@@ -47,6 +47,72 @@ def test_dense_legacy_preprocess_does_not_initialize_layout_tokenizer(monkeypatc
     get_hunyuan_image_3_pre_process_func(
         SimpleNamespace(model="model", diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY)
     )
+
+
+def test_paged_preprocess_propagates_revision_to_hf_components(monkeypatch) -> None:
+    revision = "refs/pr/42"
+    calls: dict[str, object] = {}
+    hf_config = SimpleNamespace(vae_downsample_factor=(8, 8), patch_size=2, image_base_size=1024)
+    image_processor = SimpleNamespace(vision_encoder_processor=SimpleNamespace(patch_size=1))
+    tokenizer = object()
+
+    def fake_get_config(model, **kwargs):
+        calls["config"] = (model, kwargs)
+        return hf_config
+
+    def fake_tokenizer(model, **kwargs):
+        calls["tokenizer"] = (model, kwargs)
+        return tokenizer
+
+    def fake_generation_config(model, **kwargs):
+        calls["generation_config"] = (model, kwargs)
+        return SimpleNamespace(sequence_template="instruct", drop_think=False)
+
+    monkeypatch.setattr(pipeline_module, "get_config", fake_get_config)
+    monkeypatch.setattr(pipeline_module, "HunyuanImage3ImageProcessor", lambda _config: image_processor)
+    monkeypatch.setattr(pipeline_module, "TokenizerWrapper", fake_tokenizer)
+    monkeypatch.setattr(pipeline_module.GenerationConfig, "from_pretrained", fake_generation_config)
+
+    get_hunyuan_image_3_pre_process_func(
+        SimpleNamespace(
+            model="org/hunyuan-image3",
+            revision=revision,
+            diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+        )
+    )
+
+    expected = {"revision": revision}
+    assert calls == {
+        "config": ("org/hunyuan-image3", {"trust_remote_code": True, **expected}),
+        "tokenizer": ("org/hunyuan-image3", expected),
+        "generation_config": ("org/hunyuan-image3", expected),
+    }
+
+
+def test_hunyuan_tokenizer_wrapper_passes_revision(monkeypatch) -> None:
+    from vllm_omni.diffusion.models.hunyuan_image3 import hunyuan_image3_tokenizer as tokenizer_module
+
+    calls = []
+
+    class FakeTokenizer:
+        bos_token_id = 1
+        eos_token_id = 2
+        pad_token_id = 0
+        added_tokens_encoder = {}
+
+        @staticmethod
+        def convert_tokens_to_ids(_token):
+            return 3
+
+    def fake_from_pretrained(model, **kwargs):
+        calls.append((model, kwargs))
+        return FakeTokenizer()
+
+    monkeypatch.setattr(tokenizer_module.AutoTokenizer, "from_pretrained", fake_from_pretrained)
+
+    tokenizer_module.TokenizerWrapper("org/hunyuan-image3", revision="refs/pr/42")
+
+    assert calls == [("org/hunyuan-image3", {"revision": "refs/pr/42"})]
 
 
 class _FakeTokenizerWrapper:

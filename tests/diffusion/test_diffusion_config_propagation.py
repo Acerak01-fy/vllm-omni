@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that parallel_config survives the create_default_diffusion roundtrip.
 
 Regression tests for https://github.com/vllm-project/vllm-omni/issues/1862
@@ -220,3 +220,39 @@ def test_additional_config_roundtrip():
     additional_config = {"torchair_graph_config": {"enabled": True}}
     od = _roundtrip_diffusion_config(model="x", additional_config=additional_config)
     assert od.additional_config == additional_config
+
+
+def test_hidream_signature_probe_uses_requested_revision(monkeypatch):
+    """The secondary HiDream weight-index lookup must share ``revision``."""
+    from vllm_omni.diffusion import data as diffusion_data
+    from vllm_omni.diffusion.utils import hf_utils
+
+    revision = "refs/pr/42"
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(hf_utils, "get_diffusion_model_index", lambda *_args, **_kwargs: None)
+
+    def fake_get_hf_file_to_dict(filename, model, **kwargs):
+        assert model == "org/hidream"
+        observed.setdefault("file_revisions", []).append((filename, kwargs.get("revision")))
+        if filename == "config.json":
+            return {"model_type": "qwen3_vl"}
+        return None
+
+    monkeypatch.setattr("vllm.transformers_utils.config.get_hf_file_to_dict", fake_get_hf_file_to_dict)
+
+    def fake_looks_like_hidream(model, config=None, *, revision=None):
+        observed["signature_revision"] = revision
+        assert model == "org/hidream"
+        assert config == {"model_type": "qwen3_vl"}
+        return True
+
+    monkeypatch.setattr(hf_utils, "_looks_like_hidream_o1", fake_looks_like_hidream)
+    monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
+
+    config = diffusion_data.OmniDiffusionConfig(model="org/hidream", revision=revision)
+    config.enrich_config()
+
+    assert observed["signature_revision"] == revision
+    assert observed["file_revisions"] == [("config.json", revision)]
+    assert config.model_class_name == "HiDreamO1ImagePipeline"

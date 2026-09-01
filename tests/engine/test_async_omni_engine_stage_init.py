@@ -11,6 +11,14 @@ import types
 
 import pytest
 
+from vllm_omni.config.omni_config import VllmOmniConfig, VllmOmniDiffusionStageConfig
+from vllm_omni.config.stage_config import (
+    DeployConfig,
+    PipelineConfig,
+    StageDeployConfig,
+    StageExecutionType,
+    StagePipelineConfig,
+)
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.engine import async_omni_engine as async_omni_engine_module
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -22,6 +30,7 @@ from vllm_omni.engine.stage_init_utils import (
     split_devices_for_replicas,
 )
 from vllm_omni.engine.stage_runtime import StageRuntime
+from vllm_omni.entrypoints.utils import ResolvedStageConfigs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -90,6 +99,35 @@ def _make_diffusion_metadata(stage_id: int, *, replica_id: int = 0, final_output
     )
 
 
+def _make_typed_diffusion_stage(
+    stage_id: int,
+    *,
+    devices: str = "0",
+    num_replicas: int = 1,
+) -> tuple[VllmOmniConfig, object]:
+    """Build the smallest real typed diffusion view used by startup tests."""
+    topology = StagePipelineConfig(
+        stage_id=stage_id,
+        model_stage="diffusion",
+        execution_type=StageExecutionType.DIFFUSION,
+        final_output=True,
+        final_output_type="image",
+        model_arch="TestDiffusion",
+    )
+    pipeline = PipelineConfig(
+        model_type=f"test_diffusion_{stage_id}",
+        model_arch="TestDiffusion",
+        stages=(topology,),
+    )
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=stage_id, devices=devices, num_replicas=num_replicas)])
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"model": "dummy-model"},
+    )
+    return omni_config, omni_config.stage_by_id(stage_id)
+
+
 def _make_llm_plan(
     stage_idx: int,
     *,
@@ -142,6 +180,11 @@ def _make_diffusion_plan(
 ):
     replicas: list[ReplicaInitPlan] = []
     for replica_id in range(num_replicas):
+        _, typed_stage = _make_typed_diffusion_stage(
+            stage_id,
+            devices=str(replica_id),
+            num_replicas=num_replicas,
+        )
         stage_cfg = types.SimpleNamespace(
             stage_id=stage_id,
             stage_type="diffusion",
@@ -157,6 +200,7 @@ def _make_diffusion_plan(
                 metadata=_make_diffusion_metadata(stage_id, replica_id=replica_id),
                 stage_connector_spec={},
                 omni_kv_connector=(None, None, None),
+                omni_stage_config=typed_stage,
             )
         )
     return LogicalStageInitPlan(
@@ -207,6 +251,15 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_to_runtime(monkeyp
     engine._omni_lb_policy = "random"
     engine.request_queue = types.SimpleNamespace()
     engine._log_stats = True
+    topology_stage = types.SimpleNamespace(stage_id=99)
+    engine._resolved_stage_configs = ResolvedStageConfigs(
+        config_path="dummy-config",
+        omni_config=None,
+        stage_configs=engine.stage_configs,
+        deploy_config=None,
+        omni_lb_policy=None,
+        typed_topology_stage_configs=(topology_stage,),
+    )
 
     captured: dict[str, object] = {}
     runtime = types.SimpleNamespace(stage_pools=[], initialize=lambda: None)
@@ -221,6 +274,7 @@ def test_async_omni_engine_initialize_stages_passes_log_stats_to_runtime(monkeyp
 
     assert captured["stage_init_timeout"] == 7
     assert captured["log_stats"] is True
+    assert captured["typed_topology_stage_configs"] == (topology_stage,)
 
 
 def test_compute_replica_layout_splits_diffusion_devices_by_world_size():
@@ -305,6 +359,23 @@ def test_build_logical_stage_init_plans_handles_stage_without_devices(monkeypatc
 
     assert [replica.replica_id for replica in stage_plans[0].replicas] == [0, 1, 2]
     assert [replica.stage_cfg.runtime.devices for replica in stage_plans[0].replicas] == [None, None, None]
+
+
+def test_compute_replica_layout_uses_explicit_diffusion_num_gpus():
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="diffusion",
+        engine_args={
+            "num_gpus": 4,
+            "parallel_config": {"tensor_parallel_size": 2},
+        },
+        runtime={"devices": "0,1,2,3,4,5,6,7", "num_replicas": 2},
+    )
+
+    replicas_per_stage, replica_devices_map = compute_replica_layout([stage_cfg])
+
+    assert replicas_per_stage == [2]
+    assert replica_devices_map == {0: ["0,1,2,3", "4,5,6,7"]}
 
 
 def test_collect_initialized_clients_for_cleanup_deduplicates_clients():
@@ -558,9 +629,21 @@ def test_launch_diffusion_stage_replica_does_not_write_max_num_seqs_from_batch_s
     import vllm_omni.diffusion.stage_diffusion_client as client_mod
     import vllm_omni.diffusion.stage_diffusion_proc as proc_mod
     import vllm_omni.engine.stage_engine_startup as startup_mod
+    import vllm_omni.engine.stage_init_utils as init_mod
 
     od_config = types.SimpleNamespace(max_num_seqs=1, parallel_config=types.SimpleNamespace(world_size=1))
-    monkeypatch.setattr(startup_mod, "build_diffusion_config", lambda *args: od_config)
+    typed_calls: list[tuple[object, object]] = []
+
+    def _build_typed(*args, **kwargs):
+        typed_calls.append((args[1], kwargs))
+        return od_config
+
+    def _legacy_builder_must_not_run(*_args, **_kwargs):
+        raise AssertionError("distributed diffusion startup used the legacy builder")
+
+    monkeypatch.setattr(startup_mod, "build_diffusion_config_from_omni_stage_config", _build_typed)
+    monkeypatch.setattr(startup_mod, "build_diffusion_config", _legacy_builder_must_not_run)
+    monkeypatch.setattr(init_mod, "build_diffusion_config", _legacy_builder_must_not_run)
     monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args: [])
     monkeypatch.setattr(
         startup_mod,
@@ -591,10 +674,15 @@ def test_launch_diffusion_stage_replica_does_not_write_max_num_seqs_from_batch_s
         lambda metadata, **kwargs: sentinel_client,
     )
 
+    _, typed_stage = _make_typed_diffusion_stage(0)
     result, resources = startup_mod.launch_diffusion_stage_replica(
         model="dummy-model",
-        stage_config=types.SimpleNamespace(),
+        stage_config=typed_stage,
+        legacy_registration_config=types.SimpleNamespace(),
         metadata=types.SimpleNamespace(stage_id=0),
+        stage_connector_spec={},
+        omni_kv_connector=(None, None, None),
+        stage_configs=[typed_stage],
         stage_init_timeout=12,
         batch_size=4,
         use_inline=False,
@@ -604,6 +692,51 @@ def test_launch_diffusion_stage_replica_does_not_write_max_num_seqs_from_batch_s
     assert result is sentinel_client
     assert od_config.max_num_seqs == 1
     assert resources.manager is proc_manager
+    assert len(typed_calls) == 1
+    assert isinstance(typed_calls[0][0], VllmOmniDiffusionStageConfig)
+
+
+def test_launch_diffusion_stage_replica_colocated_uses_typed_initializer(monkeypatch):
+    """Colocated DiT startup must not fall back to the legacy config builder."""
+    import vllm_omni.engine.stage_engine_startup as startup_mod
+    import vllm_omni.engine.stage_init_utils as init_mod
+
+    _, typed_stage = _make_typed_diffusion_stage(0)
+    typed_client = object()
+    typed_calls: list[tuple[object, object, object]] = []
+
+    def _initialize_typed(model, stage_config, metadata, stage_init_timeout, **kwargs):
+        typed_calls.append((model, stage_config, metadata))
+        assert stage_init_timeout == 17
+        assert kwargs["batch_size"] == 3
+        return typed_client
+
+    def _legacy_builder_must_not_run(*_args, **_kwargs):
+        raise AssertionError("colocated diffusion startup used the legacy path")
+
+    monkeypatch.setattr(startup_mod, "initialize_diffusion_stage_from_omni_stage_config", _initialize_typed)
+    monkeypatch.setattr(startup_mod, "build_diffusion_config", _legacy_builder_must_not_run)
+    monkeypatch.setattr(init_mod, "build_diffusion_config", _legacy_builder_must_not_run)
+    monkeypatch.setattr(init_mod, "initialize_diffusion_stage", _legacy_builder_must_not_run)
+
+    result, resources = startup_mod.launch_diffusion_stage_replica(
+        model="dummy-model",
+        stage_config=typed_stage,
+        legacy_registration_config=types.SimpleNamespace(),
+        metadata=_make_diffusion_metadata(0),
+        stage_connector_spec={},
+        omni_kv_connector=(None, None, None),
+        stage_configs=[typed_stage],
+        stage_init_timeout=17,
+        batch_size=3,
+        use_inline=True,
+        omni_master_server=None,
+    )
+
+    assert result is typed_client
+    assert resources == startup_mod.StageReplicaResources()
+    assert len(typed_calls) == 1
+    assert typed_calls[0][1] is typed_stage
 
 
 def test_initialize_diffusion_stage_does_not_write_max_num_seqs(monkeypatch):
@@ -638,7 +771,11 @@ def test_launch_diffusion_stage_replica_preserves_step_execution_max_num_seqs(mo
         step_execution=True,
         parallel_config=types.SimpleNamespace(world_size=1),
     )
-    monkeypatch.setattr(startup_mod, "build_diffusion_config", lambda *args: od_config)
+    monkeypatch.setattr(
+        startup_mod,
+        "build_diffusion_config_from_omni_stage_config",
+        lambda *args, **kwargs: od_config,
+    )
     monkeypatch.setattr(startup_mod, "acquire_device_locks", lambda *args: [])
     monkeypatch.setattr(
         startup_mod,
@@ -667,10 +804,15 @@ def test_launch_diffusion_stage_replica_preserves_step_execution_max_num_seqs(mo
         lambda metadata, **kwargs: object(),
     )
 
+    _, typed_stage = _make_typed_diffusion_stage(0)
     startup_mod.launch_diffusion_stage_replica(
         model="dummy-model",
-        stage_config=types.SimpleNamespace(),
+        stage_config=typed_stage,
+        legacy_registration_config=types.SimpleNamespace(),
         metadata=types.SimpleNamespace(stage_id=0),
+        stage_connector_spec={},
+        omni_kv_connector=(None, None, None),
+        stage_configs=[typed_stage],
         stage_init_timeout=12,
         batch_size=4,
         use_inline=False,
@@ -884,6 +1026,104 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
     assert [replica.stage_cfg.runtime.devices for replica in stage_plans[1].replicas] == ["1", "2", "3"]
     assert [replica.replica_id for replica in stage_plans[1].replicas] == [0, 1, 2]
     assert all(replica.num_replicas == 3 for replica in stage_plans[1].replicas)
+
+
+def test_build_logical_plans_keep_ar_generation_legacy_and_dit_typed(monkeypatch):
+    import vllm_omni.engine.stage_runtime as runtime_mod
+
+    llm0 = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        runtime=types.SimpleNamespace(devices="0"),
+        engine_args={},
+    )
+    llm1 = types.SimpleNamespace(
+        stage_id=1,
+        stage_type="llm",
+        runtime=types.SimpleNamespace(devices="1"),
+        engine_args={},
+    )
+    legacy_calls: list[int] = []
+
+    def legacy_metadata(stage_cfg):
+        legacy_calls.append(stage_cfg.stage_id)
+        metadata = _make_llm_metadata(stage_cfg.stage_id)
+        metadata.runtime_cfg = stage_cfg.runtime
+        return metadata
+
+    typed_config, _ = _make_typed_diffusion_stage(2, devices="2")
+    dit_legacy = types.SimpleNamespace(
+        stage_id=2,
+        stage_type="diffusion",
+        runtime=types.SimpleNamespace(devices="2"),
+        engine_args={},
+    )
+    topology0 = StagePipelineConfig(stage_id=0, model_stage="ar", execution_type=StageExecutionType.LLM_AR)
+    topology1 = StagePipelineConfig(
+        stage_id=1,
+        model_stage="generation",
+        execution_type=StageExecutionType.LLM_GENERATION,
+        input_sources=(0,),
+    )
+    pipeline = PipelineConfig(
+        model_type="mixed_runtime",
+        model_arch="TestDiffusion",
+        stages=(topology0, topology1, typed_config.pipeline_config.stages[0]),
+    )
+    mixed = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=DeployConfig(
+            async_chunk=False,
+            stages=[
+                StageDeployConfig(stage_id=0, devices="0"),
+                StageDeployConfig(stage_id=1, devices="1"),
+                StageDeployConfig(stage_id=2, devices="2"),
+            ],
+        ),
+        cli_overrides={"model": "dummy-model"},
+    )
+    runtime = StageRuntime(
+        stage_configs=[llm0, llm1, dit_legacy],
+        omni_config=mixed,
+        model="dummy-model",
+        config_path="dummy-config",
+        stage_init_timeout=1,
+        diffusion_batch_size=1,
+        async_chunk=False,
+    )
+
+    typed_metadata_calls: list[int] = []
+    extract_typed_metadata = runtime_mod.extract_stage_metadata_from_omni_stage_config
+
+    def typed_metadata(stage_cfg):
+        typed_metadata_calls.append(stage_cfg.stage_id)
+        return extract_typed_metadata(stage_cfg)
+
+    engine_builder_calls: list[int] = []
+
+    def build_legacy_engine_args(stage_cfg, *_, **__):
+        engine_builder_calls.append(stage_cfg.stage_id)
+        return {}
+
+    monkeypatch.setattr(runtime_mod, "extract_legacy_stage_metadata", legacy_metadata)
+    monkeypatch.setattr(runtime_mod, "extract_stage_metadata_from_omni_stage_config", typed_metadata)
+    monkeypatch.setattr(runtime_mod, "get_stage_connector_spec", lambda **_: {})
+    monkeypatch.setattr(runtime_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
+    monkeypatch.setattr(runtime_mod, "build_engine_args_dict", build_legacy_engine_args)
+    monkeypatch.setattr(
+        runtime_mod,
+        "build_vllm_config",
+        lambda *_, **__: (types.SimpleNamespace(), object),
+    )
+
+    plans = runtime._build_logical_stage_init_plans(None, [1, 1, 1], {})
+
+    assert legacy_calls == [0, 0, 1, 1]
+    assert typed_metadata_calls == [2, 2]
+    assert engine_builder_calls == [0, 1]
+    assert plans[2].replicas[0].omni_stage_config.stage_id == 2
+    assert isinstance(plans[2].replicas[0].omni_stage_config, VllmOmniDiffusionStageConfig)
+    assert plans[2].replicas[0].metadata.stage_type == "diffusion"
 
 
 def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monkeypatch):
@@ -1753,68 +1993,20 @@ def test_inject_kv_stage_info_infers_receiver_tp_topology():
     assert stage1.engine_args["omni_kv_config"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
 
 
-def test_resolve_stage_configs_injects_global_diffusion_attention_when_missing(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
-
-    engine = object.__new__(AsyncOmniEngine)
-    stage_cfg = types.SimpleNamespace(
-        stage_type="diffusion",
-        engine_args=types.SimpleNamespace(
-            diffusion_attention_config=None,
-            lora_path=None,
-            lora_scale=None,
-            enable_sleep_mode=None,
-            quantization_config=None,
-        ),
-    )
-
-    monkeypatch.setattr(
-        engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
-    )
-
-    _config_path, stage_configs = engine._resolve_stage_configs(
-        model="dummy-model",
-        kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
-        trust_remote_code=False,
-    )
-
-    diffusion_attention_config = stage_configs[0].engine_args.diffusion_attention_config
+def test_resolve_stage_configs_injects_global_diffusion_attention_when_missing():
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"diffusion_attention_backend": "FLASH_ATTN"})[0]
+    diffusion_attention_config = stage_cfg["engine_args"]["diffusion_attention_config"]
     assert isinstance(diffusion_attention_config, AttentionConfig)
     assert diffusion_attention_config.default is not None
     assert diffusion_attention_config.default.backend == "FLASH_ATTN"
 
 
-def test_resolve_stage_configs_preserves_stage_diffusion_attention(monkeypatch):
-    import vllm_omni.engine.async_omni_engine as engine_mod
-
-    engine = object.__new__(AsyncOmniEngine)
+def test_resolve_stage_configs_preserves_stage_diffusion_attention():
     existing_attention = AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA"))
-    stage_cfg = types.SimpleNamespace(
-        stage_type="diffusion",
-        engine_args=types.SimpleNamespace(
-            diffusion_attention_config=existing_attention,
-            lora_path=None,
-            lora_scale=None,
-            enable_sleep_mode=None,
-            quantization_config=None,
-        ),
-    )
-
-    monkeypatch.setattr(
-        engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
-    )
-
-    _config_path, stage_configs = engine._resolve_stage_configs(
-        model="dummy-model",
-        kwargs={"diffusion_attention_backend": "FLASH_ATTN"},
-        trust_remote_code=False,
-    )
-
-    assert stage_configs[0].engine_args.diffusion_attention_config is existing_attention
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"diffusion_attention_config": existing_attention})[
+        0
+    ]
+    assert stage_cfg["engine_args"]["diffusion_attention_config"] == existing_attention
 
 
 def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stage(monkeypatch):
@@ -1831,8 +2023,14 @@ def test_resolve_stage_configs_does_not_inject_diffusion_attention_into_llm_stag
 
     monkeypatch.setattr(
         engine_mod,
-        "load_and_resolve_stage_configs",
-        lambda *args, **kwargs: ("dummy-config", [stage_cfg], None),
+        "load_and_resolve_stage_config_views",
+        lambda *args, **kwargs: ResolvedStageConfigs(
+            config_path="dummy-config",
+            omni_config=None,
+            stage_configs=[stage_cfg],
+            deploy_config=None,
+            omni_lb_policy=None,
+        ),
     )
 
     _config_path, stage_configs = engine._resolve_stage_configs(

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import functools
 from collections.abc import Mapping
@@ -26,6 +27,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageConfig,
     StageType,
+    _apply_platform_overrides,
     build_stage_runtime_overrides,
     load_deploy_config,
     merge_pipeline_deploy,
@@ -46,6 +48,28 @@ logger = init_logger(__name__)
 # defaults can't drift apart. This is the light slice; the full device-layout
 # centralization is tracked as a follow-up.
 _DEFAULT_PARALLEL_DEGREE = 1
+
+
+def _optional_revision_kwargs(revision: str | None) -> dict[str, str]:
+    """Return a revision keyword only when the caller explicitly pinned one.
+
+    A few downstream integrations still monkeypatch the discovery helpers with
+    their historical two-argument signatures.  Keeping the no-revision call
+    shape unchanged preserves that compatibility while a pinned revision is
+    propagated end to end.
+    """
+    return {"revision": revision} if revision is not None else {}
+
+
+@dataclasses.dataclass(frozen=True)
+class StageConfigResolution:
+    """Aligned structured and compatibility views of one pipeline resolution."""
+
+    omni_config: VllmOmniConfig | None
+    legacy_stage_configs: list[StageConfig] | None
+    deploy_config: DeployConfig | None
+    deploy_config_path: str | None
+    omni_lb_policy: str | None
 
 
 @functools.cache
@@ -121,6 +145,7 @@ class StageConfigFactory:
         model: str,
         trust_remote_code: bool,
         deploy_config_path: str | None,
+        revision: str | None = None,
     ) -> tuple[EndpointRestriction, ...]:
         """Given a model string, determine the corresponding endpoint restrictions.
 
@@ -136,12 +161,18 @@ class StageConfigFactory:
             model=model,
             trust_remote_code=trust_remote_code,
             deploy_config_path=deploy_config_path,
+            **_optional_revision_kwargs(revision),
         )
         return pipeline_cfg.endpoint_restrictions if pipeline_cfg else ()
 
     @classmethod
     @functools.cache
-    def get_hf_config(cls, model: str, trust_remote_code: bool) -> PretrainedConfig | None:
+    def get_hf_config(
+        cls,
+        model: str,
+        trust_remote_code: bool,
+        revision: str | None = None,
+    ) -> PretrainedConfig | None:
         """Fetch the HF config (if it exists) from the model directory.
 
         Args:
@@ -153,14 +184,21 @@ class StageConfigFactory:
         """
         hf_config = None
         try:
-            return get_config(_materialize_object_storage_configs(model), trust_remote_code=trust_remote_code)
+            config_kwargs = {"trust_remote_code": trust_remote_code}
+            config_kwargs.update(_optional_revision_kwargs(revision))
+            return get_config(_materialize_object_storage_configs(model), **config_kwargs)
         except Exception as e:
             logger.debug(f"`get_config` failed with exception {e}; inferred HF config is None")
         return hf_config
 
     @classmethod
     @functools.cache
-    def try_infer_model_type(cls, model: str, trust_remote_code: bool) -> str | None:
+    def try_infer_model_type(
+        cls,
+        model: str,
+        trust_remote_code: bool,
+        revision: str | None = None,
+    ) -> str | None:
         """Auto-detect model_type from model directory and apply any model
         specific patches to get the correct model_type str. If we are unable
         to infer it from the model directory, we fall back to the PipelineConfig.
@@ -175,14 +213,24 @@ class StageConfigFactory:
         model_type = cls._try_infer_model_type(
             model=model,
             trust_remote_code=trust_remote_code,
+            **_optional_revision_kwargs(revision),
         )
         if model_type == "vla":
-            if _looks_like_dreamzero(model):
+            if revision is None:
+                looks_like_dreamzero = _looks_like_dreamzero(model)
+            else:
+                looks_like_dreamzero = _looks_like_dreamzero(model, revision=revision)
+            if looks_like_dreamzero:
                 model_type = "dreamzero"
         return model_type
 
     @classmethod
-    def _try_infer_model_type(cls, model: str, trust_remote_code: bool) -> str | None:
+    def _try_infer_model_type(
+        cls,
+        model: str,
+        trust_remote_code: bool,
+        revision: str | None = None,
+    ) -> str | None:
         """Auto-detect model_type from model directory.
 
         Args:
@@ -195,6 +243,7 @@ class StageConfigFactory:
         hf_config = cls.get_hf_config(
             model=model,
             trust_remote_code=trust_remote_code,
+            **_optional_revision_kwargs(revision),
         )
         if hf_config is not None:
             return hf_config.model_type
@@ -204,7 +253,7 @@ class StageConfigFactory:
         # Fallback: read config.json directly for custom model types that
         # are not registered with transformers (e.g. qwen3_tts).
         try:
-            config_dict = get_hf_file_to_dict("config.json", config_source, revision=None)
+            config_dict = get_hf_file_to_dict("config.json", config_source, revision=revision)
             if config_dict:
                 if "model_type" in config_dict:
                     return config_dict["model_type"]
@@ -221,7 +270,7 @@ class StageConfigFactory:
         # model_index.json with _class_name that maps to a pipeline key via
         # PipelineConfig.diffusers_class_name.
         try:
-            model_index = get_hf_file_to_dict("model_index.json", config_source, revision=None)
+            model_index = get_hf_file_to_dict("model_index.json", config_source, revision=revision)
             if model_index and "_class_name" in model_index:
                 class_name = model_index["_class_name"]
                 for obj in OMNI_PIPELINES.values():
@@ -267,10 +316,19 @@ class StageConfigFactory:
         trust_remote_code: bool,
         deploy_config_path: str | None = None,
         user_deploy_config: DeployConfig | None = None,
+        revision: str | None = None,
     ) -> PipelineConfig | None:
         """Resolve the PipelineConfig for a model path/name."""
-        model_type = cls.try_infer_model_type(model=model, trust_remote_code=trust_remote_code)
-        hf_config = cls.get_hf_config(model=model, trust_remote_code=trust_remote_code)
+        model_type = cls.try_infer_model_type(
+            model=model,
+            trust_remote_code=trust_remote_code,
+            **_optional_revision_kwargs(revision),
+        )
+        hf_config = cls.get_hf_config(
+            model=model,
+            trust_remote_code=trust_remote_code,
+            **_optional_revision_kwargs(revision),
+        )
 
         # Resolve the deploy config & check if the user set the pipeline;
         # If the pipeline is explicitly set, it takes highest priority
@@ -338,18 +396,242 @@ class StageConfigFactory:
         return pipeline_cfg
 
     @staticmethod
-    def _load_user_deploy_config(deploy_config_path: str | None) -> DeployConfig | None:
+    def _resolve_user_deploy_path(deploy_config_path: str) -> Path:
+        """Resolve an explicit deploy path using the legacy lookup rules."""
+        deploy_path = Path(deploy_config_path)
+        if not deploy_path.exists() and deploy_path.parent == Path("."):
+            bare_name = deploy_path.name
+            if not bare_name.endswith(".yaml"):
+                bare_name = f"{bare_name}.yaml"
+            candidate = _DEPLOY_DIR / bare_name
+            if candidate.exists():
+                deploy_path = candidate
+        return deploy_path
+
+    @classmethod
+    def _load_user_deploy_config(cls, deploy_config_path: str | None) -> DeployConfig | None:
         """Load an explicit deploy YAML once for resolution and construction."""
         if deploy_config_path is None:
             return None
-        deploy_path = Path(deploy_config_path)
-        if not deploy_path.exists() and deploy_path.parent == Path("."):
-            candidate = _DEPLOY_DIR / deploy_path
-            if candidate.exists():
-                deploy_path = candidate
+        deploy_path = cls._resolve_user_deploy_path(deploy_config_path)
         if not deploy_path.exists():
             raise FileNotFoundError(f"Deploy config not found: {deploy_path}")
         return load_deploy_config(deploy_path)
+
+    @classmethod
+    def _select_deploy_config(
+        cls,
+        pipeline_cfg: PipelineConfig,
+        deploy_config_path: str | None,
+        user_deploy_config: DeployConfig | None,
+    ) -> tuple[DeployConfig, str | None]:
+        """Select and load the deploy input once for both config views."""
+        if user_deploy_config is not None:
+            resolved_path = (
+                str(cls._resolve_user_deploy_path(deploy_config_path)) if deploy_config_path is not None else None
+            )
+            return copy.deepcopy(user_deploy_config), resolved_path
+        if deploy_config_path is not None:
+            deploy_path = cls._resolve_user_deploy_path(deploy_config_path)
+            if not deploy_path.exists():
+                raise FileNotFoundError(f"Deploy config not found: {deploy_path}")
+            return load_deploy_config(deploy_path), str(deploy_path)
+        if pipeline_cfg.default_deploy_config_name is not None:
+            deploy_path = _DEPLOY_DIR / pipeline_cfg.default_deploy_config_name
+            return load_deploy_config(deploy_path), str(deploy_path)
+        return DeployConfig(), None
+
+    @staticmethod
+    def _prepare_registry_inputs(
+        pipeline_cfg: PipelineConfig,
+        deploy_cfg: DeployConfig,
+        cli_overrides: dict[str, Any],
+    ) -> tuple[PipelineConfig, DeployConfig]:
+        """Apply topology/deploy transforms shared by both resolved views."""
+        # Normalize aliases (for example ``--num-gpus`` and diffusion-specific
+        # spellings) once before constructing either compatibility view.  This
+        # keeps the typed consumer and the legacy wire payload on the same
+        # effective override set.
+        normalized_cli_overrides = normalize_pipeline_cli_overrides(pipeline_cfg, cli_overrides)
+        # Replace the input mapping rather than updating it in place.  Alias
+        # normalization intentionally removes source spellings (for example
+        # ``diffusion_streaming_output``); retaining them would route a
+        # diffusion-only value to every AR/generation stage in a mixed
+        # pipeline before the typed owner check runs.
+        cli_overrides.clear()
+        cli_overrides.update(normalized_cli_overrides)
+        deploy_cfg = copy.deepcopy(deploy_cfg)
+        # Apply platform overlays once before either representation is built;
+        # otherwise the legacy merge and typed projection can observe
+        # different devices/env/engine extras on platform-specific deploys.
+        deploy_cfg = _apply_platform_overrides(deploy_cfg)
+        cli_async_chunk = cli_overrides.get("async_chunk")
+        if cli_async_chunk is not None:
+            deploy_cfg.async_chunk = bool(cli_async_chunk)
+
+        from vllm_omni.utils.forced_aligner import inject_forced_aligner_stage
+
+        return inject_forced_aligner_stage(pipeline_cfg, deploy_cfg, cli_overrides)
+
+    @staticmethod
+    def _deploy_for_materialized_builder(deploy_cfg: DeployConfig) -> DeployConfig:
+        """Copy an effective deploy without re-applying its platform block."""
+        builder_deploy = copy.deepcopy(deploy_cfg)
+        # ``merge_pipeline_deploy`` and ``VllmOmniConfig.from_pipeline_config``
+        # retain their historical overlay call for standalone callers. The
+        # shared resolver already applied it, so hide only the declarative
+        # block while preserving it on StageConfigResolution.deploy_config.
+        builder_deploy.platforms = None
+        return builder_deploy
+
+    @staticmethod
+    def _typed_strategy_overrides(
+        cli_overrides: dict[str, Any],
+        applied: Any,
+    ) -> dict[str, Any]:
+        """Translate strategy-owned values into typed per-stage inputs.
+
+        Strategy values fill only axes that the CLI did not set. This preserves
+        the legacy order: deploy, then strategy, then global/per-stage CLI.
+        """
+        overrides = dict(cli_overrides)
+        if applied is None:
+            return overrides
+
+        axis_fields = {
+            "tp": ("tensor_parallel_size", "tensor_parallel_size"),
+            "dp": ("data_parallel_size", "data_parallel_size"),
+            "pp": ("pipeline_parallel_size", "pipeline_parallel_size"),
+        }
+        for stage_id, strategy_cfg in applied.per_stage_config.items():
+            declared = set(strategy_cfg.l1_owners)
+            for kind, (field_name, attr_name) in axis_fields.items():
+                if kind not in declared:
+                    continue
+                stage_key = f"stage_{stage_id}_{field_name}"
+                if overrides.get(stage_key) is None and overrides.get(field_name) is None:
+                    overrides[stage_key] = getattr(strategy_cfg, attr_name)
+
+            if "ep" in declared:
+                stage_key = f"stage_{stage_id}_enable_expert_parallel"
+                if overrides.get(stage_key) is None and overrides.get("enable_expert_parallel") is None:
+                    overrides[stage_key] = strategy_cfg.enable_expert_parallel
+
+            if "stage_replica" in declared:
+                stage_key = f"stage_{stage_id}_num_replicas"
+                if overrides.get(stage_key) is None and overrides.get("num_replicas") is None:
+                    overrides[stage_key] = strategy_cfg.stage_replica_size
+        return overrides
+
+    @staticmethod
+    def _validate_config_view_alignment(
+        omni_config: VllmOmniConfig,
+        legacy_stage_configs: list[StageConfig],
+    ) -> None:
+        typed_stages = omni_config.stage_configs
+        if len(typed_stages) != len(legacy_stage_configs):
+            raise ValueError(
+                "Structured and legacy stage views have different lengths: "
+                f"{len(typed_stages)} != {len(legacy_stage_configs)}"
+            )
+        for typed_stage, legacy_stage in zip(typed_stages, legacy_stage_configs):
+            typed_identity = (
+                typed_stage.stage_id,
+                StageType(typed_stage.stage_type),
+                typed_stage.model_stage,
+            )
+            legacy_identity = (
+                legacy_stage.stage_id,
+                StageType(legacy_stage.stage_type),
+                legacy_stage.model_stage,
+            )
+            if typed_identity != legacy_identity:
+                raise ValueError(
+                    "Structured and legacy stage views are not aligned: "
+                    f"typed={typed_identity!r}, legacy={legacy_identity!r}"
+                )
+
+            typed_runtime = typed_stage.runtime_config
+            # ``legacy_stage_configs`` are the dataclass compatibility view at
+            # this point (conversion to OmegaConf happens in entrypoints).
+            # Materialize once here so the alignment check observes the same
+            # runtime projection that downstream consumers receive.
+            legacy_runtime = legacy_stage.to_omegaconf().runtime
+            typed_layout = (
+                typed_runtime.num_replicas,
+                typed_runtime.devices,
+                typed_runtime.env,
+            )
+            legacy_layout = (
+                int(legacy_runtime.get("num_replicas", 1)),
+                legacy_runtime.get("devices"),
+                legacy_runtime.get("env"),
+            )
+            if typed_layout != legacy_layout:
+                raise ValueError(
+                    "Structured and legacy stage runtime layouts are not aligned: "
+                    f"stage={typed_stage.stage_id}, typed={typed_layout!r}, "
+                    f"legacy={legacy_layout!r}"
+                )
+
+    @classmethod
+    def create_config_views_from_model(
+        cls,
+        model: str,
+        *,
+        trust_remote_code: bool | None,
+        cli_overrides: dict[str, Any],
+        deploy_config_path: str | None,
+        strategy_specs: Mapping[Any, Any] | None = None,
+    ) -> StageConfigResolution:
+        """Resolve one model into aligned typed and legacy stage views."""
+        cli_overrides = with_trust_remote_code_override(
+            cli_overrides,
+            trust_remote_code,
+        )
+        user_deploy_config = cls._load_user_deploy_config(deploy_config_path)
+        pipeline_cfg = cls.get_pipeline_config(
+            model=model,
+            trust_remote_code=bool(trust_remote_code),
+            deploy_config_path=deploy_config_path,
+            user_deploy_config=user_deploy_config,
+            **_optional_revision_kwargs(cli_overrides.get("revision")),
+        )
+        if pipeline_cfg is None:
+            return StageConfigResolution(None, None, None, deploy_config_path, None)
+
+        deploy_cfg, resolved_deploy_path = cls._select_deploy_config(
+            pipeline_cfg,
+            deploy_config_path,
+            user_deploy_config,
+        )
+        prepared_pipeline, prepared_deploy = cls._prepare_registry_inputs(
+            pipeline_cfg,
+            deploy_cfg,
+            cli_overrides,
+        )
+        legacy_stages, applied = cls._create_legacy_from_prepared_registry(
+            prepared_pipeline,
+            prepared_deploy,
+            cli_overrides,
+            strategy_specs,
+        )
+        typed_overrides = cls._typed_strategy_overrides(cli_overrides, applied)
+        typed_overrides["model"] = model
+        omni_config = VllmOmniConfig.from_pipeline_config(
+            prepared_pipeline,
+            user_deploy_config=cls._deploy_for_materialized_builder(prepared_deploy),
+            deploy_config_path=resolved_deploy_path,
+            cli_overrides=typed_overrides,
+        )
+        cls._validate_config_view_alignment(omni_config, legacy_stages)
+        return StageConfigResolution(
+            omni_config=omni_config,
+            legacy_stage_configs=legacy_stages,
+            deploy_config=prepared_deploy,
+            deploy_config_path=resolved_deploy_path,
+            omni_lb_policy=applied.omni_lb_policy if applied is not None else None,
+        )
 
     @classmethod
     def create_from_model(
@@ -369,6 +651,7 @@ class StageConfigFactory:
             trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
             user_deploy_config=user_deploy_config,
+            **_optional_revision_kwargs(cli_overrides.get("revision")),
         )
         if pipeline_cfg is None:
             return None
@@ -407,6 +690,7 @@ class StageConfigFactory:
             trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
             user_deploy_config=user_deploy_config,
+            **_optional_revision_kwargs(cli_overrides.get("revision")),
         )
         if pipeline_cfg is None:
             return None, None
@@ -438,30 +722,39 @@ class StageConfigFactory:
         load-balancer policy (``None`` when no strategy set one) travels with the
         stages instead of through a mutable out-param.
         """
-        cli_overrides = normalize_pipeline_cli_overrides(pipeline_cfg, cli_overrides)
-        deploy_cfg: DeployConfig | None
-        if user_deploy_config is not None:
-            deploy_cfg = user_deploy_config
-        elif deploy_config_path is not None:
-            deploy_cfg = cls._load_user_deploy_config(deploy_config_path)
-            assert deploy_cfg is not None
-        elif pipeline_cfg.default_deploy_config_name is not None:
-            deploy_cfg = load_deploy_config(_DEPLOY_DIR / pipeline_cfg.default_deploy_config_name)
-            assert deploy_cfg is not None
-        else:
-            deploy_cfg = DeployConfig()
+        deploy_cfg, _ = cls._select_deploy_config(
+            pipeline_cfg,
+            deploy_config_path,
+            user_deploy_config,
+        )
+        pipeline_cfg, deploy_cfg = cls._prepare_registry_inputs(
+            pipeline_cfg,
+            deploy_cfg,
+            cli_overrides,
+        )
+        stages, applied = cls._create_legacy_from_prepared_registry(
+            pipeline_cfg,
+            deploy_cfg,
+            cli_overrides,
+            strategy_specs,
+        )
+        omni_lb_policy = applied.omni_lb_policy if applied is not None else None
+        return stages, omni_lb_policy
 
-        assert deploy_cfg is not None
-
-        cli_async_chunk = cli_overrides.get("async_chunk")
-        if cli_async_chunk is not None:
-            deploy_cfg.async_chunk = bool(cli_async_chunk)
-
-        from vllm_omni.utils.forced_aligner import inject_forced_aligner_stage
-
-        pipeline_cfg, deploy_cfg = inject_forced_aligner_stage(pipeline_cfg, deploy_cfg, cli_overrides)
-
-        stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
+    @classmethod
+    def _create_legacy_from_prepared_registry(
+        cls,
+        pipeline_cfg: PipelineConfig,
+        deploy_cfg: DeployConfig,
+        cli_overrides: dict[str, Any],
+        strategy_specs: Mapping[Any, Any] | None,
+    ) -> tuple[list[StageConfig], Any]:
+        """Build the legacy view from already selected/transformed inputs."""
+        stages = merge_pipeline_deploy(
+            pipeline_cfg,
+            cls._deploy_for_materialized_builder(deploy_cfg),
+            cli_overrides,
+        )
 
         # Overlay declarative parallel strategies (opt-in) before CLI overrides.
         applied = cls._apply_strategy_specs(stages, strategy_specs)
@@ -470,12 +763,36 @@ class StageConfigFactory:
 
         for stage in stages:
             stage.runtime_overrides = cls._merge_cli_overrides(stage, explicit_overrides)
+            if StageType(stage.stage_type) != StageType.DIFFUSION:
+                continue
+
+            # These diffusion-only CLI values were historically finalized by
+            # AsyncOmniEngine after the legacy factory returned. Resolve them
+            # here so the compatibility and typed views see the same input.
+            stage_num_gpus = explicit_overrides.get(f"stage_{stage.stage_id}_num_gpus")
+            global_num_gpus = explicit_overrides.get("num_gpus")
+            if stage_num_gpus is not None or global_num_gpus is not None:
+                stage.runtime_overrides["num_gpus"] = stage_num_gpus if stage_num_gpus is not None else global_num_gpus
+
+            yaml_diffusion_quantization = stage.yaml_engine_args.pop(
+                "diffusion_quantization_config",
+                None,
+            )
+            if yaml_diffusion_quantization is not None and stage.yaml_engine_args.get("quantization_config") is None:
+                stage.yaml_engine_args["quantization_config"] = yaml_diffusion_quantization
+
+            cli_diffusion_quantization = explicit_overrides.get(
+                f"stage_{stage.stage_id}_diffusion_quantization_config",
+                explicit_overrides.get("diffusion_quantization_config"),
+            )
+            if cli_diffusion_quantization is not None and stage.runtime_overrides.get("quantization_config") is None:
+                stage.runtime_overrides["quantization_config"] = cli_diffusion_quantization
+            stage.runtime_overrides.pop("diffusion_quantization_config", None)
 
         # Re-validate the resolved layout now that CLI overrides are on top.
         cls._reconcile_strategy_with_cli(stages, applied)
 
-        omni_lb_policy = applied.omni_lb_policy if applied is not None else None
-        return stages, omni_lb_policy
+        return stages, applied
 
     @staticmethod
     def _apply_strategy_specs(

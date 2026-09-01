@@ -10,6 +10,7 @@ from vllm_omni.config.stage_config import (
 
 WAN2_2_TI2V_PIPELINE = PipelineConfig(
     model_type="wan2_2_ti2v",
+    default_deploy_config_name="wan2_2_ti2v.yaml",
     model_arch="WanPipeline",
     diffusers_class_name="WanPipeline",
     diffusers_class_aliases=("WanDMDPipeline",),

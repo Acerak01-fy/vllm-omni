@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
 import logging
@@ -162,11 +162,15 @@ def _shift_full_attn_spans(
 
 
 def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
-    hf_config = get_config(od_config.model, trust_remote_code=True)
+    revision = getattr(od_config, "revision", None)
+    revision_kwargs = {"revision": revision} if revision is not None else {}
+    hf_config = get_config(od_config.model, trust_remote_code=True, **revision_kwargs)
     image_processor = HunyuanImage3ImageProcessor(hf_config)
     prepare_diffusion_kv_layout = od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
-    tokenizer_wrapper = TokenizerWrapper(od_config.model) if prepare_diffusion_kv_layout else None
-    generation_config = GenerationConfig.from_pretrained(od_config.model) if prepare_diffusion_kv_layout else None
+    tokenizer_wrapper = TokenizerWrapper(od_config.model, **revision_kwargs) if prepare_diffusion_kv_layout else None
+    generation_config = (
+        GenerationConfig.from_pretrained(od_config.model, **revision_kwargs) if prepare_diffusion_kv_layout else None
+    )
     vae_h_factor = hf_config.vae_downsample_factor[0] * hf_config.patch_size
     vae_w_factor = hf_config.vae_downsample_factor[1] * hf_config.patch_size
     vit_patch_size = getattr(image_processor.vision_encoder_processor, "patch_size", 1)
@@ -347,16 +351,18 @@ class HunyuanImage3Pipeline(
     ]
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
-        self.hf_config = get_config(od_config.model, trust_remote_code=True)
+        revision = getattr(od_config, "revision", None)
+        revision_kwargs = {"revision": revision} if revision is not None else {}
+        self.hf_config = get_config(od_config.model, trust_remote_code=True, **revision_kwargs)
         super().__init__(self.hf_config)
         # update diffusion config
-        self.generation_config = GenerationConfig.from_pretrained(od_config.model)
+        self.generation_config = GenerationConfig.from_pretrained(od_config.model, **revision_kwargs)
         self.od_config = od_config
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
                 subfolder=None,
-                revision=od_config.revision,
+                revision=revision,
                 prefix="",
                 fall_back_to_pt=True,
             )
@@ -373,7 +379,7 @@ class HunyuanImage3Pipeline(
         self.vae = DistributedAutoencoderKLHunyuan.from_config(self.hf_config.vae)
         self.vae.use_spatial_tiling = self.od_config.vae_use_tiling
         self._pipeline = None
-        self._tkwrapper = TokenizerWrapper(od_config.model)
+        self._tkwrapper = TokenizerWrapper(od_config.model, **revision_kwargs)
         self.image_processor = HunyuanImage3ImageProcessor(self.hf_config)
         self.vision_model = Siglip2VisionTransformer(self.hf_config.vit)
         # self.vision_model = vision_model.vision_model
