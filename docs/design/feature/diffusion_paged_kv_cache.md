@@ -1,379 +1,337 @@
----
-title: Scheduler-Managed Paged KV Cache for Diffusion DiT Stages
-kind: feature
-status: draft
-owners:
-  - "@Acerak01-fy"
-  - "@zwhzzz0821"
-primary_code_paths:
-  - vllm_omni/diffusion/diffusion_kv/**
-  - vllm_omni/diffusion/sched/**
-  - vllm_omni/diffusion/worker/**
-  - vllm_omni/diffusion/attention/**
-related_code_paths:
-  - vllm_omni/diffusion/models/hunyuan_image3/**
-  - vllm_omni/diffusion/forward_context.py
-  - vllm_omni/platforms/**
-depends_on:
-  - ../module/diffusion/diffusion_runtime.md
-  - ../module/cache_management.md
-validation_paths:
-  - tests/diffusion/diffusion_kv/**
-  - tests/diffusion/models/hunyuan_image3/**
-  - tests/e2e/accuracy/test_hunyuan_image3.py
-upstream_refs:
-  - https://github.com/vllm-project/vllm-omni/issues/5244
-  - https://github.com/vllm-project/vllm-omni/pull/5541
-  - https://github.com/vllm-project/vllm-omni/pull/5550
-  - https://github.com/vllm-project/vllm-omni/pull/6094
-  - https://github.com/vllm-project/vllm-omni/pull/6102
-  - https://github.com/vllm-project/vllm-omni/pull/6563
-  - https://github.com/vllm-project/vllm-omni/pull/6658
-last_reviewed: 2026-09-01
----
+# Scheduler-Managed Paged KV Cache
 
-# Scheduler-Managed Paged KV Cache for Diffusion DiT Stages
+This document describes the design and lifecycle of Scheduler-managed paged KV cache for diffusion DiT stages.
 
-This document defines the implementation contract for Scheduler-managed
-key/value (KV) cache in a diffusion DiT stage. HunyuanImage-3.0 is the first
-complete integration, using request-level execution on NVIDIA GPU and Ascend
-NPU. The contract applies only to the models and platforms listed in the
-compatibility matrix.
+For operator-facing configuration and examples, see the
+[Paged KV Cache user guide](../../user_guide/diffusion/paged_kv_cache.md).
 
-## Scope and goals
+## Table of Contents
 
-Paging changes KV storage and ownership, not Hunyuan's attention semantics.
-Prompt and reference-image tokens are stable across denoising steps, while
-the timestep and generated-image span is rewritten. The paged path stores the
-stable prefix in Worker-owned pages and updates only the changing span after
-the first step.
+1. [Overview](#overview)
+2. [Motivation](#motivation)
+3. [Architecture](#architecture)
+4. [Execution Modes](#execution-modes)
+5. [Design](#design)
+6. [Model and Platform Integration](#model-and-platform-integration)
+7. [Configuration and Compatibility](#configuration-and-compatibility)
+8. [Limitations](#limitations)
+9. [Related Files](#related-files)
 
-The design guarantees:
+## Overview
 
-- the Scheduler owns logical allocation and release;
-- the Worker owns physical tensors, native BlockTables, slots, and metadata;
-- when CFG is enabled, all CFG rows are admitted atomically (a request without
-  CFG has one row);
-- the model supplies layout and attention spans but never allocates pages or
-  activates the Worker runtime; and
-- invalid or stale metadata fails explicitly instead of silently falling back
-  to dense execution.
+Scheduler-managed paged KV provides a page-based memory and data-movement
+foundation for diffusion DiT stages. It makes KV capacity explicit, preserves
+stable prefixes across denoising steps, and defines page-granular destinations
+for future AR-to-DiT transfer. HunyuanImage-3.0 is the current request-mode
+reference on CUDA and Ascend NPU; the supported boundaries and follow-up work
+are described below.
 
-The current implementation does not cover Hunyuan paged step execution,
-continuous batching, independent public request batching
-(`supports_request_batch=False`), more than two CFG branches, imported
-AR-to-DiT KV, independent Hunyuan KV contexts, cross-request prefix
-publication, Ring attention, or AllGather-KV SP. The reserved
-`paged_worker_local` mode is also not implemented.
+## Motivation
 
-## Architecture and ownership
+Paged KV is introduced for three related goals:
 
-~~~mermaid
+1. **Memory management:** make diffusion KV capacity visible to the Scheduler
+   so logical requests can reserve and release fixed-size blocks while the
+   Worker owns one reusable physical pool. This improves capacity planning and
+   memory utilization, and can increase request concurrency and throughput when
+   the dense path would otherwise reserve separate full tensors.
+2. **Transfer optimization:** give a DiT stage stable destination page slots so
+   a future AR-to-DiT connector can transfer missing KV blocks directly,
+   instead of gathering a complete tensor into a temporary receiver buffer.
+3. **Prefix reuse:** keep the stable prompt/reference prefix resident while
+   only the timestep/image target is rewritten at each denoising step. The same
+   page-level contract also provides the foundation for canonical prefix-cache
+   reuse when a model supplies cacheable block identities.
+
+Request-local memory management and prefix reuse are implemented by the local
+request path. Cross-stage transfer and cross-request canonical prefix caching
+use the same page interfaces but require model/connector integration that is
+outside the current Hunyuan implementation.
+
+The legacy dense path keeps complete model-owned tensors for each request. The
+paged path instead maps requests to Scheduler blocks and reuses a Worker page
+pool, making capacity and fragmentation explicit. This can improve HBM
+utilization and concurrency, although it does not guarantee lower latency for
+every shape.
+
+## Architecture
+
+The control plane describes and reserves logical sequences. The data plane
+installs the resulting snapshot on each Worker and runs the native attention
+backend.
+
+```mermaid
 flowchart LR
-    A[Request] --> B[Model preprocessing]
-    B -->|Prepared layout + KV requests| C[Scheduler]
-    C -->|Allocation metadata| D[Executor / Worker RPC]
-    D --> E[Worker KV backend]
-    E -->|Pages + BlockTables + slots| F[Model runner]
-    F -->|ForwardContext runtime| G[Common Attention]
-    G --> H[CUDA paged attention]
-    G --> I[Ascend FIA paged attention]
-    C -. release logical blocks .-> C
-    E -. clear physical rows .-> E
-~~~
+    subgraph CP[Control plane]
+        R[Diffusion request] --> P[Model preprocessing<br/>layout, CFG rows, spans]
+        P --> S[Diffusion Scheduler<br/>logical sequences and blocks]
+        S --> M[DiffusionKVMetadata]
+    end
+    M -->|immutable snapshot| X[Executor / RPC]
+    subgraph DP[Data plane: each Worker rank]
+        W[Model runner<br/>physical pages and block tables]
+        W --> A[Paged attention adapter]
+        A --> C[CUDA FlashAttention / FA3]
+        A --> N[Ascend FIA]
+        W --> O[Denoising output]
+    end
+    X --> W
+```
+
+### Ownership boundary
 
 | Component | Owns | Does not own |
 | --- | --- | --- |
-| Model preprocessing | Token/image layout, positions, CFG count, `full_attn_spans` | Physical blocks or Worker state |
-| Scheduler | Request lifecycle, logical sequences, admission, block release | Device tensors or native metadata |
-| Executor/RPC | Transport of an immutable allocation snapshot | Allocation decisions |
-| Worker/model runner | Physical KV tensors, rows, BlockTables, slots, active runtime | Scheduler block lifetime |
-| Common attention layer | Parallel hooks and backend boundary | Request admission or page allocation |
-| Platform backend | Native geometry, BlockTables, metadata, kernel selection | Model-specific token semantics |
+| Model preprocessing | Lengths, positions, CFG count, and attention spans | Physical blocks or Worker state |
+| Diffusion Scheduler | Request lifecycle, logical sequences, admission, and release | Device tensors or native kernel metadata |
+| Executor/RPC | Transport of the immutable allocation snapshot | Allocation decisions or page contents |
+| Worker/model runner | Rank-local KV tensors, rows, block tables, slots, and active metadata | Scheduler block lifetime |
+| Paged attention adapter | Layout translation, slot metadata, and backend dispatch | Capacity management or request admission |
+| Platform backend | Native page geometry, metadata construction, and kernel selection | Model-specific token semantics |
 
-The public request owns one logical sequence per Hunyuan CFG branch (one
-sequence when CFG is disabled). These sequences are allocated and released as
-one unit. `DiffusionKVMetadata` is an allocation snapshot containing IDs,
-lengths, and block IDs; it contains no device pointers, K/V tensors, or mutable
-Scheduler objects.
+`DiffusionKVCacheManager` is the request-facing Scheduler facade: it groups and
+atomically allocates the internal sequences for one request, then publishes
+`DiffusionKVMetadata` over the Worker-owned physical pool.
 
-## Lifecycle
+### Request lifecycle
+
+1. **Admission:** preprocessing creates one logical sequence per CFG branch;
+   the Scheduler reserves all required blocks atomically.
+2. **Activation:** the Worker validates the metadata generation, binds rows,
+   stages block tables, and installs native attention metadata.
+3. **Execution:** the first denoising step writes the complete sequence once;
+   later steps write only the changing target span and read retained pages.
+4. **Release:** completion, cancellation, errors, and reinitialization release
+   Scheduler blocks and clear Worker rows.
+
+Dense requests do not install paged metadata. Paged requests reject legacy
+dense KV payloads or stale/incomplete native metadata instead of silently
+falling back to dense execution.
+
+### AR-to-DiT transfer contract
+
+When an AR stage and a DiT stage are deployed separately, the previous
+model-owned transfer commonly gathers and flattens a complete KV tensor into a
+temporary receiver buffer before the DiT model can use it.
+
+The Scheduler-managed contract gives the DiT Worker a destination page layout
+before transfer. The current feature implements this DiT-side destination
+contract (reservation, layout, and generation/readiness metadata); it does not
+execute connector transfers or import AR KV. A future connector can target the
+reserved slots directly:
+
+```mermaid
+flowchart LR
+    A[AR Worker<br/>source pages] --> X[Connector<br/>missing blocks]
+    S[DiT Scheduler<br/>reserve destination blocks] --> D[DiT Worker<br/>destination pages]
+    X --> D
+    D --> F[Native DiT attention]
+```
+
+The diagram is a target connector boundary, not an enabled runtime path in this
+feature. The expected benefits of a future connector using this contract are:
+
+| Concern | Previous model-owned transfer | Page-native destination contract |
+| --- | --- | --- |
+| Transfer unit | Packed or complete KV tensor | Individual missing page blocks |
+| Receiver storage | Temporary contiguous tensor, then model cache | Scheduler-reserved Worker pages |
+| Data movement | Gather/flatten plus another copy or concatenation | Direct write to destination slots when a connector is enabled |
+| Readiness | Implicit runner-side synchronization | Explicit generation and ready metadata |
+| Denoising reuse | Reassemble the stable prefix in the model | Native attention reads resident pages |
+| Cleanup | Transfer and model-cache lifetimes are coupled | Source lease, destination reservation, and request release are explicit |
+
+Reserving destination pages up front supplies stable physical targets and an
+explicit generation/ready state, so a future connector can move only missing
+blocks and pass the same metadata to native attention. Imported AR KV is not
+enabled for `paged_scheduler` in this PR; DreamZero and LingBot-World use the
+separate `ar_diffusion_kv` contract.
+
+## Execution Modes
+
+Paged KV is a cache feature; request batching and step execution are separate
+engine modes. The terminology follows the
+[diffusion continuous batching design](diffusion_continuous_batching.md):
+
+| Execution path | Configuration | Scheduler batch unit | Hunyuan `paged_scheduler` status |
+| --- | --- | --- | --- |
+| Request execution | `step_execution=false`, `max_num_seqs=1` | One complete denoising request | Current supported path |
+| Request-level batching | `step_execution=false`, `max_num_seqs>1` | Multiple compatible public requests in one forward | Not supported by the current `paged_scheduler` integration |
+| Step execution | `step_execution=true`, `max_num_seqs=1` | One request advances one denoising step per scheduler tick | Paged path rejects it |
+| Step continuous batching | `step_execution=true`, `max_num_seqs>1` | Compatible active step states advance together | Separate feature; paged Hunyuan is not implemented |
+
+`max_num_seqs` limits public requests. CFG branches are internal rows of one
+request and are controlled by `diffusion_kv_max_rows_per_request`: a request
+without CFG uses one row, while the standard positive/negative CFG request uses
+two. Atomic CFG admission does not mean that CFG is required.
+
+## Design
 
 ### Startup and cache sizing
 
-Before admitting requests, the engine and Workers:
+Before real requests are admitted, the engine and Workers:
 
 1. Resolve `diffusion_kv_mode` and prepare a maximum-shape profile request.
-2. Register paged attention layers and report a native `KVCacheSpec` per group.
-3. Profile the request to determine non-KV memory. This probe is marked
-   `in_diffusion_kv_memory_profile` and is not a latency sample.
-4. Build the native vLLM cache configuration and resolve block geometry.
-5. Allocate rank-local physical pages and native BlockTables, then create the
-   Scheduler's `DiffusionKVCacheManager` over the same geometry.
+2. Register paged attention layers and collect a native `KVCacheSpec` per KV
+   group.
+3. Run the marked memory profile to determine non-KV memory. This probe is not
+   a latency sample. On NPU, it may use SDPA only when MindIE-SD is
+   unavailable; this is the sole intentional fallback and applies only to this
+   startup profile.
+4. Build the native cache configuration and resolve block geometry.
+5. Allocate rank-local physical pages and create the Scheduler facade over the
+   same geometry.
 
-`kv_cache_memory_bytes` is an explicit physical KV-pool budget per Worker and
-rank. It is not a request token count. Without it, sizing uses the normal
-`gpu_memory_utilization` path:
+`kv_cache_memory_bytes` is a physical KV-pool budget per Worker rank, not a
+request token count. When omitted, the normal utilization path sizes the pool
+after subtracting profiled non-KV memory. Reserved pool memory can exceed the
+live payload because it also reflects capacity and fragmentation.
 
-~~~text
-requested_memory = device_total_memory * gpu_memory_utilization
-available_kv_memory = requested_memory - profiled_non_kv_memory
-~~~
+### Logical layout
 
-Once the pool exists, a sequence of length `seq_len` needs approximately
-`ceil(seq_len / block_size)` blocks. Allocator `reserved` memory can exceed
-live payload because it describes pool capacity and fragmentation.
+Each sequence has a stable prefix and a changing target:
 
-Relevant configuration fields are:
+```text
+|-------------------------- allocated seq_len --------------------------|
+|---------------- prefix_len ----------------|---- target_len ----|unused|
+             retained across steps                 rewritten each step
+```
 
-| Field | Meaning |
-| --- | --- |
-| `diffusion_kv_mode` | `dense_legacy` (default) or `paged_scheduler` |
-| `diffusion_kv_max_rows_per_request` | Maximum Worker rows, including CFG branches |
-| `kv_cache_memory_bytes` | Optional explicit per-rank physical pool budget |
-| `gpu_memory_utilization` | Automatic pool-sizing fraction when no byte budget is set |
-| `max_model_len` | Per-sequence admission ceiling |
-| `max_num_seqs` | Maximum public requests in one Scheduler wave |
-| `max_num_batched_tokens` | Native attention token capacity for a prepared batch |
-
-### Admission and release
-
-The Scheduler facade validates IDs and lengths, computes the full reservation
-for every CFG branch, and waits when the pool is temporarily full. When all
-branches fit, it allocates them with `full_sequence_must_fit=True`; any
-partial failure rolls back the whole request. One metadata snapshot is then
-published with an allocation generation.
-
-On the Worker, installing a snapshot validates the generation, group count,
-block IDs, row capacity, and lengths; binds each logical identity to a free
-row; stages BlockTables; and invalidates metadata if the tables changed.
-Reinstalling the same generation is idempotent. A stale generation, duplicate
-identity, invalid block, or mismatched group count is a hard error.
-
-Scheduler logical blocks and Worker physical rows are released independently
-on completion, cancellation, admission failure, errors, `close`, and
-reinitialization. Dense requests never install paged metadata, and paged
-requests reject legacy dense `past_key_values` payloads.
-
-## Request execution and Hunyuan layout
-
-The current contract is request-level execution (`step_execution=false`). The
-runner installs the allocation snapshot, prepares row metadata, and executes
-the normal pipeline forward. For each sequence it uses the following rows:
+The runner exposes these boundaries to the adapter:
 
 | Phase | `query_len` | `seq_len` | `kv_start_pos` |
 | --- | ---: | ---: | ---: |
 | First denoising/prefill | `seq_len` | `seq_len` | `0` |
 | Later denoising steps | `target_len` | `prefix_len + target_len` | `prefix_len` |
 
-The ordered sequence identity is unchanged between phases. The runner places
-the active rows and `DiffusionPagedAttentionRuntime` in `ForwardContext`; the
-denoising loop switches from prefill to denoise metadata once and reuses it
-across all attention layers.
+For `block_size`, token position `p` maps to the native slot
+`block_id(p // block_size) * block_size + p % block_size`. The Scheduler owns
+the block IDs; the Worker turns them into rank-local tables and slots.
 
-Hunyuan-specific preprocessing in `request_layout.py` derives:
+### Dense and paged representation
 
-~~~text
-prefix_len = final generated-timestep scatter position
-target_len = image tokens + timestep token + guidance token
-seq_len    = final real position in the prepared row
-~~~
+Both modes implement Hunyuan's mixed causal/full attention. They differ in KV
+representation and backend input, not in the attention result they describe:
 
-`HunyuanImage3Pipeline` creates one KV sequence for each conditional or
-unconditional CFG branch. CFG rows are internal branches of one request, not
-unrelated public requests. `_forward_paged()` validates lengths and spans,
-describes Q/K/V layout, clears the legacy dense prompt cache, and handles the
-Hunyuan prompt/image split needed by strict Ulysses SP. It does not allocate
-blocks or activate the Worker runtime.
-
-Strict Ulysses SP is supported in request mode. The parallel strategy performs
-its Q/K/V exchange, the paged adapter removes synthetic padding before native
-metadata preparation, and zero placeholders are restored before the reverse
-exchange. Ring and AllGather-KV SP are rejected because their metadata and
-communication contracts are different.
-
-## Attention execution
-
-Dense and paged paths implement the same mixed causal/full attention. They
-differ in storage and in how a backend realizes the mask.
-
-### Dense path
-
-The Hunyuan dense path materializes a 4-D mask and carries equivalent
-`full_attn_spans` metadata. On NPU, the normal dense backend usually makes one
-masked attention call per layer. On CUDA, the shared piecewise FA helper may
-use one dense call per aligned segment. Thus "dense" describes the tensor
-representation, not a universal number of kernel calls.
-
-### Paged path
-
-Paged execution passes `full_attn_spans` instead of a quadratic mask. Each row
-is converted into aligned native segments:
-
-| Segment | Native inputs | Causal flag |
+| Aspect | `dense_legacy` | `paged_scheduler` |
 | --- | --- | --- |
-| Causal `[s, e)` | `Q[s:e]`, `K[:e]`, `V[:e]` | `true` |
-| Full `[a, b)` | Query overlap, `K[:b]`, `V[:b]` | `false` |
+| KV owner | Model-owned contiguous cache | Worker-owned physical pages |
+| Attention input | Contiguous K/V with a dense mask and/or span metadata | Block tables, slots, lengths, and `full_attn_spans` |
+| Prefix reuse | Model-owned prefix tensor; cache scope depends on the dense path | Stable prefix pages are retained across denoising steps; canonical cross-request reuse requires cache identities |
+| Scheduler state | No diffusion page reservation | Logical sequences, admission, generation, and release |
 
-The segment boundaries preserve bottom-right causal alignment. Native paged
-calls read persistent Worker pages, and results are restored to the original
-token order before `o_proj`, residual, and MLP layers consume them.
+The current implementation guarantees prefix reuse between the first and later
+denoising steps. Native vLLM cross-request prefix caching is not enabled by
+this Hunyuan integration: the diffusion KV manager uses
+`enable_caching=False`, and Hunyuan does not publish canonical block hashes.
 
-The K/V update is outside the segment loop:
+### Attention execution
 
-~~~text
+The two paths preserve the same mixed causal/full spans. In the paged path,
+the adapter converts each row into aligned native segments:
+
+| Segment | Query input | KV visibility | Causal flag |
+| --- | --- | --- | --- |
+| Causal `[s, e)` | `Q[s:e]` | `K[:e]`, `V[:e]` | `true` |
+| Full `[a, b)` | Query overlap | `K[:b]`, `V[:b]` | `false` |
+
+The K/V update is deliberately outside the segment loop:
+
+```text
 Q/K/V projection
-  -> write the current K/V span once
-  -> run all piecewise native attention segments
-  -> restore output order
-~~~
+    -> write the current K/V span once per layer
+    -> run all causal/full native segments
+    -> restore output order
+```
 
-CUDA keeps the update in its native paged-attention contract. Ascend performs
-an explicit normal-layout cache prewrite, then FIA segment calls read the
-written pages without a K/V source. The obsolete logical-cache to PA_NZ and
-back conversion is not part of this contract.
+CUDA keeps cache-update ownership in its native paged-attention contract.
+Ascend prewrites the normal-layout K/V span once, then FIA segment calls read
+the persistent pages without receiving K/V again. Output is restored to the
+original token order before projection, residual, and MLP layers consume it.
 
-## Piecewise planning
+Dense does not imply one universal kernel call. Hunyuan's CUDA dense path can
+also use the shared piecewise FlashAttention helper for aligned regions. In
+the paged path, the same regions are described as native segments that read
+persistent pages. The two modes can therefore have different kernel names and
+call counts while preserving the same mask semantics.
 
-`DiffusionPagedAttentionAdapter` resolves Worker rows, gathers BlockTables,
-computes slots, builds platform metadata, and caches the segment plan for the
-active forward.
+### Piecewise planning
 
-| Row layout | Execution | Purpose |
-| --- | --- | --- |
-| Homogeneous query lengths and ranges | Keep `[B, T, ...]`, flatten each segment for the native call, then reshape/concatenate or write directly to the output buffer | Avoid the large indexed output scatter for homogeneous CFG rows |
-| Heterogeneous lengths or offsets | `index_select` valid tokens, run native calls, then `index_copy_` into the original layout | General fallback preserving each row's token order |
+The common planner supports both row layouts:
 
-The fast path applies only to rows inside one attention invocation. It does not
-enable arbitrary public-request batching or change Scheduler allocation.
-
-## Platform boundary
-
-| Concern | NVIDIA GPU | Ascend NPU |
-| --- | --- | --- |
-| Block tables | Native vLLM `BlockTables` | `AscendBlockTables` from vLLM-Ascend |
-| Paged kernel | Native FlashAttention/FA3 | Ascend `FusedInferAttentionScore` (FIA) |
-| Cache update | Native paged writer/kernel | Explicit normal-layout prewrite |
-| Attention metadata | vLLM GPU builder | Ascend builder with `ChunkedPrefill` state |
-| SP specialization | Native strict Ulysses integration | Ascend paged strict-Ulysses path |
-| Dense dependency | Platform-selected dense backend | MindIE-SD when available; SDPA only for the marked startup profile |
-
-Hardware-specific imports and policy stay behind `OmniPlatform` hooks such as
-`get_diffusion_kv_block_tables_cls()`,
-`build_diffusion_kv_attn_metadata()`, and
-`requires_diffusion_paged_kv_prewrite()`.
-
-## Configuration and compatibility
-
-`paged_scheduler` requires a native cache configuration,
-`diffusion_kv_max_rows_per_request`, and a prepared memory-profile request.
-The dense path remains the default `dense_legacy` path and keeps its existing
-backend and compatibility cache.
-
-For operator-facing setup and a request example, see the
-[Scheduler-Managed Paged KV Cache user guide](../../user_guide/diffusion/paged_kv_cache.md).
-
-### Supported model, platform, and mode matrix
-
-The matrix below describes the current implementation and validation scope.
-`paged_scheduler` is a model integration, not a switch that enables paging for
-every diffusion pipeline.
-
-| Model or integration | Platform | Mode or KV contract | Execution | Backend and status |
-| --- | --- | --- | --- | --- |
-| HunyuanImage3 | NVIDIA CUDA | `dense_legacy` | Request; dense step execution follows existing backend constraints | Existing dense path |
-| HunyuanImage3 | NVIDIA CUDA | `paged_scheduler` | Request-level only | `FLASH_ATTN` -> native FlashAttention/FA3; implemented and validated |
-| HunyuanImage3 | Ascend NPU | `dense_legacy` | Request; dense step execution follows existing backend constraints | Existing dense path |
-| HunyuanImage3 | Ascend NPU | `paged_scheduler` | Request-level only | `FLASH_ATTN` -> Ascend FIA; implemented and validated |
-| DreamZero / LingBot-World | Platform-specific | Separate `ar_diffusion_kv` contract | Model-specific AR-to-DiT flow | Imported-AR-KV path; not a `diffusion_kv_mode` value or `paged_scheduler` |
-| Other diffusion models | Any | `paged_scheduler` | N/A | No model integration or validation yet |
-
-The two Hunyuan paged rows are the only current Scheduler-managed paged-KV
-model integrations. The `ar_diffusion_kv` state used by DreamZero and
-LingBot-World is a different contract; imported AR KV is explicitly rejected
-when `diffusion_kv_mode=paged_scheduler`.
-
-### Attention backend capability
-
-The abstract `AttentionBackend` defaults to `supports_paged_kv=False`. At
-present, only `FlashAttentionBackend` opts in. Select the logical
-`FLASH_ATTN` backend: CUDA resolves it to native FlashAttention/FA3 and Ascend
-resolves it to native FIA. `TORCH_SDPA`, `CUDNN_ATTN`, `FLASHINFER_ATTN`,
-`SAGE_ATTN`, the Hub backends, and other diffusion backends do not currently
-advertise Scheduler-managed paged-KV support and must not be treated as a
-transparent fallback.
-
-### Quantization
-
-The current Hunyuan Scheduler-managed paged KV path is unquantized BF16. The
-paged adapter initializes Q/K/V scales to identity, and Hunyuan's paged cache
-specification uses `torch.bfloat16`. The generic `diffusion_kv_cache_dtype` quantization
-metadata is not part of the current `forward_paged()` contract. Model weight
-quantization (`quantization_config`) is a separate concern; its interaction
-with paged KV has not been validated. Do not infer FP8 paged-KV support from a
-quantized model or from the dense attention path.
-
-### CPU offload and distributed layerwise offload
-
-`enable_cpu_offload`, `enable_layerwise_offload`, and distributed layerwise
-offload (DLO) have no combined compatibility validation or complete test
-coverage with `paged_scheduler`. Their status with Scheduler-managed paged KV
-is therefore **unknown / untested**. For a validated paged-KV setup, leave
-these offload options disabled. If offload is required, use the
-`dense_legacy` mode instead.
-
-| Combination | Status |
+| Row layout | Preparation and output handling |
 | --- | --- |
-| Request execution, TP, no SP with `FLASH_ATTN` | Supported for the Hunyuan CUDA and NPU integrations above |
-| Request execution, strict Ulysses SP with `FLASH_ATTN` | Supported by the current GPU and NPU integrations |
-| Request execution, two-branch CFG parallel with `FLASH_ATTN` | Supported with one allocated row per CFG rank |
-| Other diffusion attention backends | Rejected for Scheduler-managed paged KV; no `supports_paged_kv` opt-in |
-| Hunyuan paged step execution | Rejected; use `dense_legacy` |
-| Independent public request batching | Disabled (`supports_request_batch=False`) |
-| Ring or AllGather-KV SP | Rejected in the paged path |
-| Imported AR KV or independent Hunyuan contexts | Not implemented |
-| Cross-request prefix publication | Disabled; pages are request-local |
+| Homogeneous ranges, such as CFG rows from one request | Keep the batched layout, use contiguous views/direct output-buffer writes, and avoid the large indexed output scatter |
+| Heterogeneous lengths or offsets | Gather valid tokens with `index_select`, run native segments, and scatter them back with `index_copy_` |
 
-## Invariants, errors, and validation
+The homogeneous fast path applies to rows in one attention invocation; it does
+not enable arbitrary public-request batching or change Scheduler allocation.
 
-Implementations must preserve these invariants:
+## Model and Platform Integration
 
-1. Each `(request_id, sequence_id/context_id)` maps to one active Worker row.
-2. Every CFG branch fits before execution begins.
-3. `kv_start_pos + query_len <= seq_len`, and installed pages cover `seq_len`.
-4. Prefill and denoise retain identity; only lengths and write offset change.
-5. Span and native metadata stay stable across layers in one forward.
-6. Dense and paged ownership are exclusive, with no accidental fallback.
-7. Scheduler blocks and Worker rows are both released on every terminal path.
+### HunyuanImage-3.0
 
-Errors should be raised by the owner that can explain them: preprocessing for
-malformed layout, Scheduler for capacity, Worker for row/table state, adapter
-for shape or metadata mismatch, and platform for unavailable kernels or
-parallel strategies. The only intentional pre-admission exception is the
-explicitly marked memory profile.
+Hunyuan is the reference integration because its self-attention mixes causal
+and full regions and its generated-image region changes across denoising
+steps. It creates one logical row per conditional or unconditional CFG branch
+and supports strict Ulysses SP in request mode. Its runner owns row creation,
+phase activation, and page metadata; the model boundary supplies token layout
+and attention spans without allocating Scheduler blocks.
 
-Validation should cover mode and sizing, atomic Scheduler allocation, Worker
-row/BlockTable contracts, adapter metadata and piecewise paths, Hunyuan layout,
-and matched dense/paged E2E output. A run should record model and Omni commit,
-platform/backend, TP/SP/CFGP topology, block geometry, KV budget, warmup
-policy, request count, and output validity. A paged run is valid only with
-native-path evidence (CUDA paged FlashAttention or Ascend FIA/cache-writer
-events) and no active dense fallback.
+### Platform matrix
 
-## Implementation map
+| Model/integration | Platform | Execution | Backend | Status |
+| --- | --- | --- | --- | --- |
+| HunyuanImage-3.0 | NVIDIA CUDA | Request-level | `FLASH_ATTN` -> native FlashAttention/FA3 | Implemented and validated |
+| HunyuanImage-3.0 | Ascend NPU | Request-level | `FLASH_ATTN` -> Ascend FIA | Implemented and validated |
+| DreamZero / LingBot-World | Platform-specific | Separate `ar_diffusion_kv` contract | Imported AR-KV path | Not `paged_scheduler` |
+| Other diffusion models | Any | N/A | N/A | No paged integration yet |
 
-- Scheduler and requests: [`diffusion_kv/manager.py`](gh-file:vllm_omni/diffusion/diffusion_kv/manager.py), [`diffusion_kv/request.py`](gh-file:vllm_omni/diffusion/diffusion_kv/request.py), [`diffusion_kv/metadata.py`](gh-file:vllm_omni/diffusion/diffusion_kv/metadata.py)
-- Initialization and Worker data plane: [`diffusion_kv/initialization.py`](gh-file:vllm_omni/diffusion/diffusion_kv/initialization.py), [`diffusion_kv/model_runner_backend.py`](gh-file:vllm_omni/diffusion/diffusion_kv/model_runner_backend.py)
-- Adapter and runtime: [`diffusion_kv/paged_attention_adapter.py`](gh-file:vllm_omni/diffusion/diffusion_kv/paged_attention_adapter.py), [`worker/diffusion_model_runner.py`](gh-file:vllm_omni/diffusion/worker/diffusion_model_runner.py), [`forward_context.py`](gh-file:vllm_omni/diffusion/forward_context.py)
-- Attention and piecewise planner: [`attention/layer.py`](gh-file:vllm_omni/diffusion/attention/layer.py), [`attention/backends/flash_attn.py`](gh-file:vllm_omni/diffusion/attention/backends/flash_attn.py), [`attention/backends/utils/piecewise_attn.py`](gh-file:vllm_omni/diffusion/attention/backends/utils/piecewise_attn.py)
-- Hunyuan boundary: [`models/hunyuan_image3/request_layout.py`](gh-file:vllm_omni/diffusion/models/hunyuan_image3/request_layout.py), [`models/hunyuan_image3/pipeline_hunyuan_image3.py`](gh-file:vllm_omni/diffusion/models/hunyuan_image3/pipeline_hunyuan_image3.py), [`models/hunyuan_image3/hunyuan_image3_transformer.py`](gh-file:vllm_omni/diffusion/models/hunyuan_image3/hunyuan_image3_transformer.py)
+The logical `FLASH_ATTN` selector is the only current paged-KV capability
+advertised by `FlashAttentionBackend`. Other diffusion backends do not
+transparently fall back to dense attention for a paged request.
+
+## Configuration and Compatibility
+
+`paged_scheduler` requires a native cache configuration, a positive row limit,
+and a prepared memory-profile request. The main fields are:
+
+| Field | Meaning |
+| --- | --- |
+| `diffusion_kv_mode` | `dense_legacy` (default) or `paged_scheduler` |
+| `diffusion_kv_max_rows_per_request` | Worker row capacity for one public request, including CFG branches |
+| `kv_cache_memory_bytes` | Optional explicit physical KV-pool budget per Worker rank |
+| `gpu_memory_utilization` | Automatic pool sizing when no byte budget is supplied |
+| `diffusion_attention_backend` | Must resolve to `FLASH_ATTN` for the current paged implementation |
+
+The user guide contains the stage YAML and `vllm serve --omni` example.
+Use request execution for the current Hunyuan integration; the unsupported
+batching and step modes are summarized in [Execution Modes](#execution-modes).
+
+The current paged KV format is unquantized BF16 with identity Q/K/V scales.
+Model weight quantization, CPU offload, layerwise offload, and distributed
+layerwise offload (DLO) have not been validated with this path. Leave those
+options disabled for a validated paged setup; use `dense_legacy` when they are
+required.
+
+## Limitations
+
+- Hunyuan `paged_scheduler` is request-level only; request batching and step
+  execution are not implemented (see [Execution Modes](#execution-modes)).
+- Only strict Ulysses SP and the current two-branch CFG layout are supported;
+  Ring, AllGather-KV, and independent Hunyuan KV contexts are not implemented.
+- Imported AR-to-DiT page transfer and cross-request canonical prefix caching
+  are follow-up integrations; `ar_diffusion_kv` is a separate contract.
+- Quantized KV and CPU/DLO offload combinations are untested.
+- For a formal `paged_scheduler` request, missing native metadata or backend
+  support is an explicit error, not a dense or SDPA fallback. The marked
+  startup memory profile is the only intentional exception.
+
+## Related Files
+
+- Scheduler and allocation: [`diffusion_kv/manager.py`](gh-file:vllm_omni/diffusion/diffusion_kv/manager.py), [`diffusion_kv/request.py`](gh-file:vllm_omni/diffusion/diffusion_kv/request.py), [`diffusion_kv/metadata.py`](gh-file:vllm_omni/diffusion/diffusion_kv/metadata.py)
+- Scheduler and runtime: [`sched/base_scheduler.py`](gh-file:vllm_omni/diffusion/sched/base_scheduler.py), [`diffusion_kv/config.py`](gh-file:vllm_omni/diffusion/diffusion_kv/config.py), [`forward_context.py`](gh-file:vllm_omni/diffusion/forward_context.py), [`vllm_config.py`](gh-file:vllm_omni/diffusion/vllm_config.py)
+- Executor boundary: [`executor/abstract.py`](gh-file:vllm_omni/diffusion/executor/abstract.py), [`executor/uniproc_executor.py`](gh-file:vllm_omni/diffusion/executor/uniproc_executor.py)
+- Worker data plane: [`diffusion_kv/initialization.py`](gh-file:vllm_omni/diffusion/diffusion_kv/initialization.py), [`diffusion_kv/model_runner_backend.py`](gh-file:vllm_omni/diffusion/diffusion_kv/model_runner_backend.py), [`worker/diffusion_model_runner.py`](gh-file:vllm_omni/diffusion/worker/diffusion_model_runner.py)
+- Attention adapter and planner: [`diffusion_kv/paged_attention_adapter.py`](gh-file:vllm_omni/diffusion/diffusion_kv/paged_attention_adapter.py), [`attention/layer.py`](gh-file:vllm_omni/diffusion/attention/layer.py), [`attention/backends/flash_attn.py`](gh-file:vllm_omni/diffusion/attention/backends/flash_attn.py), [`attention/backends/utils/piecewise_attn.py`](gh-file:vllm_omni/diffusion/attention/backends/utils/piecewise_attn.py)
+- Model boundary: [`models/hunyuan_image3/request_layout.py`](gh-file:vllm_omni/diffusion/models/hunyuan_image3/request_layout.py), [`models/hunyuan_image3/pipeline_hunyuan_image3.py`](gh-file:vllm_omni/diffusion/models/hunyuan_image3/pipeline_hunyuan_image3.py), [`models/hunyuan_image3/hunyuan_image3_transformer.py`](gh-file:vllm_omni/diffusion/models/hunyuan_image3/hunyuan_image3_transformer.py)
 - Platform hooks: [`platforms/interface.py`](gh-file:vllm_omni/platforms/interface.py), [`platforms/cuda/platform.py`](gh-file:vllm_omni/platforms/cuda/platform.py), [`platforms/npu/platform.py`](gh-file:vllm_omni/platforms/npu/platform.py)
-
-## Related design work
-
-The control-plane contracts were introduced in #5541 and #5550, native
-Scheduler allocation was added in #6094, and the Worker data plane in #6102.
-Hunyuan GPU integration and shared piecewise execution began in #6658 and
-were consolidated with the Ascend implementation in #6563. Future DiT models
-should reuse these contracts and add only model-specific layout, profiling,
-and backend capability requirements.
