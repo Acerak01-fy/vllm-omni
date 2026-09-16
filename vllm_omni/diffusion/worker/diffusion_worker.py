@@ -8,6 +8,8 @@ Handles GPU infrastructure initialization and delegates model operations
 to DiffusionModelRunner.
 """
 
+from __future__ import annotations
+
 import gc
 import multiprocessing as mp
 import os
@@ -19,7 +21,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
@@ -87,6 +89,9 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
+
+if TYPE_CHECKING:
+    from vllm.distributed.weight_transfer.base import WeightTransferEngine
 
 logger = init_logger(__name__)
 
@@ -257,6 +262,8 @@ class DiffusionWorker:
         # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
+        self.weight_transfer_engine: WeightTransferEngine | None = None
+        self._weight_update_active = False
         self.init_device()
         # Create model runner — one decision chain, in precedence order:
         #   1. explicit od_config.diffusion_model_runner_cls (user override),
@@ -291,9 +298,37 @@ class DiffusionWorker:
             device=self.device,
         )
         self.profiler: WorkerProfiler | None = self._create_profiler()
+        # Set by init_device() above; read defensively so a skip-init path
+        # (or a mock od_config in tests) degrades to "not configured".
+        wt_config = getattr(self.vllm_config, "weight_transfer_config", None)
         if not skip_load_model:
             self.load_model(load_format=self.od_config.diffusion_load_format)
+            # Weight transfer engines bind the live model at construction
+            # (mirrors upstream vLLM gpu_worker), so they are created only
+            # after the model has been loaded.
+            if wt_config is not None:
+                # Register omni's in-place engine variants (e.g. "omni_ipc"
+                # for diffusers-style pipelines) before any engine is built.
+                from vllm_omni.diffusion.worker.weight_transfer_engine import (
+                    register_omni_weight_transfer_engines,
+                )
+
+                register_omni_weight_transfer_engines()
+                from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
+
+                self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
+                    wt_config,
+                    self.vllm_config,
+                    self.device,
+                    self.model_runner.pipeline,
+                )
             self.init_lora_manager()
+        elif wt_config is not None:
+            logger.warning(
+                "Worker %s: weight_transfer_config is set but the model was not "
+                "loaded (skip_load_model=True); weight transfer stays disabled.",
+                self.rank,
+            )
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def init_device(self) -> None:
@@ -318,6 +353,7 @@ class DiffusionWorker:
         # Since vLLM v0.20.0, IR wraps GPU ops. Set IR op priority preference to enforce GPU op fusion during wrapping.
         # Also need to log, because vLLM internally logs another line in VllmConfig.__post_init__. Avoid confusion.
         vllm_config.kernel_config.ir_op_priority = _resolve_ir_op_priority(self.od_config, vllm_config)
+
         if self.od_config.moe_backend != "auto":
             logger.warning(
                 "Overriding MoE backend from default 'auto' to '%s' per deploy config.",
@@ -619,6 +655,61 @@ class DiffusionWorker:
     def close_ar_diffusion_session(self, session_id: str) -> bool:
         """Close runner-owned AR state through the collective RPC boundary."""
         return self._run_ar_diffusion_session_lifecycle("close_session", session_id)
+
+    def _get_weight_transfer_engine(self) -> WeightTransferEngine:
+        """Return the initialized weight transfer engine, or raise if unset."""
+        if self.weight_transfer_engine is None:
+            raise RuntimeError("Weight transfer engine not initialized. Set weight_transfer_config in engine args.")
+        return self.weight_transfer_engine
+
+    def init_weight_transfer_engine(self, init_info: dict) -> None:
+        """Initialize weight transfer mechanism for diffusion stage.
+
+        Args:
+            init_info: Dictionary containing backend-specific initialization info
+        """
+        engine = self._get_weight_transfer_engine()
+        typed_init_info = engine.parse_init_info(init_info)
+        engine.init_transfer_engine(typed_init_info)
+
+    def start_weight_update(self) -> None:
+        """Start a new weight update session for diffusion model."""
+        engine = self._get_weight_transfer_engine()
+        if self._weight_update_active:
+            raise RuntimeError(
+                "start_weight_update called while a weight update is already active. Call finish_weight_update first."
+            )
+        try:
+            engine.start_weight_update()
+        except BaseException:
+            engine.reset_weight_update_target()
+            raise
+        self._weight_update_active = True
+
+    def update_weights(self, update_info: dict) -> None:
+        """Receive one weight update chunk from the trainer.
+
+        Args:
+            update_info: Backend-specific update info
+        """
+        engine = self._get_weight_transfer_engine()
+        if not self._weight_update_active:
+            raise RuntimeError("start_weight_update must be called before update_weights.")
+        try:
+            engine.update_weights(update_info)
+        except BaseException:
+            self._weight_update_active = False
+            engine.reset_weight_update_target()
+            raise
+
+    def finish_weight_update(self) -> None:
+        """Finish the current weight update session."""
+        engine = self._get_weight_transfer_engine()
+        if not self._weight_update_active:
+            raise RuntimeError("finish_weight_update called without a matching start_weight_update.")
+        engine.finish_weight_update()
+        engine.reset_weight_update_target()
+        self._weight_update_active = False
 
     def execute_model(
         self,
@@ -1091,7 +1182,7 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         worker_extension_cls: str | None,
         custom_pipeline_args: dict[str, Any] | None = None,
-    ) -> "WorkerWrapperBase":
+    ) -> WorkerWrapperBase:
         """Create a worker instance. Override in subclasses for different worker types."""
         worker_cls_path = current_omni_platform.get_diffusion_worker_cls()
         base_worker_class = resolve_obj_by_qualname(worker_cls_path)
