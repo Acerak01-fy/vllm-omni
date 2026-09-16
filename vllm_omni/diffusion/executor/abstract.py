@@ -174,7 +174,31 @@ class DiffusionExecutor(ABC):
         )
 
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput) -> KVConnectorOutput | None:
-        if scheduler_output.kv_connector_metadata is None:
+        if scheduler_output.kv_prefetch_connector_metadata is not None:
+            current = replace(
+                scheduler_output,
+                kv_transfer_request_ids=scheduler_output.kv_transfer_request_ids
+                - scheduler_output.kv_prefetch_request_ids,
+                kv_prefetch_connector_metadata=None,
+                kv_prefetch_request_ids=set(),
+            )
+            # First complete the current request on every rank. Only then
+            # submit B, preventing Mooncake from coalescing its bytes with A.
+            self.prepare_kv_for_forward(current)
+            return self.prepare_kv_for_forward(
+                replace(
+                    current,
+                    kv_connector_metadata=scheduler_output.kv_prefetch_connector_metadata,
+                    kv_transfer_request_ids=scheduler_output.kv_prefetch_request_ids,
+                    kv_required_request_ids=set(),
+                    kv_finished_request_ids=set(),
+                )
+            )
+        if (
+            scheduler_output.kv_connector_metadata is None
+            and not scheduler_output.kv_required_request_ids
+            and not scheduler_output.kv_poll_only
+        ):
             return
         transfer_output = replace(
             scheduler_output,
@@ -188,12 +212,21 @@ class DiffusionExecutor(ABC):
             unique_reply_rank=0,
             exec_all_ranks=True,
         )
+        required_ids = scheduler_output.kv_required_request_ids
+        if required_ids is None:
+            required_ids = scheduler_output.kv_transfer_request_ids
         if len(outputs) != self.od_config.num_gpus or any(
-            output.invalid_block_ids
-            or not scheduler_output.kv_transfer_request_ids.issubset(output.finished_recving or ())
-            for output in outputs
+            output.invalid_block_ids or not required_ids.issubset(output.finished_recving or ()) for output in outputs
         ):
             raise RuntimeError("Diffusion KV receive did not complete on every rank")
+        # A prefetched row is ready only when every rank has received it.
+        # Workers report cumulative sets, so ranks may finish in different RPCs.
+        if scheduler_output.kv_required_request_ids is not None:
+            return replace(
+                outputs[0],
+                finished_recving=set.intersection(*(set(output.finished_recving or ()) for output in outputs)),
+                finished_sending=set.intersection(*(set(output.finished_sending or ()) for output in outputs)),
+            )
         return outputs[0]
 
     @abstractmethod

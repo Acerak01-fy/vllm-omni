@@ -255,6 +255,13 @@ class DiffusionSchedulerOutput:
     kv_prefetch_job: KVPrefetchJob | None = None
     kv_connector_metadata: KVConnectorMetadata | None = None
     kv_transfer_request_ids: set[str] = field(default_factory=set)
+    # None preserves the synchronous path; an empty set means submit/poll
+    # without waiting. Transfer IDs above are submitted only once.
+    kv_required_request_ids: set[str] | None = None
+    kv_poll_only: bool = False
+    # Keep background transfers out of the current request's Mooncake batch.
+    kv_prefetch_connector_metadata: KVConnectorMetadata | None = None
+    kv_prefetch_request_ids: set[str] = field(default_factory=set)
     # Connector lifecycle uses per-sequence IDs, not public request IDs.
     kv_finished_request_ids: set[str] = field(default_factory=set)
 
@@ -274,4 +281,10 @@ class DiffusionSchedulerOutput:
 
     @property
     def is_empty(self) -> bool:
-        return self.num_scheduled_reqs == 0 and self.kv_connector_metadata is None
+        return (
+            self.num_scheduled_reqs == 0
+            and self.kv_connector_metadata is None
+            and self.kv_prefetch_connector_metadata is None
+            and not self.kv_required_request_ids
+            and not self.kv_poll_only
+        )

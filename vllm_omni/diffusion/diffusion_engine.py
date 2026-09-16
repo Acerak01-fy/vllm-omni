@@ -600,6 +600,7 @@ class DiffusionEngine:
                     if sched_output.scheduled_request_ids
                     else BatchRunnerOutput.from_list([])
                 )
+                self._poll_native_kv()
                 worker_execution_completed = True
             except Exception as exc:
                 if self._closed:
@@ -753,7 +754,12 @@ class DiffusionEngine:
                 raise
 
     def _prepare_kv_for_forward(self, sched_output: DiffusionSchedulerOutput) -> None:
-        if getattr(sched_output, "kv_connector_metadata", None) is None:
+        if (
+            getattr(sched_output, "kv_connector_metadata", None) is None
+            and getattr(sched_output, "kv_prefetch_connector_metadata", None) is None
+            and not getattr(sched_output, "kv_required_request_ids", None)
+            and not getattr(sched_output, "kv_poll_only", False)
+        ):
             return
         try:
             output = self.executor.prepare_kv_for_forward(sched_output)
@@ -761,6 +767,14 @@ class DiffusionEngine:
         except Exception as exc:
             self._fail_engine(exc)
             raise
+
+    def _poll_native_kv(self, *, drain_request_ids: list[str] | None = None) -> None:
+        poll = getattr(self.scheduler, "native_kv_poll_output", None)
+        if poll is None:
+            return
+        output = poll(drain_request_ids=drain_request_ids)
+        if output is not None:
+            self._prepare_kv_for_forward(output)
 
     def _fail_engine(self, exc: Exception) -> None:
         if getattr(self, "_shutdown_complete", False):
@@ -775,13 +789,11 @@ class DiffusionEngine:
         for stream in streams:
             self._put_queue_output(stream, DiffusionOutput.from_exception(exc))
         self._fail_pending_rpcs(exc)
-        try:
-            self.executor.shutdown()
-        finally:
-            try:
-                self.scheduler.close()
-            finally:
-                self._shutdown_complete = True
+        # If Worker shutdown fails, retain the Scheduler reservations. A
+        # remote producer may still be writing into those allocations.
+        self.executor.shutdown()
+        self.scheduler.close()
+        self._shutdown_complete = True
 
     def _emit_finished_outputs(
         self,
@@ -1029,6 +1041,7 @@ class DiffusionEngine:
                         if sched_output.scheduled_request_ids
                         else BatchRunnerOutput.from_list([])
                     )
+                    self._poll_native_kv()
                 except EngineDeadError:
                     raise
                 except Exception as exc:
@@ -1369,8 +1382,15 @@ class DiffusionEngine:
         else:
             self._loop_started = False
 
-        self.scheduler.close()
-        self.executor.shutdown()
+        if getattr(self.scheduler, "_native_prefetch_enabled", False):
+            # No new schedules after the busy loop exits. Finish outstanding
+            # writes before shutting down consumers and releasing reservations.
+            self._poll_native_kv(drain_request_ids=list(self.scheduler._kv_loading_request_ids))
+            self.executor.shutdown()
+            self.scheduler.close()
+        else:
+            self.scheduler.close()
+            self.executor.shutdown()
         self._shutdown_complete = True
 
     def abort(self, request_id: str | Iterable[str]) -> None:
@@ -1406,6 +1426,7 @@ class DiffusionEngine:
         request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
         request_ids = list(dict.fromkeys(request_ids))
 
+        self._poll_native_kv(drain_request_ids=request_ids)
         self._remove_diffusion_kv_requests(request_ids)
 
         for request_id in request_ids:

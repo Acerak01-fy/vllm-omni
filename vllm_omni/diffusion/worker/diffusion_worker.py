@@ -797,6 +797,9 @@ class DiffusionWorker:
         Args:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
+        progress = getattr(self.model_runner, "_kv_receive_progress", None)
+        if progress is not None and progress.submitted:
+            raise RuntimeError("Cannot sleep with live native KV prefetch reservations; finish requests first")
         CuMemAllocator = _get_cumem_allocator_class()
         allocator = CuMemAllocator.get_instance()
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import time
 from abc import ABC, abstractmethod
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import fields
 
 from vllm.config import VllmConfig
@@ -16,7 +17,11 @@ from vllm.v1.request import RequestStatus
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
-from vllm_omni.diffusion.diffusion_kv.kv_connector import commit_kv_load, prepare_kv_requests
+from vllm_omni.diffusion.diffusion_kv.kv_connector import (
+    commit_kv_load,
+    native_prefetch_enabled,
+    prepare_kv_requests,
+)
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVCacheManager
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -65,6 +70,8 @@ class BaseScheduler(ABC):
         self._kv_finished_request_ids: set[str] = set()
         self._kv_loading_request_ids: set[str] = set()
         self._kv_request_generations: dict[str, int] = {}
+        self._native_prefetch_enabled = False
+        self._native_prefetch_request_id: str | None = None
 
     def initialize(
         self,
@@ -76,6 +83,8 @@ class BaseScheduler(ABC):
         kv_vllm_config: VllmConfig | None = None,
     ) -> None:
         self.od_config = od_config
+        self._native_prefetch_enabled = native_prefetch_enabled(od_config)
+        self._native_prefetch_request_id = None
         self._request_states.clear()
         self._step_id = 0
         self._waiting.clear()
@@ -199,16 +208,14 @@ class BaseScheduler(ABC):
                     diffusion_kv_metadata = allocation
                     self._kv_request_generations[request_id] = allocation.allocation_generation
                     if self._kv_connector is not None:
-                        try:
-                            transfer_ids = commit_kv_load(
-                                self._kv_connector,
-                                self._diffusion_kv_manager.native_manager,
-                                state.diffusion_kv_requests,
-                                matched_tokens,
-                            )
-                        except Exception:
-                            self._diffusion_kv_manager.free_request(request_id)
-                            raise
+                        # A partial connector commit may already reference
+                        # these pages. Engine failure stops Workers first.
+                        transfer_ids = commit_kv_load(
+                            self._kv_connector,
+                            self._diffusion_kv_manager.native_manager,
+                            state.diffusion_kv_requests,
+                            matched_tokens,
+                        )
                         self._kv_transfer_request_ids.update(transfer_ids)
                         if transfer_ids:
                             self._kv_loading_request_ids.add(request_id)
@@ -216,6 +223,8 @@ class BaseScheduler(ABC):
                             sequence.num_computed_tokens = request.num_computed_tokens
 
             self._waiting.popleft()
+            if request_id == self._native_prefetch_request_id:
+                self._native_prefetch_request_id = None
             was_new_request = state.status == DiffusionRequestStatus.WAITING
             if not self._running:
                 self._running_sampling_params_key = state.sampling_params_key
@@ -262,12 +271,96 @@ class BaseScheduler(ABC):
             scheduler_output.kv_connector_metadata = self._kv_connector.build_connector_meta(scheduler_output)
             scheduler_output.kv_transfer_request_ids = self._kv_transfer_request_ids
             self._kv_transfer_request_ids = set()
+        if self._native_prefetch_enabled:
+            scheduler_output.kv_required_request_ids = self._loading_sequence_ids(self._running)
+            # Flush current-request metadata before staging B. Mooncake
+            # batches ready requests from the same producer into one write;
+            # combining A+B would make A's completion depend on B's bytes.
+            self._try_native_prefetch()
+            if self._kv_transfer_request_ids:
+                scheduler_output.kv_prefetch_connector_metadata = self._kv_connector.build_connector_meta(
+                    scheduler_output
+                )
+                scheduler_output.kv_prefetch_request_ids = self._kv_transfer_request_ids
+                scheduler_output.kv_transfer_request_ids |= self._kv_transfer_request_ids
+                self._kv_transfer_request_ids = set()
 
         # update after schedule
         self._step_id += 1
         self._finished_req_ids.clear()
         self._kv_finished_request_ids.clear()
         return scheduler_output
+
+    def _try_native_prefetch(self) -> None:
+        if not self._running or not self._waiting or self._native_prefetch_request_id is not None:
+            return
+        request_id = self._waiting[0]
+        state = self._request_states.get(request_id)
+        if state is None or state.is_finished() or not state.diffusion_kv_requests:
+            return
+        manager = self._diffusion_kv_manager
+        if manager.has_request(request_id):
+            return
+        matched_tokens = []
+        for request in state.diffusion_kv_requests:
+            params = request.kv_transfer_params or {}
+            if (
+                not params.get("do_remote_prefill")
+                or not all(params.get(key) for key in ("remote_engine_id", "remote_bootstrap_addr", "transfer_id"))
+                or type(params.get("num_transfer_tokens")) is not int
+                or params["num_transfer_tokens"] <= 0
+            ):
+                return
+            num_tokens, _ = self._kv_connector.get_num_new_matched_tokens(request, 0)
+            if num_tokens is None:
+                return
+            matched_tokens.append(num_tokens)
+        # The manager atomically reserves all CFG rows, including capacity
+        # needed when B eventually executes. B remains in WAITING.
+        try:
+            allocation = manager.reserve_request(request_id, state.diffusion_kv_requests)
+        except Exception as exc:
+            # reserve_request rolls back atomically. Normal admission will
+            # surface B's error later; speculative allocation must not fail A.
+            logger.debug("Native KV prefetch skipped for %s: reservation failed (%s)", request_id, exc)
+            return
+        if allocation is None:
+            logger.debug("Native KV prefetch skipped for %s: insufficient blocks", request_id)
+            return
+        self._kv_request_generations[request_id] = allocation.allocation_generation
+        transfer_ids = commit_kv_load(
+            self._kv_connector, manager.native_manager, state.diffusion_kv_requests, matched_tokens
+        )
+        self._kv_transfer_request_ids.update(transfer_ids)
+        if transfer_ids:
+            self._kv_loading_request_ids.add(request_id)
+        for sequence, request in zip(allocation.sequences, state.diffusion_kv_requests, strict=True):
+            sequence.num_computed_tokens = request.num_computed_tokens
+        self._native_prefetch_request_id = request_id
+        logger.debug("Native KV prefetch submitted for %s: %s", request_id, sorted(transfer_ids))
+
+    def _loading_sequence_ids(self, request_ids: Iterable[str]) -> set[str]:
+        return {
+            request.request_id
+            for request_id in request_ids
+            if request_id in self._kv_loading_request_ids
+            for request in self._request_states[request_id].diffusion_kv_requests
+        }
+
+    def native_kv_poll_output(self, *, drain_request_ids: list[str] | None = None) -> DiffusionSchedulerOutput | None:
+        """Poll after compute; cancellation/close may wait for selected loads."""
+        if not self._native_prefetch_enabled or not self._kv_loading_request_ids:
+            return None
+        return DiffusionSchedulerOutput(
+            step_id=self._step_id,
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            finished_req_ids=set(),
+            num_running_reqs=len(self._running),
+            num_waiting_reqs=len(self._waiting),
+            kv_required_request_ids=self._loading_sequence_ids(drain_request_ids or []),
+            kv_poll_only=True,
+        )
 
     @abstractmethod
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
@@ -368,6 +461,7 @@ class BaseScheduler(ABC):
         self._kv_transfer_request_ids.clear()
         self._kv_loading_request_ids.clear()
         self._kv_request_generations.clear()
+        self._native_prefetch_request_id = None
         self._request_states.clear()
         self._kv_finished_request_ids.clear()
         self._waiting.clear()
@@ -412,6 +506,8 @@ class BaseScheduler(ABC):
         for request_id in finished_req_ids:
             state = self._request_states[request_id]
             status = statuses[request_id]
+            if request_id == self._native_prefetch_request_id:
+                self._native_prefetch_request_id = None
             if self._kv_connector is not None:
                 for request in state.diffusion_kv_requests:
                     request.status = (
@@ -419,7 +515,9 @@ class BaseScheduler(ABC):
                         if status == DiffusionRequestStatus.FINISHED_ABORTED
                         else RequestStatus.FINISHED_STOPPED
                     )
-                    if request.kv_transfer_params and request.kv_transfer_params.get("do_remote_prefill"):
+                    if self._native_prefetch_enabled or (
+                        request.kv_transfer_params and request.kv_transfer_params.get("do_remote_prefill")
+                    ):
                         self._kv_finished_request_ids.add(request.request_id)
                     block_ids = []
                     if self._diffusion_kv_manager.has_request(request_id):
