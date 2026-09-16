@@ -44,9 +44,14 @@ separate `ar_diffusion_kv` imported-AR-KV contract.
 The diffusion KV fields are stage settings. The two
 `diffusion_kv_*` fields are diffusion-specific engine fields and are forwarded
 through `engine_extras`; `kv_cache_memory_bytes` is a standard stage field and
-is placed directly under the stage:
+is placed directly under the stage.
+
+Set `pipeline: hunyuan_image3_dit` to select the standalone DiT pipeline,
+where stage `0` is the diffusion stage.
 
 ```yaml
+pipeline: hunyuan_image3_dit
+
 stages:
   - stage_id: 0
     max_num_seqs: 1
