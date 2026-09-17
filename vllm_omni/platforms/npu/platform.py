@@ -54,6 +54,15 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     _omni_enum = OmniPlatformEnum.NPU
     dist_backend: str = "hccl"
 
+    @classmethod
+    def create_diffusion_kv_connector(
+        cls, vllm_config: Any, kv_caches_by_layer: Any, kv_cache_config: Any = None
+    ) -> Any:
+        """Use the initialized native Ascend KV worker with the shared lifecycle."""
+        from vllm_omni.platforms.npu.worker.npu_diffusion_kv_connector import NPUActiveKVConnector
+
+        return NPUActiveKVConnector(vllm_config, kv_caches_by_layer)
+
     # conv2d convolution operator in the code2wav module of Qwen3-TTS not being able to run on Aclnn
     def __init__(self) -> None:
         from vllm_ascend.utils import adapt_patch
@@ -173,6 +182,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     @classmethod
     def init_diffusion_model_runner_runtime(cls, vllm_config: Any, od_config: Any, device: torch.device) -> None:
         from vllm_ascend.ascend_forward_context import set_mc2_mask, set_mc2_tokens_capacity
+        from vllm_ascend.utils import set_potential_max_tokens
 
         from vllm_omni.platforms.npu.models.minimax_h3 import (
             apply_minimax_h3_qwen3vl_patch,
@@ -189,6 +199,10 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         apply_minimax_h3_qwen3vl_patch()
         apply_minimax_h3_qwen3vl_sdpa_patch()
         apply_minimax_h3_qwen3vl_swiglu_patch()
+        from vllm_omni.platforms.npu.worker.npu_diffusion_kv_connector import ensure_native_kv_context_groups
+
+        ensure_native_kv_context_groups(vllm_config)
+        set_potential_max_tokens(vllm_config)
         set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
         set_mc2_mask(vllm_config, device)
 

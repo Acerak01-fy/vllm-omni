@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Regression tests for vllm-project/vllm-omni#5349 (P1): normal completion
 goes through _free_request(), not finish_requests() (the external
 abort/cancel entry point). Without a cleanup_receiver() call there,
@@ -76,14 +79,16 @@ def test_free_request_is_safe_without_a_chunk_transfer_adapter():
     sched._free_input_coordinator_request.assert_called_once_with("req-1")
 
 
-def test_native_mooncake_finish_uses_confirmed_token_boundary() -> None:
+@pytest.mark.parametrize("connector_name", ["MooncakeConnector", "MooncakeConnectorV1"])
+def test_native_mooncake_finish_uses_confirmed_token_boundary(connector_name: str) -> None:
     sched = _make_scheduler(chunk_transfer_adapter=None)
-    sched.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(kv_connector="MooncakeConnector"))
+    sched.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(kv_connector=connector_name))
     observed = {}
 
     def connector_finished(request):
         observed["status"] = request.status
         observed["num_computed_tokens"] = request.num_computed_tokens
+        observed["prompt_token_ids"] = list(request.prompt_token_ids)
         return True, None
 
     sched._connector_finished = connector_finished
@@ -97,24 +102,30 @@ def test_native_mooncake_finish_uses_confirmed_token_boundary() -> None:
     request.num_computed_tokens = 13
     request.num_output_placeholders = 1
     request.num_prompt_tokens = 10
+    request.prompt_token_ids = list(range(10))
+    request.all_token_ids = list(range(14))
+    original_prompt = request.prompt_token_ids
 
     kv_params, _ = sched._free_request(request)
 
     assert observed == {
         "status": RequestStatus.FINISHED_LENGTH_CAPPED,
         "num_computed_tokens": 12,
+        "prompt_token_ids": list(range(12)),
     }
     assert request.status == RequestStatus.FINISHED_STOPPED
     assert request.num_computed_tokens == 13
+    assert request.prompt_token_ids is original_prompt
     assert kv_params == {
         "transfer_id": "xfer-req-native",
         "num_transfer_tokens": 12,
     }
 
 
-def test_native_mooncake_recycles_ar_pages_in_physical_order() -> None:
+@pytest.mark.parametrize("connector_name", ["MooncakeConnector", "MooncakeConnectorV1"])
+def test_native_mooncake_recycles_ar_pages_in_physical_order(connector_name: str) -> None:
     sched = OmniARScheduler.__new__(OmniARScheduler)
-    sched.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(kv_connector="MooncakeConnector"))
+    sched.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(kv_connector=connector_name))
     blocks = [SimpleNamespace(block_id=7), SimpleNamespace(block_id=2), SimpleNamespace(block_id=4)]
     sched.kv_cache_manager = SimpleNamespace(
         enable_caching=False,
@@ -132,11 +143,47 @@ def test_native_mooncake_recycles_ar_pages_in_physical_order() -> None:
     assert [block.block_id for block in freed] == [2, 4, 7]
 
 
-def test_native_mooncake_deferred_ar_pages_drain_in_physical_order() -> None:
+def test_native_ascend_exports_generated_ar_prefix() -> None:
+    native = pytest.importorskip("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector")
+    connector = object.__new__(native.MooncakeConnectorScheduler)
+    connector.block_size = 4
+    connector.pcp_size = connector.dcp_size = connector.tp_size = 1
+    connector.group_transfer_info = [SimpleNamespace(is_state_group=False, tokens_per_block=4, blocks_per_window=0)]
+    connector._reqs_need_send = {}
+    connector.engine_id = "ar"
+    connector.side_channel_host = "localhost"
+    connector.side_channel_port = 10000
+    connector.multi_nodes_meta_mapping = {}
+    sched = _make_scheduler()
+    sched.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(kv_connector="MooncakeConnectorV1"))
+    sched._connector_finished = lambda request: connector.request_finished(request, ([1, 2, 3],))
+    request = _make_finished_request("generated-prefix")
+    request.client_index = 0
+    request.status = RequestStatus.FINISHED_STOPPED
+    request.kv_transfer_params = {"do_remote_decode": True, "transfer_id": "generated-prefix"}
+    request.num_prompt_tokens = 4
+    request.prompt_token_ids = [0, 1, 2, 3]
+    original_prompt = request.prompt_token_ids
+    request.all_token_ids = list(range(10))
+    request.output_token_ids = list(range(4, 10))
+    request.num_computed_tokens = 10
+    request.num_output_placeholders = 1
+
+    params, _ = sched._free_request(request)
+
+    assert params["num_transfer_tokens"] == 9
+    assert params["remote_block_ids"] == ([1, 2, 3],)
+    assert params["num_prompt_blocks"] == 3
+    assert request.prompt_token_ids is original_prompt
+    assert request.num_prompt_tokens == 4
+
+
+@pytest.mark.parametrize("connector_name", ["MooncakeConnector", "MooncakeConnectorV1"])
+def test_native_mooncake_deferred_ar_pages_drain_in_physical_order(connector_name: str) -> None:
     from collections import deque
 
     sched = OmniARScheduler.__new__(OmniARScheduler)
-    sched.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(kv_connector="MooncakeConnector"))
+    sched.vllm_config = SimpleNamespace(kv_transfer_config=SimpleNamespace(kv_connector=connector_name))
     blocks = [SimpleNamespace(block_id=7), SimpleNamespace(block_id=2), SimpleNamespace(block_id=4)]
     sched.kv_cache_manager = SimpleNamespace(
         enable_caching=False,

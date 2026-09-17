@@ -254,7 +254,7 @@ def commit_kv_load(
         # different logical prefix lengths. Bytes beyond ``num_tokens`` are
         # not marked computed and are overwritten by the DiT prefill.
         transfer_tokens = num_tokens
-        if num_tokens > 0 and request.kv_transfer_params is not None:
+        if request.kv_transfer_params is not None:
             transfer_tokens = request.kv_transfer_params["num_transfer_tokens"]
             if type(transfer_tokens) is not int or not num_tokens <= transfer_tokens <= request.num_tokens:
                 raise KVTransferRegistrationError(
@@ -268,10 +268,12 @@ def commit_kv_load(
                 for group, spec in zip(blocks.blocks, manager.kv_cache_config.kv_cache_groups, strict=True)
             )
         )
-        allocations.append((request, prefix_blocks, num_tokens))
+        allocations.append((request, prefix_blocks, num_tokens, transfer_tokens))
     try:
-        for request, prefix_blocks, num_tokens in allocations:
-            connector.update_state_after_alloc(request, prefix_blocks, num_tokens)
+        for request, prefix_blocks, num_tokens, transfer_tokens in allocations:
+            # Register the physical transport boundary even for zero reusable
+            # tokens; only the logical prefix below is marked computed.
+            connector.update_state_after_alloc(request, prefix_blocks, transfer_tokens)
             request.num_computed_tokens = num_tokens
             if request.kv_transfer_params is not None:
                 expected.add(request.request_id)

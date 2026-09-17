@@ -147,7 +147,8 @@ def test_shutdown_kv_connector_is_idempotent() -> None:
     scheduler_connector.shutdown.assert_called_once()
 
 
-def test_commit_aligns_cfg_transport_pages_without_extending_computed_prefix() -> None:
+@pytest.mark.parametrize("matched_tokens", [[7, 5], [0, 0], [7, 0]])
+def test_commit_aligns_cfg_transport_pages_without_extending_computed_prefix(matched_tokens) -> None:
     requests = tuple(
         SimpleNamespace(
             request_id=f"req/{sequence_id}",
@@ -163,13 +164,13 @@ def test_commit_aligns_cfg_transport_pages_without_extending_computed_prefix() -
     )
     connector = mock.Mock()
 
-    expected = commit_kv_load(connector, manager, requests, [7, 5])
+    expected = commit_kv_load(connector, manager, requests, matched_tokens)
 
     assert expected == {"req/0", "req/1"}
     calls = connector.update_state_after_alloc.call_args_list
     assert [len(call.args[1].blocks[0]) for call in calls] == [3, 3]
-    assert [call.args[2] for call in calls] == [7, 5]
-    assert [request.num_computed_tokens for request in requests] == [7, 5]
+    assert [call.args[2] for call in calls] == [9, 9]
+    assert [request.num_computed_tokens for request in requests] == matched_tokens
 
 
 def test_wait_without_pending_load_uses_vllm_post_forward_once() -> None:

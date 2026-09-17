@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -256,6 +256,9 @@ class DiffusionSchedulerOutput:
     kv_prefetch_job: KVPrefetchJob | None = None
     kv_connector_metadata: KVConnectorMetadata | None = None
     kv_transfer_request_ids: set[str] = field(default_factory=set)
+    # DiT resolves KV loads before forward, including empty-block notices.
+    # Native ActiveKVConnector must not defer these submissions to post_forward.
+    has_sync_kv_loads: bool = True
     # Connector lifecycle uses per-sequence IDs, not public request IDs.
     kv_finished_request_ids: set[str] = field(default_factory=set)
 

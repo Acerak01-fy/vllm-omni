@@ -132,7 +132,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _uses_native_mooncake_connector(self) -> bool:
         kv_config = getattr(self.vllm_config, "kv_transfer_config", None)
-        return getattr(kv_config, "kv_connector", None) == "MooncakeConnector"
+        return getattr(kv_config, "kv_connector", None) in {"MooncakeConnector", "MooncakeConnectorV1"}
 
     def _free_request_blocks(self, request: Request) -> None:
         """Keep native Mooncake pages coalescible without changing vLLM APIs."""
@@ -1065,25 +1065,29 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         status = getattr(request, "status", None)
         transfer_params = getattr(request, "kv_transfer_params", None)
         native_transfer = (
-            transfer_params
-            and transfer_params.get("do_remote_decode")
-            and getattr(getattr(self.vllm_config, "kv_transfer_config", None), "kv_connector", None)
-            == "MooncakeConnector"
+            transfer_params and transfer_params.get("do_remote_decode") and self._uses_native_mooncake_connector()
         )
         if native_transfer and status == RequestStatus.FINISHED_STOPPED:
             request.status = RequestStatus.FINISHED_LENGTH_CAPPED
         num_computed_tokens = None
+        prompt_token_ids = None
         if native_transfer:
             # vLLM clips the block table with
             # get_block_ids_for_computed_tokens(). Exclude Omni's optimistic
             # async output placeholders from the physical transfer boundary.
             num_computed_tokens = request.num_computed_tokens
             request.num_computed_tokens = self._get_confirmed_num_computed_tokens(request)
+            # A stage handoff exports the computed AR continuation too.
+            # Prefill-oriented native connectors clip to prompt_token_ids;
+            # present the full confirmed prefix for this synchronous hook.
+            prompt_token_ids = request.prompt_token_ids
+            request.prompt_token_ids = list(request.all_token_ids[: request.num_computed_tokens])
         try:
             connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         finally:
             if num_computed_tokens is not None:
                 request.num_computed_tokens = num_computed_tokens
+                request.prompt_token_ids = prompt_token_ids
             if status is not None:
                 request.status = status
         if native_transfer and connector_delay_free_blocks:

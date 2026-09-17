@@ -479,9 +479,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.diffusion_kv_backend.initialize_kv_cache(kv_cache_config)
         self.kv_cache_config = self.diffusion_kv_backend.kv_cache_config
         if getattr(self.od_config, "kv_transfer_config", None) is not None:
-            from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
-
-            self._kv_connector = ActiveKVConnector(self.vllm_config, self.diffusion_kv_backend.kv_caches_by_layer)
+            self._kv_connector = current_omni_platform.create_diffusion_kv_connector(
+                self.vllm_config, self.diffusion_kv_backend.kv_caches_by_layer, self.kv_cache_config
+            )
 
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput):
         from vllm_omni.diffusion.diffusion_kv.kv_connector import wait_for_kv_load

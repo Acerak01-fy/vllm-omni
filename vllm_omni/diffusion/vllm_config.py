@@ -80,6 +80,8 @@ class _DiffusionVllmModelConfig:
     enable_prompt_embeds: bool = False
     logits_processors: tuple[str, ...] = ()
     use_mla: bool = False
+    # Ascend platform validation probes this native ModelConfig field.
+    is_deepseek_mla: bool = False
     is_moe: bool = False
     # Native vLLM attention layers/builders read these fields directly.  The
     # diffusion model does not have a full vLLM ModelConfig, so keep the
@@ -153,6 +155,12 @@ class _DiffusionVllmModelConfig:
 
     def get_total_num_kv_heads(self) -> int:
         return self.hf_text_config.num_key_value_heads
+
+    def get_num_experts(self) -> int:
+        return int(getattr(self.hf_config, "num_experts", getattr(self.hf_config, "num_local_experts", 0)))
+
+    def get_total_num_hidden_layers(self) -> int:
+        return int(getattr(self.hf_config, "num_hidden_layers", 0))
 
     @property
     def is_diffusion(self) -> bool:

@@ -95,7 +95,7 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
 
     for name in ("_DP", "_CFG", "_SP", "_PP", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
-    for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
+    for name in ("_TP", "_PCP", "_DCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
 
     parallel_state.initialize_model_parallel(
@@ -111,6 +111,8 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
     )
 
     assert parallel_state.vllm_parallel_state._PCP is not parallel_state._SP
+    assert parallel_state.vllm_parallel_state._DCP.world_size == 1
+    assert parallel_state.vllm_parallel_state._DCP.local_group == [local_rank]
     assert parallel_state.vllm_parallel_state._PCP.world_size == 2
     assert parallel_state._DP.world_size == 2
     assert parallel_state.vllm_parallel_state._DP is not parallel_state._DP
@@ -189,7 +191,7 @@ def test_moe_ep_maps_diffusion_sp_cfg_dp_to_vllm_groups(monkeypatch):
     ]
 
     vllm_group_names = [group.parallel_mode for group in created_groups if group.parallel_mode.startswith("vllm_")]
-    assert vllm_group_names == ["vllm_pcp", "vllm_tp", "vllm_dp", "vllm_ep"]
+    assert vllm_group_names == ["vllm_pcp", "vllm_dcp", "vllm_tp", "vllm_dp", "vllm_ep"]
     ep_groups = [group.local_group for group in created_groups if group.parallel_mode == "vllm_ep"]
     assert ep_groups == [parallel_state.vllm_parallel_state._EP.local_group]
 
@@ -222,7 +224,7 @@ def test_invalid_hsdp_shard_size_fails_before_group_creation(monkeypatch, fully_
 
     for name in ("_DP", "_CFG", "_SP", "_PP", "_FS", "_HSDP_REPLICATE", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
-    for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
+    for name in ("_TP", "_PCP", "_DCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
 
     with pytest.raises(ValueError, match=error_message):
@@ -272,7 +274,7 @@ def test_cfg_parallel_keeps_diffusion_dp_without_ep(monkeypatch):
 
     for name in ("_DP", "_CFG", "_SP", "_PP", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
-    for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
+    for name in ("_TP", "_PCP", "_DCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
 
     parallel_state.initialize_model_parallel(
@@ -315,12 +317,16 @@ def test_destroy_model_parallel_clears_vllm_pipeline_group(monkeypatch):
         monkeypatch.setattr(parallel_state, name, None)
     monkeypatch.setattr(parallel_state, "_PP", pipeline_group)
     monkeypatch.setattr(parallel_state, "_EXPERT_PARALLEL_GROUP_RANKS", None)
-    for name in ("_DP", "_PCP", "_TP", "_EP"):
+    for name in ("_DP", "_PCP", "_DCP", "_TP", "_EP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
     monkeypatch.setattr(parallel_state.vllm_parallel_state, "_PP", pipeline_group, raising=False)
+    dcp_group = _DestroyableGroup()
+    monkeypatch.setattr(parallel_state.vllm_parallel_state, "_DCP", dcp_group, raising=False)
 
     parallel_state.destroy_model_parallel()
 
+    assert dcp_group.destroy_calls == 1
+    assert parallel_state.vllm_parallel_state._DCP is None
     assert pipeline_group.destroy_calls == 1
     assert parallel_state.vllm_parallel_state._PP is None
 
@@ -364,7 +370,7 @@ def test_non_moe_ep_fails_before_vllm_ep_remap(monkeypatch):
 
     for name in ("_DP", "_CFG", "_SP", "_PP", "_EXPERT_PARALLEL_GROUP_RANKS"):
         monkeypatch.setattr(parallel_state, name, None)
-    for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
+    for name in ("_TP", "_PCP", "_DCP", "_DP", "_EP", "_PP"):
         monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
 
     with pytest.raises(RuntimeError, match="Expert parallelism enabled for a non-MoE model"):

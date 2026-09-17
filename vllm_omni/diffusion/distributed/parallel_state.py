@@ -896,6 +896,15 @@ def _initialize_model_parallel(
             group_name="pcp",
         )
 
+        # Diffusion does not shard decode context. Native KV connectors still
+        # query the vLLM DCP group, so expose a singleton for each rank.
+        vllm_parallel_state._DCP = init_vllm_model_parallel_group(
+            group_ranks=[[rank] for rank in range(world_size)],
+            local_rank=get_world_group().local_rank,
+            backend=backend,
+            group_name="dcp",
+        )
+
     assert vllm_parallel_state._TP is None, "Tensor parallel group is already initialized"
     tp_group_ranks = get_rank_groups("tp")
     if use_moe_parallel_mapping:
@@ -991,6 +1000,7 @@ def initialize_model_parallel(
         "vllm_pp": vllm_parallel_state._PP,
         "vllm_ep": vllm_parallel_state._EP,
         "vllm_pcp": vllm_parallel_state._PCP,
+        "vllm_dcp": vllm_parallel_state._DCP,
     }
     initialized_names = [name for name, group in existing_groups.items() if group is not None]
     if initialized_names:
@@ -1040,6 +1050,10 @@ def destroy_model_parallel():
     if _CFG:
         _CFG.destroy()
     _CFG = None
+
+    if vllm_parallel_state._DCP:
+        vllm_parallel_state._DCP.destroy()
+    vllm_parallel_state._DCP = None
 
     if vllm_parallel_state._PCP and vllm_parallel_state._PCP is not _SP:
         vllm_parallel_state._PCP.destroy()
