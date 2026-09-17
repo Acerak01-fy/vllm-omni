@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-import gc
 import math
 import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -31,6 +30,7 @@ from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory as SharedFusedMoE
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -40,6 +40,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
+    VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
@@ -59,6 +60,7 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     _merge_multimodal_embeddings,
     is_pp_missing_parameter,
+    make_layers,
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -86,6 +88,9 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import (
+    HunYuanAttention,
+    HunYuanCrossAttention,
+    HunYuanDecoderLayer,
     HunYuanMLP,
     HunYuanModel,
     HunYuanSparseMoeBlock,
@@ -96,6 +101,57 @@ from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import Aut
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
 
 logger = init_logger(__name__)
+
+
+class HunyuanImage3DecoderLayer(HunYuanDecoderLayer):
+    """Build the final Image3 MoE before offloading and backend registration.
+
+    Reuse the upstream attention modules and forward. Constructing a stock
+    decoder first would allocate and register expert weights that must then be
+    replaced; backend registries can keep those obsolete weights alive.
+    """
+
+    def __init__(self, *, config, cache_config, quant_config, prefix, layer_id, enable_eplb):
+        nn.Module.__init__(self)
+        self.layer_id = layer_id
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = (
+            config.intermediate_size
+            if isinstance(config.intermediate_size, int)
+            else config.intermediate_size[layer_id]
+        )
+        attention_cls = HunYuanCrossAttention if layer_id % _get_cla_factor(config) else HunYuanAttention
+        self.self_attn = attention_cls(
+            config=config,
+            hidden_size=self.hidden_size,
+            num_heads=config.num_attention_heads,
+            num_kv_heads=getattr(config, "num_key_value_heads", config.num_attention_heads),
+            max_position_embeddings=getattr(config, "max_position_embeddings", 8192),
+            quant_config=quant_config,
+            bias=getattr(config, "attention_bias", False) or getattr(config, "bias", False),
+            cache_config=cache_config,
+            prefix=f"{prefix}.self_attn",
+            layer_id=layer_id,
+        )
+        if _is_moe(config):
+            self.mlp = HunyuanImage3SparseMoeBlock(
+                config=config,
+                quant_config=quant_config,
+                layer_id=layer_id,
+                prefix=f"{prefix}.mlp",
+                enable_eplb=enable_eplb,
+            )
+        else:
+            self.mlp = HunYuanMLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                bias=getattr(config, "mlp_bias", False),
+                prefix=f"{prefix}.mlp",
+            )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
 @support_torch_compile(
@@ -109,6 +165,34 @@ logger = init_logger(__name__)
     }
 )
 class HunyuanModel(HunYuanModel):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        nn.Module.__init__(self)
+        config = vllm_config.model_config.hf_config
+        self.config = config
+        self.quant_config = vllm_config.quant_config
+        self.num_redundant_experts = vllm_config.parallel_config.eplb_config.num_redundant_experts
+        self.vocab_size = config.vocab_size
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank or (config.tie_word_embeddings and pp_group.is_last_rank):
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size, config.hidden_size, quant_config=self.quant_config
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda prefix: HunyuanImage3DecoderLayer(
+                config=config,
+                layer_id=int(prefix.split(".")[-1]),
+                cache_config=vllm_config.cache_config,
+                quant_config=self.quant_config,
+                prefix=prefix,
+                enable_eplb=vllm_config.parallel_config.enable_eplb,
+            ),
+            prefix=f"{prefix}.layers",
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps) if pp_group.is_last_rank else PPMissingLayer()
+
     def _split_qkv_weight(self, qkv: torch.Tensor):
         num_attention_heads = self.config.num_attention_heads
         num_kv_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
@@ -1630,75 +1714,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self._blocked_token_ids_tensor: torch.Tensor | None = None
 
         self._replace_rotary_embeddings()
-        self._patch_moe_blocks()
-
-    def _patch_moe_blocks(self):
-        """Replace stock ``HunYuanSparseMoeBlock`` instances with
-        :class:`HunyuanImage3SparseMoeBlock`, which routes in fp32 to match
-        the HF reference (``modeling_hunyuan_image_3.HunyuanMoE``).
-
-        Stock vLLM builds the router gate as a default-dtype (bf16)
-        ``ReplicatedLinear`` and lets ``SharedFusedMoE``'s ``topk_softmax``
-        kernel consume bf16 logits, which is the largest deterministic
-        precision gap remaining vs HF after the prompt/preprocessing
-        alignment fixes. See ``HunyuanImage3SparseMoeBlock`` docstring for
-        the full rationale.
-
-        Must run before weight loading (still inside ``__init__``) so the
-        replacement gate's fp32 ``params_dtype`` is honored when the
-        checkpoint is loaded.
-        """
-        if not _is_moe(self.config):
-            return
-        enable_eplb = getattr(self.vllm_config.parallel_config, "enable_eplb", False)
-        ccfg = self.vllm_config.compilation_config
-        replaced = 0
-        for layer_id, layer in enumerate(self.model.layers):
-            mlp = getattr(layer, "mlp", None)
-            if isinstance(mlp, HunYuanSparseMoeBlock) and not isinstance(mlp, HunyuanImage3SparseMoeBlock):
-                # Pop the OLD experts' registration from
-                # ``static_forward_context`` first — otherwise the new
-                # ``SharedFusedMoE`` built inside
-                # :class:`HunyuanImage3SparseMoeBlock` will trip
-                # ``ValueError: Duplicate layer name`` (see
-                # vllm/model_executor/layers/fused_moe/layer.py:327).
-                old_prefix = f"model.layers.{layer_id}.mlp.experts"
-                ccfg.static_forward_context.pop(old_prefix, None)
-                if old_prefix in ccfg.static_all_moe_layers:
-                    ccfg.static_all_moe_layers.remove(old_prefix)
-
-                # Free the OLD MoE block's GPU buffers BEFORE allocating
-                # the replacement. The parent ``SharedFusedMoE`` pre-
-                # allocates the full ``[num_experts, ...]`` expert weight
-                # tensors at ``__init__`` (~750 MiB per layer per worker
-                # on this 80B model with TP=2), so without this drop we
-                # transiently double the MoE footprint and OOM near the
-                # gpu_memory_utilization cap.
-                layer.mlp = None
-                del mlp
-                gc.collect()
-                torch.accelerator.empty_cache()
-
-                layer.mlp = HunyuanImage3SparseMoeBlock(
-                    config=self.config,
-                    quant_config=self.quant_config,
-                    layer_id=layer_id,
-                    prefix=f"model.layers.{layer_id}.mlp",
-                    enable_eplb=enable_eplb,
-                )
-                replaced += 1
-        logger.info(
-            "Replaced %d HunYuanSparseMoeBlock layers with "
-            "HunyuanImage3SparseMoeBlock (fp32 router matching HF reference)",
-            replaced,
-        )
-        if replaced == 0:
-            logger.warning(
-                "HunyuanImage3: _patch_moe_blocks replaced 0 layers. "
-                "Routing will run in bf16 instead of fp32 — output will "
-                "diverge from the HF reference more than necessary. "
-                "Check that model.layers[*].mlp is HunYuanSparseMoeBlock."
-            )
 
     def _replace_rotary_embeddings(self):
         """Replace vLLM's standard MRotaryEmbedding with the custom
