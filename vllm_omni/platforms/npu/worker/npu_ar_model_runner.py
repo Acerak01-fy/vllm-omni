@@ -309,6 +309,52 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         return bool(value)
     #  -------------------------------------- Omni-new -------------------------------------------------
 
+    def _is_connector_only_step(self, scheduler_output: SchedulerOutput) -> bool:
+        """Whether polling the connector cannot mutate persistent input buffers.
+
+        An empty schedule can still evict the previous batch or finish requests.
+        Let those transitions take the synchronized path; only subsequent idle
+        polls may bypass input preparation. Connector readiness and completion
+        handling remain in kv_connector_no_forward().
+        """
+        # Native KV senders may initialize the Omni mixin with a None payload
+        # connector; the placeholder itself does not imply input-buffer work.
+        if (
+            scheduler_output.total_num_scheduled_tokens != 0
+            or self.input_batch.num_reqs != 0
+            or self.speculative_config is not None
+            or self.omni_prefix_cache is not None
+            or self.parallel_config.data_parallel_size != 1
+            or self.parallel_config.pipeline_parallel_size != 1
+            or getattr(self, "_omni_connector", None) is not None
+            or getattr(self, "_async_chunk", False)
+            or getattr(self, "_pending_full_payload_send", None)
+            or getattr(self, "_duplex_sampling_hook", None) is not None
+            or self.kv_extracted_req_ids
+            or has_ec_transfer()
+            or not has_kv_transfer_group()
+        ):
+            return False
+        if scheduler_output.scheduled_cached_reqs.req_ids or scheduler_output.scheduled_cached_reqs.resumed_req_ids:
+            return False
+        return not any(
+            getattr(scheduler_output, name, None)
+            for name in (
+                "scheduled_new_reqs",
+                "num_scheduled_tokens",
+                "finished_req_ids",
+                "scheduled_spec_decode_tokens",
+                "scheduled_encoder_inputs",
+                "free_encoder_mm_hashes",
+                "new_block_ids_to_zero",
+                "kv_cache_block_copies",
+                "ec_connector_metadata",
+                "ec_manager_metadata",
+                "finished_requests_needing_kv_transfer",
+                "pending_input_registrations",
+            )
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -391,6 +437,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if kv_connector_metadata is not None:
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
         #  -------------------------------------- Omni-new -------------------------------------------------
+
+        if self._is_connector_only_step(scheduler_output):
+            output = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+            return self.attach_omni_connector_output(output)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
