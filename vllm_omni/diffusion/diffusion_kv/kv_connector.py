@@ -39,7 +39,7 @@ class KVTransferRegistrationError(ValueError):
 def native_prefetch_enabled(od_config: OmniDiffusionConfig) -> bool:
     """Validate the opt-in GPU consumer implementation before allocating pages."""
     config = getattr(od_config, "kv_transfer_config", None)
-    if config is None:
+    if not isinstance(config, KVTransferConfig):
         return False
     extra = config.kv_connector_extra_config or {}
     enabled = extra.get("enable_kv_async_prefetch", False)

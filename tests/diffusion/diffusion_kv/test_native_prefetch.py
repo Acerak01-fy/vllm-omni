@@ -174,6 +174,18 @@ def _config():
     )
 
 
+def test_mock_config_does_not_enable_native_prefetch():
+    assert not native_prefetch_enabled(Mock())
+
+
+@pytest.mark.parametrize("enabled", ["true", "false", 0, 1, None])
+def test_native_prefetch_rejects_non_boolean_flag(enabled):
+    config = _config()
+    config.kv_transfer_config.kv_connector_extra_config["enable_kv_async_prefetch"] = enabled
+    with pytest.raises(ValueError, match="must be a boolean"):
+        native_prefetch_enabled(config)
+
+
 def test_opt_in_and_platform_validation(monkeypatch):
     monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.is_cuda", lambda: True)
     config = _config()
