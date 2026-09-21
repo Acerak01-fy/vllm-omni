@@ -2,6 +2,15 @@
 
 This document describes the design and lifecycle of Scheduler-managed paged KV cache for diffusion DiT stages.
 
+Paged KV cache is a scheduler-managed KV-cache and memory-management
+mechanism. It is separate from attention backend selection: native attention
+backends such as FlashAttention or Ascend FIA perform the attention computation,
+while paged KV provides the block layout and metadata consumed by those
+backends.
+
+The current implementation requires the `FLASH_ATTN` selector; other
+attention backends do not currently support `paged_scheduler`.
+
 For operator-facing configuration and examples, see the
 [Paged KV Cache user guide](../../user_guide/diffusion/paged_kv_cache.md).
 
