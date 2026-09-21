@@ -384,6 +384,7 @@ class DiffusionEngine:
         self._cv = threading.Condition(self._rpc_lock)
         self._out_streams: dict[str, asyncio.Queue[DiffusionOutput]] = {}
         self._closed = False
+        self._shutting_down = False
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
@@ -846,15 +847,20 @@ class DiffusionEngine:
             self._prepare_kv_for_forward(output)
 
     def _fail_engine(self, exc: Exception) -> None:
-        if getattr(self, "_shutdown_complete", False):
-            return
-        logger.error("Diffusion engine failed; stopping workers before releasing KV pages", exc_info=exc)
         with self._cv:
+            if getattr(self, "_shutdown_complete", False) or getattr(self, "_shutting_down", False):
+                return
+            # Mark shutdown before invoking any component callbacks.  A
+            # failing shutdown can re-enter this method from another error
+            # path, and repeating executor.shutdown() is unsafe.
+            self._shutting_down = True
             self._closed = True
             if self.stop_event is not None:
                 self.stop_event.set()
             streams = list(self._out_streams.values())
             self._cv.notify_all()
+
+        logger.error("Diffusion engine failed; stopping workers before releasing KV pages", exc_info=exc)
         for stream in streams:
             self._put_queue_output(stream, DiffusionOutput.from_exception(exc))
         self._fail_pending_rpcs(exc)
