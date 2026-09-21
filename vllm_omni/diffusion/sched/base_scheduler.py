@@ -22,6 +22,7 @@ from vllm_omni.diffusion.diffusion_kv.kv_connector import (
     commit_kv_load,
     native_prefetch_enabled,
     prepare_kv_requests,
+    validate_kv_transfer_boundaries,
 )
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVCacheManager
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
@@ -333,6 +334,13 @@ class BaseScheduler(ABC):
             if num_tokens is None:
                 return
             matched_tokens.append(num_tokens)
+        try:
+            validate_kv_transfer_boundaries(state.diffusion_kv_requests, matched_tokens)
+        except KVTransferRegistrationError as exc:
+            # Do not reserve B's pages for a transfer that cannot be registered.
+            # Normal admission will report the request-scoped error later.
+            logger.debug("Native KV prefetch skipped for %s: invalid boundary (%s)", request_id, exc)
+            return
         # The manager atomically reserves all CFG rows, including capacity
         # needed when B eventually executes. B remains in WAITING.
         try:

@@ -57,11 +57,10 @@ def native_prefetch_enabled(od_config: OmniDiffusionConfig) -> bool:
         or extra.get("mooncake_protocol", "rdma") != "tcp"
         or od_config.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER
         or od_config.max_num_seqs != 1
-        or od_config.model_class_name not in ("HunyuanImage3ForCausalMM", "HunyuanImage3Pipeline")
         or getattr(od_config, "cfg_kv_collect_func", None) is not None
     ):
         raise ValueError(
-            "Native KV prefetch requires CUDA, HunyuanImage3Pipeline, MooncakeConnector TCP consumer, "
+            "Native KV prefetch requires CUDA, MooncakeConnector TCP consumer, "
             "paged_scheduler, max_num_seqs=1 and no CFG companion collector"
         )
     return True
@@ -327,6 +326,21 @@ def install_mooncake_cfg_fanout(connector: KVConnectorBase_V1) -> None:
     setattr(worker, "_omni_cfg_fanout_installed", True)
 
 
+def validate_kv_transfer_boundaries(requests: tuple[DiffusionKVRequest, ...], matched_tokens: list[int]) -> None:
+    """Validate every CFG row before reserving or registering destination pages."""
+    for request, num_tokens in zip(requests, matched_tokens, strict=True):
+        params = request.kv_transfer_params
+        if num_tokens <= 0 or params is None:
+            continue
+        transfer_tokens = params.get("num_transfer_tokens")
+        if type(transfer_tokens) is not int or not num_tokens <= transfer_tokens <= request.num_tokens:
+            raise KVTransferRegistrationError(
+                "Diffusion KV transfer boundary must cover the reusable prefix "
+                f"without exceeding the allocated sequence: reusable={num_tokens}, "
+                f"transfer={transfer_tokens!r}, allocated={request.num_tokens}"
+            )
+
+
 def commit_kv_load(
     connector: KVConnectorBase_V1,
     manager: KVCacheManager,
@@ -338,6 +352,7 @@ def commit_kv_load(
     # All rows sharing a transfer_id must reach the same connector metadata:
     # the producer uses this complete per-rank row set for fan-out accounting.
     # Validate every CFG row before mutating any connector state.
+    validate_kv_transfer_boundaries(requests, matched_tokens)
     for request, num_tokens in zip(requests, matched_tokens, strict=True):
         blocks = manager.get_blocks(request.request_id)
         # Mooncake's producer advertises complete physical blocks. Keep every
@@ -348,12 +363,6 @@ def commit_kv_load(
         transfer_tokens = num_tokens
         if num_tokens > 0 and request.kv_transfer_params is not None:
             transfer_tokens = request.kv_transfer_params["num_transfer_tokens"]
-            if type(transfer_tokens) is not int or not num_tokens <= transfer_tokens <= request.num_tokens:
-                raise KVTransferRegistrationError(
-                    "Diffusion KV transfer boundary must cover the reusable prefix "
-                    f"without exceeding the allocated sequence: reusable={num_tokens}, "
-                    f"transfer={transfer_tokens!r}, allocated={request.num_tokens}"
-                )
         prefix_blocks = KVCacheBlocks(
             tuple(
                 group[: (transfer_tokens + spec.kv_cache_spec.block_size - 1) // spec.kv_cache_spec.block_size]
