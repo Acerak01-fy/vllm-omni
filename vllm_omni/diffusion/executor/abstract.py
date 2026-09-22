@@ -17,7 +17,7 @@ from vllm_omni.diffusion.sched.interface import CachedRequestData
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
-    from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+    from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, NewRequestData
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 
@@ -176,7 +176,12 @@ class DiffusionExecutor(ABC):
             args=(unique_request_ids,),
         )
 
-    def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput) -> KVConnectorOutput | None:
+    def prepare_kv_for_forward(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        *,
+        prepared_request: tuple[str, NewRequestData] | None = None,
+    ) -> KVConnectorOutput | None:
         if scheduler_output.kv_connector_metadata is None:
             return
         transfer_output = replace(
@@ -188,6 +193,7 @@ class DiffusionExecutor(ABC):
         outputs: list[KVConnectorOutput] = self.collective_rpc(
             "prepare_kv_for_forward",
             args=(transfer_output,),
+            **({"kwargs": {"prepared_request": prepared_request}} if prepared_request is not None else {}),
             unique_reply_rank=0,
             exec_all_ranks=True,
         )

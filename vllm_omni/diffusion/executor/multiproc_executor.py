@@ -22,6 +22,7 @@ from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQ
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
+from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
@@ -37,7 +38,7 @@ from vllm_omni.diffusion.worker import WorkerProc
 from vllm_omni.engine.shutdown import worker_shutdown_grace_s
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+    from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput, NewRequestData
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
@@ -186,6 +187,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # Async output: result pump thread for dispatching AsyncDiffusionOutput
         # messages in request-mode (step_execution=False).
         self._rpc_id_counter = 0
+        self._prepared_kv_request: tuple[str, NewRequestData] | None = None
         self._rpc_id_lock = threading.Lock()
         self._rpc_futures: dict[str, concurrent.futures.Future[AsyncDiffusionOutput]] = {}
         self._output_futures: dict[str, concurrent.futures.Future[DiffusionOutput]] = {}
@@ -500,6 +502,40 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         """Register a callback invoked when a worker process dies."""
         self._failure_callbacks.append(callback)
 
+    def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput) -> KVConnectorOutput | None:
+        # Stage the execution payload before receiving KV. This does NOT
+        # authorize computation: Engine still checks completion/cancellation
+        # before execute_request sends the single-use permit.
+        self._prepared_kv_request = None
+        parallel = self.od_config.parallel_config
+        if (
+            scheduler_output.kv_connector_metadata is not None
+            and not self.od_config.step_execution
+            and parallel.data_parallel_size == 1
+            and not any_selected_component_uses_allgather(self.od_config)
+            and len(scheduler_output.scheduled_new_reqs) == 1
+            and not scheduler_output.scheduled_cached_reqs.request_ids
+            and scheduler_output.kv_prefetch_job is None
+        ):
+            new_req = scheduler_output.scheduled_new_reqs[0]
+            if new_req.diffusion_kv_metadata is not None:
+                from vllm_omni.diffusion.sched.interface import validate_new_request_data_identity
+
+                validate_new_request_data_identity(new_req)
+                self._prepared_kv_request = (self._next_rpc_id(), new_req)
+        return super().prepare_kv_for_forward(scheduler_output, prepared_request=self._prepared_kv_request)
+
+    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> None:
+        prepared = getattr(self, "_prepared_kv_request", None)
+        if prepared is not None:
+            new_req = prepared[1]
+            metadata = new_req.diffusion_kv_metadata
+            if new_req.request_id in request_ids or (
+                metadata is not None and (new_req.request_id, metadata.allocation_generation) in request_ids
+            ):
+                self._prepared_kv_request = None
+        super().remove_diffusion_kv_requests(request_ids)
+
     def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Adapt request-mode scheduler output to worker execute_model RPCs.
 
@@ -601,15 +637,21 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         for new_req in new_reqs:
             req = new_req.req
             try:
+                method = "execute_model"
                 args: tuple = (req, self.od_config, scheduler_output.kv_prefetch_job)
                 if new_req.diffusion_kv_metadata is not None:
                     args += (new_req.diffusion_kv_metadata,)
+                prepared = getattr(self, "_prepared_kv_request", None)
+                if prepared is not None and prepared[1] is new_req:
+                    self._prepared_kv_request = None
+                    method = "execute_prepared_model"
+                    args = (prepared[0],)
                 allgather_active = any_selected_component_uses_allgather(self.od_config)
                 timeout_options: dict[str, Any] = {}
                 if allgather_active:
                     timeout_options["timeout"] = _DLO_DP_WAVE_TIMEOUT_S
                 result = self.collective_rpc(
-                    "execute_model",
+                    method,
                     args=args,
                     unique_reply_rank=0,
                     exec_all_ranks=True,
@@ -774,7 +816,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # pump routes the result back to a Future via rpc_id.
         if (
             not self.od_config.step_execution
-            and method in ("execute_model", "execute_model_batch")
+            and method in ("execute_model", "execute_model_batch", "execute_prepared_model")
             and not multi_rank_reply
         ):
             rpc_id = self._next_rpc_id()

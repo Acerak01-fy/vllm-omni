@@ -1174,6 +1174,7 @@ class DiffusionEngine:
         guidance_scale: float,
         num_image_inputs: int = 1,
         num_inference_steps: int = 1,
+        num_frames: int | None = None,
     ) -> OmniDiffusionRequest | None:
         """Build a minimal model request for startup profiling or warmup."""
         prompt = OmniTextPrompt(prompt="dummy run")
@@ -1190,7 +1191,8 @@ class DiffusionEngine:
             audio_sr = 16000
             prompt.setdefault("multi_modal_data", {})["audio"] = np.random.randn(audio_sr * 2).astype(np.float32)
 
-        num_frames = get_dummy_run_num_frames(model_class_name, supports_audio_input)
+        if num_frames is None:
+            num_frames = get_dummy_run_num_frames(model_class_name, supports_audio_input)
         if num_frames <= 0:
             return None
         return OmniDiffusionRequest(
@@ -1242,6 +1244,9 @@ class DiffusionEngine:
             width=profile_width,
             guidance_scale=5.0,
             num_image_inputs=get_dummy_run_num_image_inputs(model_class_name),
+            # Hunyuan skips generic warmup, but paged KV still requires an
+            # activation profile. Its image request has exactly one frame.
+            num_frames=1,
         )
         if request is None:
             raise RuntimeError("paged_scheduler requires a runnable Diffusion KV memory profile request")
