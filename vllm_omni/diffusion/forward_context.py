@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -66,6 +66,10 @@ class ForwardContext:
     # Tracks the depth of SP sharding - incremented on shard, decremented on gather
     # Used by attention layers to determine if SP communication should be enabled
     _sp_shard_depth: int = 0
+    # One entry per active SP split boundary: whether it auto-pads, which makes
+    # every rank's shard the same length and lets attention collectives skip a
+    # runtime length all-gather. Pushed on split, popped on gather.
+    _sp_equal_pad_stack: list[bool] = field(default_factory=list)
 
     @property
     def sp_active(self) -> bool:
@@ -87,6 +91,15 @@ class ForwardContext:
 
         sp_size = self.omni_diffusion_config.parallel_config.sequence_parallel_size
         return sp_size is not None and sp_size > 1
+
+    @property
+    def sp_rank_local_seq_lens_equal(self) -> bool:
+        """Whether every active SP boundary guarantees equal local shard sizes.
+
+        Only framework-managed auto_pad boundaries provide this contract; a
+        region that also shards manually keeps the dynamic length exchange.
+        """
+        return bool(self._sp_equal_pad_stack) and all(self._sp_equal_pad_stack)
 
     def __post_init__(self):
         pass
@@ -267,6 +280,47 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
             ensure_active = getattr(paged_kv_runtime, "ensure_active", None)
             if callable(ensure_active):
                 ensure_active(step_idx)
+
+
+def get_paged_kv_computed_tokens() -> tuple[int, ...]:
+    runtime = _forward_context.paged_kv_runtime if _forward_context is not None else None
+    if runtime is None:
+        return ()
+    return tuple(row.kv_start_pos for row in runtime.metadata.prefill_rows)
+
+
+@contextmanager
+def paged_kv_prefill(sequence_id: int, num_tokens: int):
+    from dataclasses import replace
+
+    runtime = get_forward_context().paged_kv_runtime
+    if runtime is None:
+        raise RuntimeError("Paged KV prefill requires an active runtime")
+    rows = runtime.metadata.prefill_rows
+    matching_rows = [row for row in rows if row.sequence_id == sequence_id]
+    if len(matching_rows) != 1:
+        raise ValueError(
+            f"Paged KV prefill requires exactly one active row for sequence {sequence_id}; found {len(matching_rows)}"
+        )
+    row = matching_rows[0]
+    if type(num_tokens) is not int or not row.kv_start_pos < num_tokens <= row.seq_len:
+        raise ValueError(
+            "Paged KV prefill target must extend the active prefix without exceeding its allocation: "
+            f"start={row.kv_start_pos}, target={num_tokens!r}, allocated={row.seq_len}"
+        )
+    prefill = replace(row, query_len=num_tokens - row.kv_start_pos, seq_len=num_tokens)
+    batch = runtime.adapter.prepare_batch((prefill,))
+    with runtime.adapter.activate(batch):
+        yield
+    runtime.metadata = replace(
+        runtime.metadata,
+        prefill_rows=tuple(
+            replace(item, kv_start_pos=num_tokens, query_len=item.seq_len - num_tokens)
+            if item.sequence_id == sequence_id
+            else item
+            for item in rows
+        ),
+    )
 
 
 def set_forward_context_denoise_timestep(timestep: float | None) -> None:

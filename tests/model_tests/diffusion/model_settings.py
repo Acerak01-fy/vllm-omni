@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from tests.model_tests.diffusion import diff_model_builders
+from tests.model_tests.diffusion.anima_builder import CHECKPOINT_FILENAME, real_anima_model, tiny_anima_builder
 from tests.model_tests.diffusion.config_types import (
     DiffusionAccs,
     DiffusionModelTestOpts,
@@ -29,6 +33,12 @@ from tests.model_tests.diffusion.config_types import (
 # $ pytest test_common_offline.py -k test_pipeline_on_supported_tasks[Flux2KleinPipeline
 #   ^ Runs all test groups for Flux2KleinPipeline only
 DIFFUSION_TEST_SETTINGS = {
+    "AnimaPipeline": DiffusionModelTestOpts(
+        model=real_anima_model,
+        builder=tiny_anima_builder,
+        supported_tasks=[DiffusionTasks.TEXT_TO_IMAGE],
+        checkpoint_filename=CHECKPOINT_FILENAME,
+    ),
     "Flux2KleinPipeline": DiffusionModelTestOpts(
         model="black-forest-labs/FLUX.2-klein-4B",
         builder=diff_model_builders.tiny_flux2_klein_builder,
@@ -53,6 +63,32 @@ DIFFUSION_TEST_SETTINGS = {
         model="Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
         builder=diff_model_builders.tiny_sana_video_builder,
         supported_tasks=[DiffusionTasks.TEXT_TO_VIDEO],
+        extra_test_groups=[
+            [DiffusionAccs.TENSOR_PARALLEL],
+            [DiffusionAccs.CFG_PARALLEL],
+            [DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CFG_PARALLEL],
+            [DiffusionAccs.SEQUENCE_PARALLEL],
+            [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CFG_PARALLEL],
+            [DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.SEQUENCE_PARALLEL],
+            [DiffusionAccs.CACHE_DIT],
+            [DiffusionAccs.CPU_OFFLOAD],
+            [DiffusionAccs.LAYERWISE_OFFLOAD],
+            [DiffusionAccs.CACHE_DIT, DiffusionAccs.CPU_OFFLOAD],
+            [DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
+        ],
+        check_multi_output=False,
+    ),
+    "SanaImageToVideoPipeline": DiffusionModelTestOpts(
+        model="Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
+        builder=diff_model_builders.tiny_sana_video_i2v_builder,
+        supported_tasks=[DiffusionTasks.IMAGE_TO_VIDEO],
+        extra_test_groups=[
+            [DiffusionAccs.CFG_PARALLEL],
+            [DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CFG_PARALLEL],
+            [DiffusionAccs.SEQUENCE_PARALLEL],
+            [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CFG_PARALLEL],
+        ],
+        check_i2v_t2v_divergence=False,
         check_multi_output=False,
     ),
     "QwenImagePipeline": DiffusionModelTestOpts(

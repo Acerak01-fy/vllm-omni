@@ -25,7 +25,7 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.cache.cachedit import cache_summary
+from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
     resolve_prompt_embed_cache_config,
@@ -42,15 +42,19 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
 )
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
+from vllm_omni.diffusion.interaction.types import InteractionPayload
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
-    SupportsPromptUpdate,
+    SupportsInteractionApply,
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
-    supports_prompt_update,
+    supports_interaction_apply,
     supports_step_execution,
 )
 from vllm_omni.diffusion.offloader import enable_offload_backend
+from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
+from vllm_omni.diffusion.postprocess.device_reduction import prepare_diffusion_media_for_transport
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -175,6 +179,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.offload_backend: Any | None = None
         self.prompt_embed_cache: Any | None = None
         self.input_batch: InputBatch | None = None
+        self._interaction_coordinator: InteractionCoordinator | None = None
         self.model_memory_usage = 0
         self.diffusion_kv_backend = DiffusionKVModelRunnerBackend(
             vllm_config=vllm_config,
@@ -189,14 +194,20 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         self.state_cache: dict[str, StepRequestState] = {}
 
         # Initialize KV cache manager for connector management.
-        self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
+        self.kv_transfer_manager = (
+            OmniKVTransferManager.from_od_config(od_config)
+            if getattr(od_config, "kv_transfer_config", None) is None
+            else None
+        )
+        self._kv_connector = None
 
         # Prefetch covers TP / SP / CFG-Parallel / HSDP.  Disabled when a CFG
         # companion KV collector is set (that KV is not backgrounded).
         has_cfg_companion_kv = getattr(od_config, "cfg_kv_collect_func", None) is not None
 
         self._kv_prefetch_enabled = (
-            bool(self.kv_transfer_manager.config.enable_kv_async_prefetch)
+            self.kv_transfer_manager is not None
+            and bool(self.kv_transfer_manager.config.enable_kv_async_prefetch)
             and not has_cfg_companion_kv
             and self.kv_transfer_manager.config.need_recv_cache
         )
@@ -278,6 +289,26 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         if load_format == "dummy":
             return
+
+        # Resolve environment overrides before model loading. Rank-local
+        # prompt-cache hits cannot safely skip text-encoder collectives.
+        enable_pec, pec_size = resolve_prompt_embed_cache_config(
+            enable=getattr(self.od_config, "enable_prompt_embed_cache", False),
+            max_size=getattr(self.od_config, "prompt_embed_cache_size", 32),
+        )
+        resolved_offload = resolve_offload(self.od_config)
+        dp_size = int(getattr(getattr(self.od_config, "parallel_config", None), "data_parallel_size", 1))
+        if (
+            enable_pec
+            and dp_size > 1
+            and resolved_offload.offloads(TEXT_ENCODER_COMPONENT)
+            and resolved_offload.uses_allgather(TEXT_ENCODER_COMPONENT)
+        ):
+            raise ValueError(
+                "Prompt embedding cache cannot be combined with text_encoder "
+                "AllGather across data-parallel ranks; disable the cache or use "
+                "rank-local text_encoder transfer."
+            )
 
         current_omni_platform.init_diffusion_model_runner_runtime(
             vllm_config=self.vllm_config,
@@ -385,7 +416,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 # may explicitly adopt the enabled Cache-DiT backend and then
                 # own all later request-boundary enable/disable transitions.
                 self.cache_backend.enable(self.pipeline)
-                if str(self.od_config.cache_backend).lower() == "cache_dit" and adopt_request_scoped_cache_dit(
+                if isinstance(self.cache_backend, CacheDiTBackend) and adopt_request_scoped_cache_dit(
                     self.pipeline,
                     self.cache_backend,
                 ):
@@ -398,10 +429,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Install prompt-embedding cache (transparent wrapper around
         # ``pipeline.encode_prompt``). Enabled via config or env var; a no-op
         # when the pipeline does not expose ``encode_prompt``.
-        enable_pec, pec_size = resolve_prompt_embed_cache_config(
-            enable=getattr(self.od_config, "enable_prompt_embed_cache", False),
-            max_size=getattr(self.od_config, "prompt_embed_cache_size", 32),
-        )
         if enable_pec:
             self.prompt_embed_cache = install_prompt_embed_cache(
                 self.pipeline,
@@ -409,6 +436,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 enabled=True,
                 model_tag=self.od_config.model_class_name,
             )
+
+        self._interaction_coordinator = InteractionCoordinator.build(self.pipeline, self.od_config)
+        if hasattr(self.pipeline, "_interaction_coordinator"):
+            self.pipeline._interaction_coordinator = self._interaction_coordinator
 
         logger.info("Model runner: Initialization complete.")
 
@@ -447,6 +478,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         self.diffusion_kv_backend.initialize_kv_cache(kv_cache_config)
         self.kv_cache_config = self.diffusion_kv_backend.kv_cache_config
+        if getattr(self.od_config, "kv_transfer_config", None) is not None:
+            from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
+
+            self._kv_connector = ActiveKVConnector(self.vllm_config, self.diffusion_kv_backend.kv_caches_by_layer)
+
+    def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput):
+        from vllm_omni.diffusion.diffusion_kv.kv_connector import wait_for_kv_load
+
+        timeout = self.od_config.kv_transfer_config.kv_connector_extra_config.get("transfer_timeout", 60.0)
+        return wait_for_kv_load(self._kv_connector, scheduler_output, timeout)
 
     def install_diffusion_kv_metadata(self, metadata: DiffusionKVMetadata) -> bool:
         return self.diffusion_kv_backend.install_diffusion_kv_metadata(metadata)
@@ -459,7 +500,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     ) -> int:
         return self.diffusion_kv_backend.get_diffusion_kv_row(request_id, sequence_id, context_id)
 
-    def remove_diffusion_kv_requests(self, request_ids: list[str]) -> int:
+    def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> int:
         return self.diffusion_kv_backend.remove_diffusion_kv_requests(request_ids)
 
     def refresh_diffusion_kv_block_table_layout(self) -> None:
@@ -496,8 +537,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     DiffusionPagedAttentionRow(
                         request_id=request_metadata.request_id,
                         sequence_id=sequence.sequence_id,
-                        query_len=sequence.seq_len,
+                        query_len=sequence.seq_len - sequence.num_computed_tokens,
                         seq_len=sequence.seq_len,
+                        kv_start_pos=sequence.num_computed_tokens,
                     )
                 )
                 denoise_rows.append(
@@ -518,6 +560,23 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """
         if self.prompt_embed_cache is not None:
             self.prompt_embed_cache.clear()
+
+    def release_captured_graphs(self) -> None:
+        """Drop every CUDA graph held for this model, wherever it is kept.
+
+        Sleep level 2 discards the memory a capture was recorded against, so a
+        graph that outlives it replays over freed storage. The runner owns
+        compilation and execution resources, so it owns the release: a pipeline
+        that captures graphs of its own implements ``release_captured_graphs``
+        and is collected here, instead of every caller having to know which
+        pipelines have one.
+        """
+        runners = getattr(self, "graph_runners", None)
+        if runners is not None:
+            runners.clear()
+        release = getattr(self.pipeline, "release_captured_graphs", None)
+        if callable(release):
+            release()
 
     def get_prompt_embed_cache_stats(self) -> dict | None:
         """Return hit/miss statistics for the prompt-embedding cache, if enabled.
@@ -565,6 +624,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         kv_prefetch_job: KVPrefetchJob | None = None,
         use_prefetch: bool = False,
     ) -> None:
+        if self.kv_transfer_manager is None:
+            self._initialize_generator(req.sampling_params)
+            return
         # Receive AR KV. Single-request execution can use the prefetch path:
         # consume prior-forward payload, sync-fallback on miss; request-batch
         # execution keeps the synchronous per-request receive path.
@@ -614,14 +676,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # RequestBatchSamplingParamsKey, so the first request's num_inference_steps applies
         # to the whole runner batch.
         num_inference_steps = first_req.sampling_params.num_inference_steps
+        if num_inference_steps is None and first_req.sampling_params.timesteps is not None:
+            num_inference_steps = len(first_req.sampling_params.timesteps)
+        if num_inference_steps is None and first_req.sampling_params.sigmas is not None:
+            num_inference_steps = len(first_req.sampling_params.sigmas)
+        if num_inference_steps is None:
+            num_inference_steps = getattr(self.pipeline, "default_num_inference_steps", None)
         if num_inference_steps is None and od_config.cache_backend in (
             "tea_cache",
+            "sea_cache",
             "step_cache",
         ):
             # When num_inference_steps is None, some pipelines defer to their
-            # own defaults. TeaCache refresh ignores this value; step_cache
-            # refresh is a no-op because per-chunk state resets in the denoise
-            # loop. Use the pipeline default when available to keep refresh
+            # own defaults. These backends use refresh to reset request state;
+            # runtime step metadata is either unused or resolved in the
+            # pipeline. Use the pipeline default when available to keep refresh
             # behavior aligned with single-request execution.
             num_inference_steps = getattr(self.pipeline, "num_inference_steps", 0) or 0
 
@@ -633,6 +702,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 "currently requires num_inference_steps to be passed explicitly",
                 od_config.cache_backend,
             )
+
+    def _prepare_output_for_transport(
+        self,
+        output: DiffusionOutput,
+        sampling_params: OmniDiffusionSamplingParams,
+    ) -> DiffusionOutput:
+        if output.media is not None:
+            if output.output is not None:
+                raise ValueError("DiffusionOutput cannot contain both media and legacy output")
+            output.media = prepare_diffusion_media_for_transport(
+                output.media,
+                od_config=self.od_config,
+                sampling_params=sampling_params,
+            )
+        return output
 
     def _runner_output_from_outputs(
         self,
@@ -707,6 +791,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         "Diffusion KV metadata count must match the request batch: "
                         f"metadata={len(diffusion_kv_metadata)}, requests={len(reqs)}"
                     )
+                for req, metadata in zip(reqs, diffusion_kv_metadata, strict=True):
+                    req.kv_computed_tokens = tuple(seq.num_computed_tokens for seq in metadata.sequences)
                 paged_metadata = self._build_paged_attention_metadata(diffusion_kv_metadata)
                 paged_kv_runtime, paged_kv_context = self.diffusion_kv_backend.activate_paged_attention_metadata(
                     paged_metadata
@@ -728,6 +814,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         allow_single_output=allow_single_output,
                         pipeline_name=type(self.pipeline).__name__,
                     )
+                with record_function("prepare_output_for_transport"):
+                    outputs = [
+                        self._prepare_output_for_transport(output, req.sampling_params)
+                        for req, output in zip(reqs, outputs, strict=True)
+                    ]
 
             if is_primary and outputs and record_output_peak_memory:
                 batch_peak_memory_mb = self._sample_peak_memory_mb()
@@ -749,7 +840,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         return self._runner_output_from_outputs(reqs, outputs)
 
-    def _attach_stepwise_metrics(
+    def _attach_stepwise_metadata(
         self,
         state: StepRequestState,
         output: DiffusionOutput,
@@ -759,6 +850,14 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             consume_pipeline_stage_durations(self.pipeline),
         )
         attach_stage_durations(state, output)
+
+        # In streaming output mode with interaction, acknowledge which events are handled in this chunk.
+        meta = state.interaction_chunk_metadata
+        state.interaction_chunk_metadata = None
+        if meta is not None:
+            output.started_event_ids = list(meta.started_event_ids)
+            output.active_event_ids = list(meta.active_event_ids)
+            output.completed_event_ids = list(meta.completed_event_ids)
 
     def execute_model(
         self,
@@ -910,10 +1009,21 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
-    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
-        """Step-before update: cleanup finished requests and get/create one running state."""
-        for request_id in scheduler_output.finished_req_ids:
+    def _cleanup_finished_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> None:
+        """Retire state and paged-KV rows released by the scheduler wave."""
+        finished_req_ids = scheduler_output.finished_req_ids
+        for request_id in finished_req_ids:
             self.state_cache.pop(request_id, None)
+
+        if (
+            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and finished_req_ids
+        ):
+            self.remove_diffusion_kv_requests(list(finished_req_ids))
+
+    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[list[StepRequestState], list[str]]:
+        """Resolve cached state and create state for newly admitted requests."""
 
         resolved: list[StepRequestState] = []
         new_request_ids: list[str] = []
@@ -931,13 +1041,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     kv_sender_info=sched_new_req.req.kv_sender_info,
                     prepared_layout=getattr(sched_new_req.req, "prepared_layout", None),
                 )
+                if sched_new_req.diffusion_kv_metadata is not None:
+                    new_state.extra["kv_computed_tokens"] = tuple(
+                        seq.num_computed_tokens for seq in sched_new_req.diffusion_kv_metadata.sequences
+                    )
                 state_req = copy.copy(sched_new_req.req)
                 state_req.sampling_params = new_state.sampling
-                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                    state_req,
-                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                    target_device=self._target_device,
-                )
+                if self.kv_transfer_manager is not None:
+                    self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                        state_req,
+                        cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                        target_device=self._target_device,
+                    )
                 self.state_cache[request_id] = new_state
                 resolved.append(new_state)
 
@@ -960,34 +1075,19 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         new_request_ids: list[str],
     ) -> tuple[list[StepRequestState], InputBatch | None, list[RunnerOutput]]:
         # process new reqs
+        pipeline = self.pipeline
+        assert pipeline is not None, "Model not loaded. Call load_model() first."
         prepared_states: list[StepRequestState] = []
         error_outputs: list[RunnerOutput] = []
         for state in states:
             if state.request_id in new_request_ids:
-                # Everything that runs before ``_dit_any_rank_failed`` must be
-                # inside the try: an exception in ``_initialize_generator`` or
+                # Everything that requires rank-synchronization must be called
+                # inside a try, record the exception and handle with `_dit_any_rank_failed`.
+                # Reason (example): An exception in ``_initialize_generator`` or
                 # ``clear_pipeline_stage_durations`` on one rank would skip the
                 # all-reduce here while every peer proceeds into it, and the
                 # peers then hang on the NCCL collective until timeout.
-                per_req_exc: BaseException | None = None
-                try:
-                    self._initialize_generator(state.sampling)
-                    clear_pipeline_stage_durations(self.pipeline)
-                    # encode
-                    self.pipeline.prepare_encode(state)
-                    merge_stage_durations(
-                        state,
-                        consume_pipeline_stage_durations(self.pipeline),
-                    )
-                except Exception as exc:
-                    per_req_exc = exc
-                # Pipelines that do rank-0-only work (e.g. MiniMax H3
-                # reference-video prep) must broadcast per-request failures
-                # internally so downstream collectives stay in step; even so,
-                # cross-check that every DiT rank agrees so a rank-local error
-                # (or a future pipeline that omits the guard) does not leave
-                # the process group half-way through a new request.
-                if _dit_any_rank_failed(per_req_exc is not None):
+                def _abort_prep_failure(per_req_exc: BaseException | None) -> None:
                     self.state_cache.pop(state.request_id, None)
                     if per_req_exc is None:
                         per_req_exc = RuntimeError(
@@ -1007,6 +1107,41 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             result=DiffusionOutput.from_exception(per_req_exc),
                         )
                     )
+
+                per_req_exc: BaseException | None = None
+                try:
+                    self._initialize_generator(state.sampling)
+                    clear_pipeline_stage_durations(pipeline)
+                    pipeline.prepare_encode(state)
+                except Exception as exc:
+                    per_req_exc = exc
+                # Pipelines that do rank-0-only work (e.g. MiniMax H3
+                # reference-video prep) must broadcast per-request failures
+                # internally so downstream collectives stay in step; even so,
+                # cross-check that every DiT rank agrees so a rank-local error
+                # (or a future pipeline that omits the guard) does not leave
+                # the process group half-way through a new request.
+                if _dit_any_rank_failed(per_req_exc is not None):
+                    _abort_prep_failure(per_req_exc)
+                    continue
+                # If the pipeline supports interaction, the interaction session initialization also needs to call
+                # synchronized_monotonic_time(). Wrap in another try-block to not block on prepare_encode failures.
+                try:
+                    if supports_interaction_apply(pipeline) and state.chunk_index == 0:
+                        pipe = cast(SupportsInteractionApply, pipeline)
+                        assert self._interaction_coordinator is not None, "Model not loaded. Call load_model() first."
+                        state.interaction_chunk_metadata = self._interaction_coordinator.maybe_prepare_initial_session(
+                            state, pipe
+                        )
+                        pipe.prepare_next_chunk(state)
+                    merge_stage_durations(
+                        state,
+                        consume_pipeline_stage_durations(pipeline),
+                    )
+                except Exception as exc:
+                    per_req_exc = exc
+                if _dit_any_rank_failed(per_req_exc is not None):
+                    _abort_prep_failure(per_req_exc)
                     continue
             prepared_states.append(state)
 
@@ -1051,6 +1186,38 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             record_output_peak_memory=True,
         )
 
+    def _execute_non_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
+        """Run a complete legacy forward for requests excluded from step mode."""
+        if scheduler_output.scheduled_cached_reqs.request_ids:
+            raise ValueError("A non-step fallback batch cannot contain cached stepwise requests.")
+
+        runner_outputs: list[RunnerOutput] = []
+        for index, new_req in enumerate(scheduler_output.scheduled_new_reqs):
+            try:
+                result = self.execute_model(
+                    new_req.req,
+                    kv_prefetch_job=getattr(scheduler_output, "kv_prefetch_job", None) if index == 0 else None,
+                    diffusion_kv_metadata=new_req.diffusion_kv_metadata,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Non-step fallback execution failed for %s",
+                    new_req.request_id,
+                    exc_info=True,
+                )
+                result = DiffusionOutput(error=str(exc))
+
+            step_index = getattr(new_req.req.sampling_params, "step_index", None)
+            runner_outputs.append(
+                RunnerOutput(
+                    request_id=new_req.request_id,
+                    step_index=0 if step_index is None else step_index,
+                    finished=True,
+                    result=result,
+                )
+            )
+        return BatchRunnerOutput.from_list(runner_outputs)
+
     def _execute_stepwise(
         self,
         scheduler_output: DiffusionSchedulerOutput,
@@ -1062,8 +1229,28 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Execute one step with explicit validation and profiling policy."""
 
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        # A scheduler wave can release a previous stepwise request while it
+        # admits a full-forward fallback request. Do this before dispatch so
+        # the fallback does not bypass normal state/KV retirement.
+        self._cleanup_finished_step_requests(scheduler_output)
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
+        non_step_requests = [
+            new_req
+            for new_req in scheduler_output.scheduled_new_reqs
+            if not getattr(new_req.req, "use_step_execution", True)
+        ]
+        if non_step_requests:
+            scheduled_request_count = len(scheduler_output.scheduled_new_reqs) + len(
+                scheduler_output.scheduled_cached_reqs.request_ids
+            )
+            if len(non_step_requests) != scheduled_request_count:
+                raise ValueError("Cannot mix stepwise and non-step fallback requests in one scheduler batch.")
+            # This wave has no stepwise requests, so the previous batch cannot
+            # be reused and must not keep its step tensors alive.
+            self.input_batch = None
+            return self._execute_non_step_requests(scheduler_output)
+        for new_req in scheduler_output.scheduled_new_reqs:
             if validate_kv_metadata:
                 self._validate_diffusion_kv_metadata(
                     request_id=new_req.req.request_id,
@@ -1079,15 +1266,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         # Scheduler metadata is installed only for newly admitted requests;
         # cached requests continue to use the row installed on their first
-        # step. Paged rows are retired here for scheduler-finished requests so
-        # a subsequent wave can reuse the native table slots. Dense execution
-        # must not issue Worker KV cleanup side effects.
-        if (
-            getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-            is DiffusionKVCacheMode.PAGED_SCHEDULER
-            and scheduler_output.finished_req_ids
-        ):
-            self.remove_diffusion_kv_requests(list(scheduler_output.finished_req_ids))
+        # step. Finished-state retirement is shared with full-forward
+        # fallback dispatch above.
         installed_request_ids: list[str] = []
         try:
             for new_req in scheduler_output.scheduled_new_reqs:
@@ -1116,6 +1296,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
+            pipeline = self.pipeline
+            assert pipeline is not None, "Model not loaded. Call load_model() first."
             had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -1130,7 +1312,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             states, input_batch, runner_output_list = self._prepare_batch_inputs(states, new_request_ids)
             if input_batch is None:
                 return BatchRunnerOutput.from_list(runner_output_list)
-            attn_metadata = {}
+            attn_metadata: dict[str, Any] = {}
 
             kv_backend = getattr(self, "diffusion_kv_backend", None)
             paged_kv_runtime = kv_backend if getattr(kv_backend, "paged_attention_adapter", None) is not None else None
@@ -1141,16 +1323,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 paged_kv_runtime=paged_kv_runtime,
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
-                clear_pipeline_stage_durations(self.pipeline)
-                noise_pred = self.pipeline.denoise_step(input_batch, states=states)
-                denoise_stage_durations = consume_pipeline_stage_durations(self.pipeline)
+                clear_pipeline_stage_durations(pipeline)
+                noise_pred = pipeline.denoise_step(input_batch, states=states)
+                denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
                 for state in states:
                     merge_stage_durations(
                         state,
                         denoise_stage_durations,
                     )
 
-                pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
+                pipeline_interrupted = getattr(pipeline, "interrupt", False)
                 if noise_pred is None and pipeline_interrupted:
                     for state in states:
                         runner_output_list.append(
@@ -1165,9 +1347,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 else:
                     offset = 0
                     for req in states:
+                        if req.latents is None:
+                            raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
                         row_num = req.latents.shape[0]
                         try:
-                            self.pipeline.step_scheduler(
+                            pipeline.step_scheduler(
                                 req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
                             )
                             if self.od_config.streaming_output:
@@ -1176,13 +1360,20 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                 should_decode = req.denoise_completed
 
                             if should_decode:
-                                clear_pipeline_stage_durations(self.pipeline)
-                                result = self.pipeline.post_decode(req)
+                                clear_pipeline_stage_durations(pipeline)
+                                result = pipeline.post_decode(req)
                                 if result is not None:
-                                    self._attach_stepwise_metrics(
+                                    result = self._prepare_output_for_transport(result, req.sampling)
+                                    self._attach_stepwise_metadata(
                                         req,
                                         result,
                                     )
+                                    # After consuming this chunk's interaction metadata, apply pending interactions and
+                                    # prepare the next chunk (prepare_next_chunk may be a no-op---depending on pipeline)
+                                    if supports_interaction_apply(pipeline) and not req.request_denoise_completed:
+                                        pipe = cast(SupportsInteractionApply, pipeline)
+                                        pipe.apply_interaction_at_chunk_boundary(req)
+                                        pipe.prepare_next_chunk(req)
                             else:
                                 result = None
                             # finished should be computed after post_decode() advanced chunk_index
@@ -1232,12 +1423,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     for runner_output in runner_output_list:
                         if runner_output.result is None:
                             continue
-                        state = states_by_id.get(runner_output.request_id)
-                        if state is None:
+                        matched_state = states_by_id.get(runner_output.request_id)
+                        if matched_state is None:
                             continue
                         runner_output.result.peak_memory_mb = max(
                             runner_output.result.peak_memory_mb,
-                            state.peak_memory_mb,
+                            matched_state.peak_memory_mb,
                         )
 
                 terminal_request_ids = [
@@ -1258,42 +1449,34 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         request_id: str,
         interaction: OmniInteractionPrompt,
     ) -> None:
-        """Route a midway interaction to the matching active stepwise request feature."""
-        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        """Route a midway interaction through the pipeline interaction coordinator."""
+        assert self.pipeline is not None and self._interaction_coordinator is not None, (
+            "Model not loaded. Call load_model() first."
+        )
         if not self.od_config.streaming_output:
             raise ValueError("submit_interaction requires streaming_output=True")
         if not self._supports_step_mode():
             raise ValueError("submit_interaction requires step execution support")
 
-        event = interaction.get("event")
-        if isinstance(event, dict) and "prompt" in event and "multi_modal_data" not in event:
-            # Is a prompt update interaction.
-            self._submit_prompt_update_interaction(request_id, interaction)
-            return
-
-        raise NotImplementedError(
-            "Only text-only prompt update interactions with 'event.prompt' and optional "
-            "'transition_chunks' are supported in this release"
-        )
-
-    def _submit_prompt_update_interaction(
-        self,
-        request_id: str,
-        interaction: OmniInteractionPrompt,
-    ) -> None:
-        """Queue a prompt-update interaction for an active stepwise request."""
-        if not supports_prompt_update(self.pipeline):
-            raise ValueError(f"prompt_update is not supported by pipeline {self.od_config.model_class_name!r}")
-
         state = self.state_cache.get(request_id)
         if state is None:
-            raise ValueError(f"No active request state for prompt_update: {request_id!r}")
+            raise ValueError(f"No active request state for interaction: {request_id!r}")
 
-        event = cast(dict[str, Any], interaction.get("event"))
-        prompt = event["prompt"]
-        transition_chunks = interaction.get("transition_chunks")
-        event_id = interaction.get("event_id")
-        if not isinstance(event_id, str) or not event_id:
-            raise ValueError("event_id must be non-empty")
-        pipeline = cast(SupportsPromptUpdate, self.pipeline)
-        pipeline.prepare_prompt_update(state, prompt, event_id, transition_chunks)
+        event = interaction["event"]
+        parts: list[tuple[str, InteractionPayload]] = []
+        prompt = event.get("prompt")
+        if prompt is not None:
+            parts.append(("prompt", {"prompt": prompt}))
+        multi_modal_data = event.get("multi_modal_data")
+        if multi_modal_data:
+            parts.extend(
+                (str(modality), cast(InteractionPayload, payload)) for modality, payload in multi_modal_data.items()
+            )
+
+        self._interaction_coordinator.enqueue_parts(
+            state,
+            parts=parts,
+            event_id=interaction["event_id"],
+            received_at=time.monotonic(),
+            transition_chunks=interaction.get("transition_chunks"),
+        )
