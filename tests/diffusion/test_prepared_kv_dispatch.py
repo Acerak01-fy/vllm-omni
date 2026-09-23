@@ -25,8 +25,6 @@ def dispatch(monkeypatch):
     config = SimpleNamespace(step_execution=False, parallel_config=SimpleNamespace(data_parallel_size=1), num_gpus=1)
     worker = object.__new__(worker_module.DiffusionWorker)
     worker.od_config = config
-    worker._prepared_execution_lock = threading.Lock()
-    worker._prepared_execution = None
     worker.model_runner = Mock()
     worker.model_runner.prepare_kv_for_forward.return_value = KVConnectorOutput(finished_recving={"A/kv"})
     worker.execute_model = Mock(return_value=DiffusionOutput(output=None))

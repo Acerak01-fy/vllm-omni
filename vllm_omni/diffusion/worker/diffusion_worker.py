@@ -8,7 +8,6 @@ Handles GPU infrastructure initialization and delegates model operations
 to DiffusionModelRunner.
 """
 
-import concurrent.futures
 import gc
 import multiprocessing as mp
 import os
@@ -20,7 +19,6 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -103,26 +101,6 @@ _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 # Worker entry points that release device memory. Background D2H/SHM packing
 # still reads model output tensors, so it must finish before these run.
 _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
-
-
-@dataclass
-class _PreparedExecution:
-    """A model execution staged while the engine validates KV ownership.
-
-    KV receive and request validation are control-plane operations.  Starting
-    a waiter before returning from ``prepare_kv_for_forward`` lets the worker
-    enter the model immediately when the engine sends the one-shot permit,
-    without making the worker dispatch a second model call from scratch.
-    """
-
-    permit: str
-    request: NewRequestData
-    gate: threading.Event = field(default_factory=threading.Event)
-    result: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    authorized: bool = False
-    cancelled: bool = False
-    thread: threading.Thread | None = None
 
 
 def _cleanup_after_execution_error(exc: Exception) -> None:
@@ -273,8 +251,6 @@ class DiffusionWorker:
         self.rank = rank
         self.od_config = od_config
         self._prepared_kv_request: tuple[str, NewRequestData] | None = None
-        self._prepared_execution: _PreparedExecution | None = None
-        self._prepared_execution_lock = threading.Lock()
         self.device: torch.device | None = None
         self.vllm_config: VllmConfig | None = None
         self.model_runner: DiffusionModelRunner | None = None
@@ -567,21 +543,14 @@ class DiffusionWorker:
     def remove_diffusion_kv_requests(self, request_ids: list[str | tuple[str, int]]) -> int:
         """Clear Worker-local rows without freeing Scheduler-owned blocks."""
 
-        prepared_request = getattr(self, "_prepared_kv_request", None)
-        if prepared_request is not None:
-            new_req = prepared_request[1]
+        prepared = getattr(self, "_prepared_kv_request", None)
+        if prepared is not None:
+            new_req = prepared[1]
             metadata = new_req.diffusion_kv_metadata
             if new_req.request_id in request_ids or (
                 metadata is not None and (new_req.request_id, metadata.allocation_generation) in request_ids
             ):
                 self._prepared_kv_request = None
-        pending = self._prepared_execution
-        if pending is not None:
-            metadata = pending.request.diffusion_kv_metadata
-            if pending.request.request_id in request_ids or (
-                metadata is not None and (pending.request.request_id, metadata.allocation_generation) in request_ids
-            ):
-                self._cancel_prepared_execution(pending, "Diffusion KV request was cancelled")
         assert self.model_runner is not None, "Model runner not initialized"
         return self.model_runner.remove_diffusion_kv_requests(request_ids)
 
@@ -590,7 +559,6 @@ class DiffusionWorker:
         scheduler_output: DiffusionSchedulerOutput,
         prepared_request: tuple[str, NewRequestData] | None = None,
     ):
-        self._cancel_prepared_execution(self._prepared_execution, "Superseded by a new KV request")
         self._prepared_kv_request = None
 
         def prepare():
@@ -600,103 +568,22 @@ class DiffusionWorker:
 
         outputs = _run_and_gather_rank_values("Diffusion KV receive", prepare)
         self._prepared_kv_request = prepared_request
-        if prepared_request is not None:
-            pending = _PreparedExecution(prepared_request[0], prepared_request[1])
-            pending.thread = threading.Thread(
-                target=self._run_prepared_execution,
-                args=(pending,),
-                daemon=True,
-                name=f"diffusion-prepared-{prepared_request[0]}",
-            )
-            with self._prepared_execution_lock:
-                self._prepared_execution = pending
-            pending.thread.start()
         return outputs
 
     def execute_prepared_model(self, permit: str) -> DiffusionOutput:
-        """Release a pre-dispatched model after the Engine validates the request."""
-        pending = self._prepared_execution
+        """Execute only after Engine authorizes this prepared scheduling wave."""
+        prepared = getattr(self, "_prepared_kv_request", None)
+        self._prepared_kv_request = None
 
         def validate_permit():
-            with self._prepared_execution_lock:
-                valid = (
-                    pending is not None
-                    and self._prepared_execution is pending
-                    and pending.permit == permit
-                    and not pending.cancelled
-                    and not pending.authorized
-                )
-            return valid, None if valid else "Missing or stale diffusion KV execution permit"
+            if prepared is None or prepared[0] != permit:
+                raise ValueError("Missing or stale diffusion KV execution permit")
 
         # A stale permit on any rank must stop all ranks before model collectives.
-        try:
-            statuses = _run_and_gather_rank_values("Diffusion KV execution permit", validate_permit)
-        except Exception:
-            if pending is not None:
-                self._cancel_prepared_execution(pending, "Missing or stale diffusion KV execution permit")
-            self._prepared_kv_request = None
-            raise
-        failures = [result for valid, result in statuses if not valid]
-        if failures:
-            if pending is not None:
-                self._cancel_prepared_execution(pending, failures[0] or "invalid permit")
-            # A rank disagreement invalidates the complete wave locally; do
-            # not let the request identity survive into a later permit.
-            self._prepared_kv_request = None
-            raise RuntimeError(failures[0] or "Missing or stale diffusion KV execution permit")
-
-        assert pending is not None
-        with pending.lock:
-            if pending.cancelled or pending.authorized:
-                raise RuntimeError("Missing or stale diffusion KV execution permit")
-            pending.authorized = True
-            pending.gate.set()
-        try:
-            return pending.result.result()
-        finally:
-            with self._prepared_execution_lock:
-                if self._prepared_execution is pending:
-                    self._prepared_execution = None
-            if self._prepared_kv_request is not None and self._prepared_kv_request[0] == permit:
-                self._prepared_kv_request = None
-
-    def _run_prepared_execution(self, pending: _PreparedExecution) -> None:
-        """Wait out of band for the Engine permit, then run the model."""
-        pending.gate.wait()
-        with pending.lock:
-            if pending.cancelled:
-                if not pending.result.done():
-                    pending.result.set_exception(RuntimeError("Prepared diffusion execution was cancelled"))
-                return
-        try:
-            request = pending.request
-            vllm_config = getattr(self, "vllm_config", None)
-            config_context = (
-                set_current_vllm_config(vllm_config) if vllm_config is not None else nullcontext()
-            )
-            with config_context:
-                output = self.execute_model(
-                    request.req,
-                    self.od_config,
-                    diffusion_kv_metadata=request.diffusion_kv_metadata,
-                )
-        except Exception as exc:
-            if not pending.result.done():
-                pending.result.set_exception(exc)
-        else:
-            if not pending.result.done():
-                pending.result.set_result(output)
-
-    def _cancel_prepared_execution(self, pending: _PreparedExecution | None, reason: str) -> None:
-        if pending is None:
-            return
-        with pending.lock:
-            if pending.authorized:
-                return
-            pending.cancelled = True
-            pending.gate.set()
-            if not pending.result.done():
-                pending.result.set_exception(RuntimeError(reason))
+        _run_and_gather_rank_values("Diffusion KV execution permit", validate_permit)
+        assert prepared is not None
+        new_req = prepared[1]
+        return self.execute_model(new_req.req, self.od_config, diffusion_kv_metadata=new_req.diffusion_kv_metadata)
 
     def init_lora_manager(self) -> None:
         """Initialize the LoRA manager for this worker."""
@@ -1143,7 +1030,6 @@ class DiffusionWorker:
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
         try:
-            self._cancel_prepared_execution(self._prepared_execution, "Diffusion worker is shutting down")
             if self.model_runner is not None:
                 mgr = getattr(self.model_runner, "kv_transfer_manager", None)
                 try:
