@@ -117,7 +117,6 @@ class _PreparedExecution:
 
     permit: str
     request: NewRequestData
-    stream: Any = None
     gate: threading.Event = field(default_factory=threading.Event)
     result: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -593,19 +592,16 @@ class DiffusionWorker:
     ):
         self._cancel_prepared_execution(self._prepared_execution, "Superseded by a new KV request")
         self._prepared_kv_request = None
-        execution_stream = None
 
         def prepare():
-            nonlocal execution_stream
             if prepared_request is not None:
                 validate_new_request_data_identity(prepared_request[1])
-                execution_stream = torch.get_device_module(self.device).current_stream(self.device)
             return self.model_runner.prepare_kv_for_forward(scheduler_output)
 
         outputs = _run_and_gather_rank_values("Diffusion KV receive", prepare)
         self._prepared_kv_request = prepared_request
         if prepared_request is not None:
-            pending = _PreparedExecution(prepared_request[0], prepared_request[1], stream=execution_stream)
+            pending = _PreparedExecution(prepared_request[0], prepared_request[1])
             pending.thread = threading.Thread(
                 target=self._run_prepared_execution,
                 args=(pending,),
@@ -673,15 +669,12 @@ class DiffusionWorker:
                     pending.result.set_exception(RuntimeError("Prepared diffusion execution was cancelled"))
                 return
         try:
-            # Accelerator device/stream state is thread-local. Reuse the
-            # caller's stream so KV preparation, forward and output handoff
-            # remain ordered without adding a device-wide synchronization.
-            current_omni_platform.set_device(self.device)
-            device_module = torch.get_device_module(self.device)
             request = pending.request
             vllm_config = getattr(self, "vllm_config", None)
-            config_context = set_current_vllm_config(vllm_config) if vllm_config is not None else nullcontext()
-            with device_module.stream(pending.stream), config_context:
+            config_context = (
+                set_current_vllm_config(vllm_config) if vllm_config is not None else nullcontext()
+            )
+            with config_context:
                 output = self.execute_model(
                     request.req,
                     self.od_config,

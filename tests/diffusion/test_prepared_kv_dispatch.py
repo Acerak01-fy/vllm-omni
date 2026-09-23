@@ -3,7 +3,6 @@
 
 import queue
 import threading
-from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -26,13 +25,6 @@ def dispatch(monkeypatch):
     config = SimpleNamespace(step_execution=False, parallel_config=SimpleNamespace(data_parallel_size=1), num_gpus=1)
     worker = object.__new__(worker_module.DiffusionWorker)
     worker.od_config = config
-    worker.device = "test-device"
-    monkeypatch.setattr(worker_module.current_omni_platform, "set_device", Mock())
-    monkeypatch.setattr(
-        worker_module.torch,
-        "get_device_module",
-        Mock(return_value=SimpleNamespace(current_stream=Mock(return_value=object()), stream=lambda _: nullcontext())),
-    )
     worker._prepared_execution_lock = threading.Lock()
     worker._prepared_execution = None
     worker.model_runner = Mock()
@@ -79,47 +71,6 @@ def test_preparation_needs_explicit_single_use_permit(dispatch):
     with pytest.raises(RuntimeError, match="stale"):
         worker.execute_prepared_model(permit)
     assert worker.execute_model.call_count == 1
-
-
-@pytest.mark.parametrize("device", ["npu:1", "npu:3", "cuda:2"])
-def test_execution_thread_restores_device_and_callers_stream(dispatch, monkeypatch, device):
-    executor, worker, scheduled = dispatch
-    worker.device = device
-    local = threading.local()
-    caller = threading.get_ident()
-    original_stream = object()
-
-    def capture_stream(actual_device):
-        assert actual_device == device and threading.get_ident() == caller
-        return original_stream
-
-    def set_device(actual_device):
-        assert threading.get_ident() != caller
-        local.device = actual_device
-
-    @contextmanager
-    def stream_context(stream):
-        assert local.device == device and stream is original_stream
-        local.stream = stream
-        try:
-            yield
-        finally:
-            local.stream = None
-
-    def compute(*args, **kwargs):
-        assert local.device == device and local.stream is original_stream
-        assert threading.get_ident() != caller
-        return DiffusionOutput(output=None)
-
-    module = SimpleNamespace(current_stream=capture_stream, stream=stream_context)
-    monkeypatch.setattr(worker_module.torch, "get_device_module", lambda _: module)
-    monkeypatch.setattr(worker_module.current_omni_platform, "set_device", set_device)
-    worker.execute_model.side_effect = compute
-    executor.prepare_kv_for_forward(scheduled)
-    worker.execute_model.assert_not_called()
-    result = executor.execute_request(scheduled)
-    assert result.runner_outputs[0].result.error is None
-    worker.execute_model.assert_called_once()
 
 
 @pytest.mark.parametrize("action", ["cancel", "timeout"])
