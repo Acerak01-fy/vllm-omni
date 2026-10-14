@@ -21,7 +21,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.distributed as dist
@@ -306,18 +306,7 @@ class DiffusionWorker:
             # Weight transfer engines bind the live model at construction
             # (mirrors upstream vLLM gpu_worker), so they are created only
             # after the model has been loaded.
-            if wt_config is not None:
-                from vllm_omni.diffusion.worker.weight_transfer_engine import (
-                    create_diffusion_weight_transfer_engine,
-                )
-
-                self.weight_transfer_engine = create_diffusion_weight_transfer_engine(
-                    wt_config,
-                    self.vllm_config,
-                    self.device,
-                    self.model_runner.pipeline,
-                    apply_strategy=getattr(self.od_config, "weight_transfer_apply_strategy", None),
-                )
+            self._init_weight_transfer_engine()
             self.init_lora_manager()
         elif wt_config is not None:
             logger.warning(
@@ -326,6 +315,23 @@ class DiffusionWorker:
                 self.rank,
             )
         logger.info(f"Worker {self.rank}: Initialization complete.")
+
+    def _init_weight_transfer_engine(self) -> None:
+        """Create the WTE after the current pipeline has been materialized."""
+        if self.weight_transfer_engine is not None:
+            return
+        wt_config = getattr(self.vllm_config, "weight_transfer_config", None)
+        if wt_config is None:
+            return
+        from vllm_omni.diffusion.worker.weight_transfer_engine import create_diffusion_weight_transfer_engine
+
+        self.weight_transfer_engine = create_diffusion_weight_transfer_engine(
+            wt_config,
+            self.vllm_config,
+            self.device,
+            cast(DiffusionModelRunner, self.model_runner).pipeline,
+            apply_strategy=getattr(self.od_config, "weight_transfer_apply_strategy", None),
+        )
 
     def init_device(self) -> None:
         """Initialize the device and distributed environment."""
@@ -1095,9 +1101,18 @@ class CustomPipelineWorkerExtension:
             custom_pipeline_args: Dictionary of arguments for custom pipeline initialization
         """
 
+        worker = cast(DiffusionWorker, self)
+        if worker._weight_update_active:
+            raise RuntimeError("Cannot replace the pipeline during an active weight update.")
+        # Release the engine's reference to the old pipeline before replacing it.
+        if worker.weight_transfer_engine is not None:
+            worker.weight_transfer_engine.shutdown()
+            worker.weight_transfer_engine = None
+
         # Clean up old pipeline
-        if self.model_runner.pipeline is not None:
-            del self.model_runner.pipeline
+        model_runner = cast(DiffusionModelRunner, worker.model_runner)
+        if model_runner.pipeline is not None:
+            del model_runner.pipeline
             gc.collect()
             torch.accelerator.empty_cache()
 
@@ -1105,11 +1120,12 @@ class CustomPipelineWorkerExtension:
         custom_pipeline_name = custom_pipeline_args["pipeline_class"]
 
         # Use the DiffusionWorker's load_model method which handles the forward context
-        self.load_model(
+        worker.load_model(
             load_format="custom_pipeline",
             custom_pipeline_name=custom_pipeline_name,
         )
-        self.init_lora_manager()
+        worker._init_weight_transfer_engine()
+        worker.init_lora_manager()
 
 
 class WorkerProc:

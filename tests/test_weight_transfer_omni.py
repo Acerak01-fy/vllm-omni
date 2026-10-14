@@ -174,6 +174,69 @@ def test_diffusion_happy_path_delegates_to_engine():
     assert worker._weight_update_active is False
 
 
+@pytest.mark.parametrize("has_existing_engine", [False, True])
+def test_custom_pipeline_reload_rebinds_weight_transfer(monkeypatch, has_existing_engine):
+    """Updates and target resets after reload must use the replacement pipeline."""
+    import torch
+    from vllm.config.weight_transfer import WeightTransferConfig
+
+    from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
+
+    class Pipeline(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(2))
+
+        def load_weights(self, weights):
+            with torch.no_grad():
+                for name, value in weights:
+                    getattr(self, name).copy_(value)
+
+    old, replacement = Pipeline(), Pipeline()
+    worker = _bare_diffusion_worker(model=old)
+    worker.vllm_config = SimpleNamespace(
+        weight_transfer_config=WeightTransferConfig(backend="ipc"),
+        parallel_config=None,
+        model_config=None,
+        quant_config=None,
+    )
+    worker.od_config = SimpleNamespace(weight_transfer_apply_strategy="direct-load")
+    worker.device = torch.device("cpu")
+    if has_existing_engine:
+        worker._init_weight_transfer_engine()
+        previous = worker.weight_transfer_engine
+        previous._packed_importer = MagicMock()
+    worker.load_model = lambda **kwargs: setattr(worker.model_runner, "pipeline", replacement)
+    worker.init_lora_manager = MagicMock()
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+
+    CustomPipelineWorkerExtension.re_init_pipeline(worker, {"pipeline_class": "test.Pipeline"})
+    if has_existing_engine:
+        previous._packed_importer.close.assert_called_once()
+    for value in (1.0, 2.0):
+        worker.init_weight_transfer_engine({"packed": True})
+        worker.start_weight_update()
+        assert worker.weight_transfer_engine.model is replacement
+        worker.weight_transfer_engine.model.load_weights([("weight", torch.full((2,), value))])
+        worker.finish_weight_update()
+        assert worker.weight_transfer_engine.model is replacement
+        torch.testing.assert_close(replacement.weight, torch.full((2,), value))
+        torch.testing.assert_close(old.weight, torch.zeros(2))
+
+
+def test_custom_pipeline_reload_rejects_active_update():
+    from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
+
+    engine = MagicMock()
+    worker = _bare_diffusion_worker(engine=engine)
+    worker.start_weight_update()
+    model = worker.model_runner.pipeline
+    with pytest.raises(RuntimeError, match="active weight update"):
+        CustomPipelineWorkerExtension.re_init_pipeline(worker, {"pipeline_class": "test.Pipeline"})
+    assert worker.model_runner.pipeline is model
+    engine.shutdown.assert_not_called()
+
+
 def test_diffusion_rejects_update_before_start():
     worker = _bare_diffusion_worker(engine=MagicMock())
 
