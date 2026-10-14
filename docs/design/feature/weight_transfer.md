@@ -19,7 +19,7 @@
 
 Weight transfer enables dynamic model weight updates on a live serving engine, without restart and without touching GPU memory layout. It is the mechanism RL training loops need: every training iteration produces new policy weights that must be applied to the rollout engine before the next generation round.
 
-This feature ports the upstream vLLM weight transfer architecture — as of the vLLM 0.29 line that vLLM-Omni 0.28+/main tracks — onto vLLM-Omni's multi-stage orchestration. The four-phase protocol, payload contracts, and worker engine construction match upstream exactly; the adaptation is in how the orchestrator fans the protocol out to heterogeneous stages (AR vs diffusion), and one omni-specific backend (`omni_ipc`) for diffusers-style pipelines.
+This feature ports the upstream vLLM weight transfer architecture — as of the vLLM 0.29 line that vLLM-Omni 0.28+/main tracks — onto vLLM-Omni's multi-stage orchestration. The four-phase protocol, payload contracts, and worker engine construction match upstream exactly; the adaptation is in how the orchestrator fans the protocol out to heterogeneous stages (AR vs diffusion), with a stage-local apply strategy for diffusers-style pipelines.
 
 **Core benefit**: an RL trainer can update rollout weights in place (measured: applied weights match the shipped tensors bit-exactly, restored weights reproduce the original output bit-exactly), replacing verl-omni's current workarounds (ZMQ-sidecar weight pushes and checkpoint-restart cycles).
 
@@ -80,7 +80,7 @@ The lifecycle matches upstream method-for-method:
 │                                                factory signature     │
 │        │                                             │               │
 │        ▼                                             ▼               │
-│  upstream engine (layerwise reload)     omni_ipc engine (in place)   │
+│  upstream engine (layerwise reload)     ipc + direct-load strategy       │
 │  └ ipc / nccl / sparse_nccl             └ vllm/diffusion/worker/     │
 │                                           weight_transfer_engine.py   │
 └──────────────────────────────────────────────────────────────────────┘
@@ -106,24 +106,24 @@ deploy YAML / --weight-transfer-config (inherited upstream EngineArgs flag)
 
 AR stages resolve the field through the upstream `EngineArgs`/`VllmConfig` intersection (inherited, no omni plumbing needed for the native backends).
 
-### Layerwise Reload vs In-Place Application
+### Layerwise Reload vs Direct Loading
 
 Upstream `ipc`/`nccl` wrap every update round in the **layerwise-reload protocol**: at `start_weight_update` each parameter is moved to meta device (its kernel-format storage saved), and as chunks stream in, per-parameter `weight_loader` wiring buffers them until a layer is complete; the layer is then re-materialized, the full weight-processing pipeline (quantization repack, fusion) re-runs, and the result is copied back into the original storage. This is what allows updating *quantized* weights without changing memory layout — but it requires models to be built through vLLM's reload-aware construction (`record_metadata_for_reloading` at build time). Omni's diffusers-style pipelines are not wired into that protocol: their layers carry no recorded metadata, so the meta-ization step deletes parameters and never restores them.
 
-`omni_ipc` takes the other valid shape upstream itself ships — **apply in place, no layerwise reload** (exactly the design point of upstream's `sparse_nccl`): received tensors are rebuilt from CUDA IPC handles and applied through the pipeline's own `load_weights` onto the live parameters. For unquantized bf16 pipelines this is semantically equivalent and cheaper. The class inherits the entire IPC payload contract (handshake, handles, packed mode); only the two lifecycle hooks differ.
+The `direct-load` strategy takes the other valid shape upstream itself ships — **apply in place, no layerwise reload** (exactly the design point of upstream's `sparse_nccl`): received tensors are rebuilt from standard CUDA IPC handles and applied through the pipeline's own `load_weights` onto live parameters. This path supports unquantized pipelines whose loaders can update live parameters; quantized updates require a compatible reload lifecycle. The class inherits the entire IPC payload contract; only the two lifecycle hooks differ.
 
 ## Backends
 
-Registered in upstream's factory (inherited) plus one omni variant:
+The transport is selected through the upstream factory; diffusion can select a local application strategy:
 
 | Backend | Application | Protocol | Use case |
 | ------- | ----------- | -------- | -------- |
 | `ipc` | CUDA IPC handles | layerwise reload | AR stages, single node |
 | `nccl` | NCCL broadcast | layerwise reload | multi-GPU trainers |
 | `sparse_nccl` | sparse patches | in place | updating a parameter subset |
-| `omni_ipc` | CUDA IPC handles | in place via `load_weights` | diffusion stages (diffusers-style pipelines) |
+| `ipc` + `direct-load` | CUDA IPC handles | in place via `load_weights` | dense, unquantized diffusion stages |
 
-`omni_ipc` is registered through the factory's runtime extension point (`register_engine`) when the diffusion worker boots; the trainer side is unchanged — payloads are the standard IPC ones, so the upstream trainer engine and HTTP client drive it unmodified.
+The diffusion worker selects the local `direct-load` strategy after constructing the standard upstream `ipc` config; the trainer side is unchanged because the payloads are the standard IPC ones.
 
 ## Orchestrator Semantics
 
@@ -169,7 +169,7 @@ Wire shapes (IPC): init `{"packed": bool}`; update `names / dtype_names / shapes
 
 ## Measured Results
 
-Remote L4, `tiny-random/Qwen-Image`, single stage, `omni_ipc` backend:
+Remote L4, `tiny-random/Qwen-Image`, single stage, `ipc` transport with the `direct-load` strategy:
 
 | Check | Result |
 | ----- | ------ |
@@ -185,7 +185,10 @@ Note on the perturbation target: this tiny untrained model is insensitive to tra
 ```yaml
 # deploy override — pipeline-wide
 weight_transfer_config:
-  backend: omni_ipc   # diffusion pipeline; use ipc/nccl for AR stages
+  backend: ipc
+stages:
+  - stage_id: 0
+    weight_transfer_apply_strategy: direct-load
 
 # or stage-scoped: only stage 1 gets the feature (stage 0 never sees RPCs)
 weight_transfer_config:
@@ -193,12 +196,14 @@ weight_transfer_config:
 stages:
   - stage_id: 1
     weight_transfer_config:
-      backend: omni_ipc
+      backend: ipc
+    weight_transfer_apply_strategy: direct-load
 ```
 
 ```bash
 # CLI (inherited from upstream EngineArgs)
-vllm-omni serve MODEL --omni ... --weight-transfer-config '{"backend": "omni_ipc"}'
+vllm-omni serve MODEL --omni ... --weight-transfer-config '{"backend": "ipc"}' \
+  --stage-0-weight-transfer-apply-strategy direct-load
 ```
 
 ## Testing
@@ -216,7 +221,7 @@ vllm-omni serve MODEL --omni ... --weight-transfer-config '{"backend": "omni_ipc
 | `vllm_omni/diffusion/data.py` | `OmniDiffusionConfig.weight_transfer_config` |
 | `vllm_omni/diffusion/vllm_config.py` | typed mapping into `VllmConfig` |
 | `vllm_omni/diffusion/worker/diffusion_worker.py` | four-phase lifecycle, state machine, engine creation post-load |
-| `vllm_omni/diffusion/worker/weight_transfer_engine.py` | `omni_ipc` backend + factory registration |
+| `vllm_omni/diffusion/worker/weight_transfer_engine.py` | IPC apply strategies |
 | `vllm_omni/entrypoints/async_omni.py` | orchestrator lifecycle API, selective routing, strict errors |
 | `vllm_omni/entrypoints/serve/weight_transfer_api.py` | HTTP router (gated) |
 | `vllm_omni/entrypoints/openai/api_server.py` | gated router mounting |
@@ -224,7 +229,7 @@ vllm-omni serve MODEL --omni ... --weight-transfer-config '{"backend": "omni_ipc
 
 ## Future Work
 
-1. **Layerwise-reload adaptation for diffusion pipelines** — required only when updating *quantized* diffusion weights (fp8 DiT et al.). Three prerequisites: call `record_metadata_for_reloading` in the omni pipeline loader after construction (before any post-load processing mutates parameter layout); compose the pipeline's `AutoWeightsLoader` path with the wrapped per-parameter `weight_loader` (including tied-embedding name alignment); guarantee chunk boundaries keep layers complete (a layer materializes only when all its parameters arrive). Can coexist with `omni_ipc` as another opt-in backend.
+1. **Layerwise-reload adaptation for diffusion pipelines** — required only when updating *quantized* diffusion weights (fp8 DiT et al.). Three prerequisites: call `record_metadata_for_reloading` in the omni pipeline loader after construction (before any post-load processing mutates parameter layout); compose the pipeline's `AutoWeightsLoader` path with the wrapped per-parameter `weight_loader` (including tied-embedding name alignment); guarantee chunk boundaries keep layers complete (a layer materializes only when all its parameters arrive). This will become the `layerwise` apply strategy for the standard IPC transport.
 2. **AR-stage structured-config plumbing** — route `weight_transfer_config` through the structured AR stage projection so LLM-only pipelines opt in via that path too.
 3. **Multi-node** — exercise the `nccl` backends with distributed trainers.
 4. **Sparse updates** — LoRA/adapter-shaped updates via `sparse_nccl`.

@@ -14,6 +14,11 @@ Weight transfer is **opt-in**. Enable it with the pipeline-wide `weight_transfer
 # deploy override
 weight_transfer_config:
   backend: ipc
+
+# For a dense diffusion stage, keep the apply policy stage-local.
+stages:
+  - stage_id: 0
+    weight_transfer_apply_strategy: direct-load
 ```
 
 Restrict it to specific stages with a stage-level override; lifecycle RPCs are then routed only to the stages where the feature is enabled:
@@ -30,18 +35,20 @@ stages:
       backend: ipc
 ```
 
-### Supported Backends
+### Supported Transports and Apply Strategies
 
 The worker-side backends registered by upstream vLLM are inherited unchanged, plus one omni-specific variant:
 
-| Backend | Description | Use Case |
+| Transport / strategy | Description | Use Case |
 | ------- | ----------- | -------- |
 | `ipc` | CUDA IPC handles (zero-copy, same node), layerwise-reload protocol | Single-node vLLM-native (AR) stages |
 | `nccl` | NCCL broadcast from the trainer, layerwise-reload protocol | Multi-GPU trainers |
 | `sparse_nccl` | Sparse tensor transfer over NCCL, applied in place | Updating a subset of parameters |
-| `omni_ipc` | IPC payloads, weights applied in place via the pipeline's `load_weights` (no layerwise reload) | Diffusion stages (diffusers-style pipelines) |
+| `ipc` + `weight_transfer_apply_strategy: direct-load` | Standard IPC payloads, weights applied in place via the pipeline's `load_weights` | Dense, unquantized diffusion stages |
 
-`omni_ipc` mirrors upstream's `sparse_nccl` design point — "apply in place, no layerwise reload" — for omni's diffusers-style pipelines, whose modules are not wired into the layerwise-reload protocol. Trainer-side code needs no changes: the payloads are the standard IPC ones.
+The `direct-load` strategy mirrors upstream's `sparse_nccl` design point. It is
+implemented only for dense, unquantized diffusion weights. Use the default
+`layerwise` strategy for quantized modules.
 
 ## Usage
 
@@ -90,6 +97,7 @@ The `init_info` / `update_info` bodies are opaque to the HTTP layer; their schem
 engine = AsyncOmni(
     model="path/to/model",
     weight_transfer_config={"backend": "ipc"},
+    weight_transfer_apply_strategy="direct-load",
 )
 await engine.init_weight_transfer_engine({"packed": False})  # IPC handshake
 await engine.start_weight_update()
@@ -105,8 +113,8 @@ await engine.finish_weight_update()
 
 ## Limitations
 
-- Upstream's layerwise-reload protocol (used by `ipc`/`nccl` to rebuild quantized kernel-format storages in place) requires models built through vLLM's native reload-aware construction. AR stages satisfy this; omni's diffusers-style diffusion pipelines do not — use the `omni_ipc` backend on diffusion stages, which applies received weights in place through the pipeline's `load_weights` (verified end-to-end: perturbed weights change the generated output and pristine weights restore it bit-exactly).
-- Multi-node trainers should use the `nccl` backends; `ipc` / `omni_ipc` require trainer and rollout workers to share GPUs on one node.
+- Upstream's layerwise-reload protocol (used by `ipc`/`nccl` to rebuild quantized kernel-format storages in place) requires models built through vLLM's native reload-aware construction. Dense diffusion stages can use `ipc` with `weight_transfer_apply_strategy: direct-load`, which applies received weights through the pipeline's `load_weights`.
+- Multi-node trainers should use the `nccl` backend; `ipc` requires trainer and rollout workers to share GPUs on one node.
 
 ## See Also
 

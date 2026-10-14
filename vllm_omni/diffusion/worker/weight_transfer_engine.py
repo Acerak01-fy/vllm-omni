@@ -1,33 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Omni-specific weight transfer engine for diffusers-style diffusion pipelines.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Diffusion application policies over the upstream IPC transport.
 
-Upstream's IPC/NCCL engines wrap every update round in the layerwise-reload
-protocol: parameters are moved to meta device at ``start_weight_update`` and
-restored through the per-parameter ``weight_loader`` wiring as chunks stream
-in, so quantized/fused kernel-format storages can be rebuilt in place. That
-protocol assumes the model was built through vLLM's native reload-aware
-construction, which omni's diffusion pipelines do not fully satisfy.
+``direct-load`` passes received weights to the live pipeline's ``load_weights``
+without entering the layerwise meta/restore lifecycle. It supports unquantized
+models whose loaders can update existing parameters. The upstream IPC payload,
+receive path, and update synchronization are inherited unchanged.
 
-Omni's diffusion pipelines serve unquantized vLLM layers, where a received
-checkpoint tensor can be applied by the ordinary ``load_weights`` path onto
-the live parameters — the same "apply in place, no layerwise reload" shape
-upstream's ``sparse_nccl`` engine uses. ``OmniIPCWeightTransferEngine``
-therefore inherits the whole IPC payload contract (handshake, handles,
-packed mode) and only replaces the lifecycle hooks:
-
-- ``start_weight_update`` / ``finish_weight_update``: no layerwise
-  meta-ization; only the packed-importer bookkeeping is kept.
-- ``receive_weights``: inherited — rebuilds CUDA IPC tensors and calls
-  ``model.load_weights`` on the live pipeline.
-
-The engine is registered as backend ``"omni_ipc"`` so deployments opt in per
-stage (diffusion stages only; AR stages use the native upstream backends with
-their layerwise semantics).
-
-The trainer side needs no changes: payloads are the standard IPC ones, so the
-upstream ``IPCTrainerWeightTransferEngine`` / ``HTTPVLLMWeightSyncClient``
-drive this engine unmodified.
+``layerwise`` delegates to the upstream factory and requires the model to
+implement vLLM's reload lifecycle; selecting it does not add that capability.
 """
 
 from __future__ import annotations
@@ -35,11 +16,9 @@ from __future__ import annotations
 from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
 from vllm.distributed.weight_transfer.ipc_engine import IPCWeightTransferEngine
 
-_BACKEND_NAME = "omni_ipc"
 
-
-class OmniIPCWeightTransferEngine(IPCWeightTransferEngine):
-    """IPC engine that applies weights in place, without layerwise reload."""
+class IPCDirectLoadWeightTransferEngine(IPCWeightTransferEngine):
+    """Load standard IPC weights through the live pipeline without layerwise reload."""
 
     def start_weight_update(self) -> None:
         """No-op: weights stream onto the live (unmeta-ized) parameters."""
@@ -52,20 +31,31 @@ class OmniIPCWeightTransferEngine(IPCWeightTransferEngine):
         self._packed_importer.close()
 
 
-def register_omni_weight_transfer_engines() -> str:
-    """Register omni's engine variants; returns the backend name to use.
+def create_diffusion_weight_transfer_engine(
+    config,
+    vllm_config,
+    device,
+    model,
+    *,
+    apply_strategy: str | None,
+):
+    """Create an IPC engine with the requested diffusion apply strategy.
 
-    Idempotent: re-registration (e.g. repeated worker imports) is ignored.
+    ``direct-load`` is valid only for dense, unquantized diffusion modules.  The
+    layerwise strategy is delegated to the upstream factory, preserving its
+    quantized reload behavior and its future backend additions.
     """
-    try:
-        WeightTransferEngineFactory.register_engine(
-            _BACKEND_NAME,
-            OmniIPCWeightTransferEngine,
-        )
-    except ValueError:
-        # Already registered by an earlier import.
-        pass
-    return _BACKEND_NAME
-
-
-OMNI_IPC_BACKEND = register_omni_weight_transfer_engines()
+    if apply_strategy in (None, "layerwise"):
+        return WeightTransferEngineFactory.create_engine(config, vllm_config, device, model)
+    if apply_strategy == "direct-load":
+        if getattr(vllm_config, "quant_config", None) is not None:
+            raise ValueError(
+                "weight_transfer_apply_strategy='direct-load' does not support "
+                "quantized diffusion weights; a reload-aware loader is required"
+            )
+        if config.backend != "ipc":
+            raise ValueError("weight_transfer_apply_strategy='direct-load' currently requires backend='ipc'")
+        return IPCDirectLoadWeightTransferEngine(config, vllm_config, device, model)
+    raise ValueError(
+        f"Unsupported weight_transfer_apply_strategy={apply_strategy!r}; expected 'direct-load' or 'layerwise'"
+    )

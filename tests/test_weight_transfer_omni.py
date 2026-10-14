@@ -21,6 +21,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+pytestmark = [pytest.mark.cpu, pytest.mark.advanced_model]
+
 # --- Config plumbing ---
 
 
@@ -57,6 +59,35 @@ def test_stage_scoped_weight_transfer_config_targets_one_stage():
 
     assert build_stage_runtime_overrides(1, cli) == {"weight_transfer_config": {"backend": "ipc"}}
     assert build_stage_runtime_overrides(0, cli) == {}
+
+
+def test_stage_scoped_apply_strategy_targets_one_stage():
+    """Apply policy is stage-local and does not become an upstream backend key."""
+    from vllm_omni.config.stage_config import build_stage_runtime_overrides
+
+    cli = {"stage_1_weight_transfer_apply_strategy": "direct-load"}
+
+    assert build_stage_runtime_overrides(1, cli) == {"weight_transfer_apply_strategy": "direct-load"}
+    assert build_stage_runtime_overrides(0, cli) == {}
+
+
+def test_apply_strategy_is_projected_to_diffusion_config():
+    from vllm_omni.config.omni_config import _DiffusionConfigProjection
+
+    config = _DiffusionConfigProjection.from_kwargs(
+        weight_transfer_config={"backend": "ipc"},
+        weight_transfer_apply_strategy="direct-load",
+    )
+    assert config.weight_transfer_config == {"backend": "ipc"}
+    assert config.weight_transfer_apply_strategy == "direct-load"
+
+
+@pytest.mark.parametrize("strategy", ["delta", "inplace", "in-place", "direct_load"])
+def test_apply_strategy_rejects_unknown_value(strategy):
+    from vllm_omni.config.omni_config import _DiffusionConfigProjection
+
+    with pytest.raises(ValueError, match="weight_transfer_apply_strategy"):
+        _DiffusionConfigProjection.from_kwargs(weight_transfer_apply_strategy=strategy)
 
 
 # --- AR stage: inherited from upstream GPUWorker ---
@@ -202,6 +233,39 @@ def test_diffusion_session_is_reusable_after_finish():
 
     assert engine.start_weight_update.call_count == 2
     assert engine.finish_weight_update.call_count == 2
+
+
+def test_direct_load_strategy_uses_standard_ipc_engine():
+    import torch
+    from vllm.config.weight_transfer import WeightTransferConfig
+
+    from vllm_omni.diffusion.worker.weight_transfer_engine import (
+        IPCDirectLoadWeightTransferEngine,
+        create_diffusion_weight_transfer_engine,
+    )
+
+    config = WeightTransferConfig(backend="ipc")
+    vllm_config = SimpleNamespace(parallel_config=MagicMock(), model_config=MagicMock(), quant_config=None)
+    engine = create_diffusion_weight_transfer_engine(
+        config, vllm_config, torch.device("cpu"), MagicMock(), apply_strategy="direct-load"
+    )
+    assert isinstance(engine, IPCDirectLoadWeightTransferEngine)
+
+
+def test_direct_load_strategy_rejects_quantized_model():
+    import torch
+    from vllm.config.weight_transfer import WeightTransferConfig
+
+    from vllm_omni.diffusion.worker.weight_transfer_engine import create_diffusion_weight_transfer_engine
+
+    with pytest.raises(ValueError, match="does not support quantized"):
+        create_diffusion_weight_transfer_engine(
+            WeightTransferConfig(backend="ipc"),
+            SimpleNamespace(parallel_config=MagicMock(), model_config=MagicMock(), quant_config=MagicMock()),
+            torch.device("cpu"),
+            MagicMock(),
+            apply_strategy="direct-load",
+        )
 
 
 def test_orchestrator_exposes_lifecycle():

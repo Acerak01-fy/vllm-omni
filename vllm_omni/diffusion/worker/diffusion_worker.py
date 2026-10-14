@@ -307,20 +307,16 @@ class DiffusionWorker:
             # (mirrors upstream vLLM gpu_worker), so they are created only
             # after the model has been loaded.
             if wt_config is not None:
-                # Register omni's in-place engine variants (e.g. "omni_ipc"
-                # for diffusers-style pipelines) before any engine is built.
                 from vllm_omni.diffusion.worker.weight_transfer_engine import (
-                    register_omni_weight_transfer_engines,
+                    create_diffusion_weight_transfer_engine,
                 )
 
-                register_omni_weight_transfer_engines()
-                from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
-
-                self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
+                self.weight_transfer_engine = create_diffusion_weight_transfer_engine(
                     wt_config,
                     self.vllm_config,
                     self.device,
                     self.model_runner.pipeline,
+                    apply_strategy=getattr(self.od_config, "weight_transfer_apply_strategy", None),
                 )
             self.init_lora_manager()
         elif wt_config is not None:

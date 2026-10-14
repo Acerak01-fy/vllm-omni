@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E test verifying weight transfer actually changes generation output.
 
 Drives the *real* upstream IPC payload path: tensors are exported as CUDA IPC
@@ -7,8 +7,8 @@ handles by a helper process (a process must not open its own exported
 handles, and the uniproc worker lives in this process) — mirroring
 ``IPCTrainerWeightTransferEngine._send_unpacked`` — shipped through the
 ``AsyncOmni`` four-phase lifecycle, and applied by the omni diffusion engine
-(``omni_ipc`` backend: IPC payloads, weights applied in place through the
-pipeline's ``load_weights`` without the layerwise-reload protocol).
+(``ipc`` transport with the ``direct-load`` apply strategy: weights are applied
+through the pipeline's ``load_weights`` without layerwise reload).
 
 Flow:
 1. Generate image1 with original weights
@@ -217,7 +217,8 @@ async def test_weight_transfer_changes_generation():
             model=MODEL,
             enforce_eager=True,
             max_num_seqs=1,
-            weight_transfer_config={"backend": "omni_ipc"},
+            weight_transfer_config={"backend": "ipc"},
+            weight_transfer_apply_strategy="direct-load",
         )
         after.callback(engine.shutdown)
 
@@ -260,9 +261,7 @@ async def test_weight_transfer_changes_generation():
                 return 2
             return 3
 
-        candidates = [
-            (name, tensor) for name, tensor in pristine_tensors if tensor.numel() > 10
-        ]
+        candidates = [(name, tensor) for name, tensor in pristine_tensors if tensor.numel() > 10]
         target_name, _ = min(candidates, key=lambda item: _sensitivity(item[0]))
         print(f"[test] perturbing {target_name}")
 

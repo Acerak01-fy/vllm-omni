@@ -820,6 +820,7 @@ class _DiffusionConfigProjection:
     # to the typed upstream ``WeightTransferConfig`` when building its
     # ``VllmConfig``.
     weight_transfer_config: dict[str, Any] | None = None
+    weight_transfer_apply_strategy: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     @field_validator("kv_transfer_config", mode="before")
@@ -843,6 +844,13 @@ class _DiffusionConfigProjection:
         from dataclasses import fields
 
         return {f.name: getattr(value, f.name) for f in fields(value)}
+
+    @field_validator("weight_transfer_apply_strategy")
+    @classmethod
+    def _validate_weight_transfer_apply_strategy(cls, value: str | None) -> str | None:
+        if value is not None and value not in {"direct-load", "layerwise"}:
+            raise ValueError("weight_transfer_apply_strategy must be 'direct-load' or 'layerwise'")
+        return value
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> _DiffusionConfigProjection:
