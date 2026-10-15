@@ -332,14 +332,13 @@ class DiffusionWorker:
         wt_config = getattr(self.vllm_config, "weight_transfer_config", None)
         if wt_config is None:
             return
-        from vllm_omni.diffusion.worker.weight_transfer_engine import create_diffusion_weight_transfer_engine
+        from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
 
-        self.weight_transfer_engine = create_diffusion_weight_transfer_engine(
-            wt_config,
-            self.vllm_config,
-            self.device,
-            cast(DiffusionModelRunner, self.model_runner).pipeline,
-            apply_strategy=getattr(self.od_config, "weight_transfer_apply_strategy", None),
+        pipeline = cast(DiffusionModelRunner, self.model_runner).pipeline
+        if not getattr(pipeline, "_omni_weight_reload_prepared", False):
+            raise RuntimeError("The active diffusion pipeline has no weight-reload metadata")
+        self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
+            wt_config, self.vllm_config, self.device, pipeline
         )
 
     def init_device(self) -> None:

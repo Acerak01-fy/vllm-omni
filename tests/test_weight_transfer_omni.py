@@ -28,9 +28,9 @@ pytestmark = [pytest.mark.cpu, pytest.mark.advanced_model]
 
 def test_weight_transfer_config_is_pipeline_wide_field():
     """weight_transfer_config must propagate to every stage's engine args."""
-    from vllm_omni.config.stage_config import _PIPELINE_WIDE_ENGINE_FIELDS
+    from vllm_omni.config.stage_config import PIPELINE_WIDE_ENGINE_FIELDS
 
-    assert "weight_transfer_config" in _PIPELINE_WIDE_ENGINE_FIELDS
+    assert "weight_transfer_config" in PIPELINE_WIDE_ENGINE_FIELDS
 
 
 def test_weight_transfer_config_is_deploy_override_key():
@@ -59,35 +59,6 @@ def test_stage_scoped_weight_transfer_config_targets_one_stage():
 
     assert build_stage_runtime_overrides(1, cli) == {"weight_transfer_config": {"backend": "ipc"}}
     assert build_stage_runtime_overrides(0, cli) == {}
-
-
-def test_stage_scoped_apply_strategy_targets_one_stage():
-    """Apply policy is stage-local and does not become an upstream backend key."""
-    from vllm_omni.config.stage_config import build_stage_runtime_overrides
-
-    cli = {"stage_1_weight_transfer_apply_strategy": "direct-load"}
-
-    assert build_stage_runtime_overrides(1, cli) == {"weight_transfer_apply_strategy": "direct-load"}
-    assert build_stage_runtime_overrides(0, cli) == {}
-
-
-def test_apply_strategy_is_projected_to_diffusion_config():
-    from vllm_omni.config.omni_config import _DiffusionConfigProjection
-
-    config = _DiffusionConfigProjection.from_kwargs(
-        weight_transfer_config={"backend": "ipc"},
-        weight_transfer_apply_strategy="direct-load",
-    )
-    assert config.weight_transfer_config == {"backend": "ipc"}
-    assert config.weight_transfer_apply_strategy == "direct-load"
-
-
-@pytest.mark.parametrize("strategy", ["delta", "inplace", "in-place", "direct_load"])
-def test_apply_strategy_rejects_unknown_value(strategy):
-    from vllm_omni.config.omni_config import _DiffusionConfigProjection
-
-    with pytest.raises(ValueError, match="weight_transfer_apply_strategy"):
-        _DiffusionConfigProjection.from_kwargs(weight_transfer_apply_strategy=strategy)
 
 
 # --- AR stage: inherited from upstream GPUWorker ---
@@ -186,11 +157,14 @@ def test_custom_pipeline_reload_rebinds_weight_transfer(monkeypatch, has_existin
         def __init__(self):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.zeros(2))
+            self.supports_weight_reload = True
 
         def load_weights(self, weights):
-            with torch.no_grad():
-                for name, value in weights:
-                    getattr(self, name).copy_(value)
+            from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+            for name, value in weights:
+                param = getattr(self, name)
+                getattr(param, "weight_loader", default_weight_loader)(param, value)
 
     old, replacement = Pipeline(), Pipeline()
     worker = _bare_diffusion_worker(model=old)
@@ -200,7 +174,11 @@ def test_custom_pipeline_reload_rebinds_weight_transfer(monkeypatch, has_existin
         model_config=None,
         quant_config=None,
     )
-    worker.od_config = SimpleNamespace(weight_transfer_apply_strategy="direct-load")
+    from vllm_omni.diffusion.model_loader.weight_reload import prepare_model_for_weight_reload
+
+    worker.od_config = _reload_config()
+    for pipeline in (old, replacement):
+        prepare_model_for_weight_reload(pipeline, worker.od_config, torch.device("cpu"))
     worker.device = torch.device("cpu")
     if has_existing_engine:
         worker._init_weight_transfer_engine()
@@ -298,39 +276,6 @@ def test_diffusion_session_is_reusable_after_finish():
     assert engine.finish_weight_update.call_count == 2
 
 
-def test_direct_load_strategy_uses_standard_ipc_engine():
-    import torch
-    from vllm.config.weight_transfer import WeightTransferConfig
-
-    from vllm_omni.diffusion.worker.weight_transfer_engine import (
-        IPCDirectLoadWeightTransferEngine,
-        create_diffusion_weight_transfer_engine,
-    )
-
-    config = WeightTransferConfig(backend="ipc")
-    vllm_config = SimpleNamespace(parallel_config=MagicMock(), model_config=MagicMock(), quant_config=None)
-    engine = create_diffusion_weight_transfer_engine(
-        config, vllm_config, torch.device("cpu"), MagicMock(), apply_strategy="direct-load"
-    )
-    assert isinstance(engine, IPCDirectLoadWeightTransferEngine)
-
-
-def test_direct_load_strategy_rejects_quantized_model():
-    import torch
-    from vllm.config.weight_transfer import WeightTransferConfig
-
-    from vllm_omni.diffusion.worker.weight_transfer_engine import create_diffusion_weight_transfer_engine
-
-    with pytest.raises(ValueError, match="does not support quantized"):
-        create_diffusion_weight_transfer_engine(
-            WeightTransferConfig(backend="ipc"),
-            SimpleNamespace(parallel_config=MagicMock(), model_config=MagicMock(), quant_config=MagicMock()),
-            torch.device("cpu"),
-            MagicMock(),
-            apply_strategy="direct-load",
-        )
-
-
 def test_orchestrator_exposes_lifecycle():
     """AsyncOmni must expose the full lifecycle for EngineClient compatibility."""
     from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -398,6 +343,139 @@ def test_orchestrator_rejects_when_no_stage_configured():
     with pytest.raises(RuntimeError, match="No stage has weight transfer enabled"):
         asyncio.run(omni.start_weight_update())
     omni.collective_rpc.assert_not_awaited()
+
+
+def _reload_config(**overrides):
+    return SimpleNamespace(
+        **{
+            "weight_transfer_config": {"backend": "ipc"},
+            "quantization_config": None,
+            "parallel_config": SimpleNamespace(use_hsdp=False),
+            "cache_backend": "none",
+            **overrides,
+        }
+    )
+
+
+def test_upstream_reload_preserves_storage_and_frozen_components():
+    """Split a layer across chunks and repeat reload without changing frozen state."""
+    import torch
+    from vllm.config.weight_transfer import WeightTransferConfig
+    from vllm.distributed.weight_transfer.ipc_engine import IPCWeightTransferEngine
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+
+    from vllm_omni.diffusion.model_loader.weight_reload import prepare_model_for_weight_reload
+
+    class Pipeline(torch.nn.Module):
+        supports_weight_reload = True
+
+        def __init__(self):
+            super().__init__()
+            self.transformer = torch.nn.Module()
+            self.transformer.register_parameter("weight", torch.nn.Parameter(torch.zeros(2, 3)))
+            self.transformer.register_parameter("gain", torch.nn.Parameter(torch.zeros(2)))
+            self.frozen = torch.nn.Linear(2, 2)
+            self.frozen.register_buffer("constant", torch.ones(2), persistent=False)
+
+        def load_weights(self, weights):
+            return AutoWeightsLoader(self).load_weights(weights)
+
+    pipeline = Pipeline()
+    prepare_model_for_weight_reload(pipeline, _reload_config(), torch.device("cpu"))
+    tensors = dict(pipeline.named_parameters()) | dict(pipeline.named_buffers())
+    pointers = {name: value.data_ptr() for name, value in tensors.items()}
+    frozen = {name: value.clone() for name, value in tensors.items() if name.startswith("frozen.")}
+    engine = IPCWeightTransferEngine(
+        WeightTransferConfig(backend="ipc"),
+        SimpleNamespace(parallel_config=None, model_config=None),
+        torch.device("cpu"),
+        pipeline,
+    )
+    for value in (2.0, 3.0):
+        engine.start_weight_update()
+        pipeline.load_weights([("transformer.weight", torch.full((2, 3), value))])
+        assert pipeline.transformer.weight.is_meta
+        pipeline.load_weights([("transformer.gain", torch.full((2,), value + 1))])
+        engine.finish_weight_update()
+        torch.testing.assert_close(pipeline.transformer.weight, torch.full((2, 3), value))
+        torch.testing.assert_close(pipeline.transformer.gain, torch.full((2,), value + 1))
+        current = dict(pipeline.named_parameters()) | dict(pipeline.named_buffers())
+        assert {name: tensor.data_ptr() for name, tensor in current.items()} == pointers
+        assert all(tensor.device.type == "cpu" for tensor in current.values())
+        for name, expected in frozen.items():
+            torch.testing.assert_close(current[name], expected)
+        assert "constant" in pipeline.frozen._non_persistent_buffers_set
+
+
+@pytest.mark.parametrize("unsupported", ["pipeline", "quantization", "hsdp", "offload", "cache"])
+def test_reload_rejects_unsupported_configuration_before_mutation(unsupported):
+    import torch
+
+    from vllm_omni.diffusion.model_loader.weight_reload import prepare_model_for_weight_reload
+
+    model = torch.nn.Linear(2, 2)
+    model.supports_weight_reload = unsupported != "pipeline"
+    config = _reload_config()
+    if unsupported == "quantization":
+        config.quantization_config = object()
+    elif unsupported == "hsdp":
+        config.parallel_config.use_hsdp = True
+    elif unsupported == "offload":
+        config.enable_cpu_offload = True
+    elif unsupported == "cache":
+        config.cache_backend = "cache_dit"
+    original = model.weight
+    with pytest.raises(ValueError):
+        prepare_model_for_weight_reload(model, config, torch.device("cpu"))
+    assert model.weight is original and not model.weight.is_meta
+    assert not getattr(model, "_omni_weight_reload_prepared", False)
+
+
+def test_reload_preparation_is_opt_in():
+    import torch
+
+    from vllm_omni.diffusion.model_loader.weight_reload import prepare_model_for_weight_reload
+
+    model = torch.nn.Linear(2, 2)
+    prepare_model_for_weight_reload(model, _reload_config(weight_transfer_config=None), torch.device("cpu"))
+    assert not getattr(model, "_omni_weight_reload_prepared", False)
+
+
+@pytest.mark.parametrize("load_format", ["default", "custom_pipeline"])
+def test_loader_prepares_default_and_custom_pipelines(monkeypatch, load_format):
+    import torch
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    from vllm_omni.diffusion.model_loader import diffusers_loader
+
+    class Pipeline(torch.nn.Module):
+        supports_weight_reload = True
+
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(2))
+
+    monkeypatch.setattr(diffusers_loader, "initialize_model", lambda config: Pipeline())
+    monkeypatch.setattr(diffusers_loader, "_resolve_custom_pipeline_cls", lambda name: Pipeline)
+    loader = object.__new__(diffusers_loader.DiffusersPipelineLoader)
+    loader.od_config = _reload_config()
+    loader.quant_config = None
+    pipeline = loader._init_from_load_format(load_format, torch.device("cpu"), "test.Pipeline")
+    assert pipeline._omni_weight_reload_prepared
+    info = get_layerwise_info(pipeline)
+    assert info.restore_device == torch.device("cpu")
+    assert info.restore_metadata[0]["weight"].is_meta
+    assert not pipeline.weight.is_meta
+
+
+def test_worker_rejects_pipeline_without_reload_metadata():
+    import torch
+    from vllm.config.weight_transfer import WeightTransferConfig
+
+    worker = _bare_diffusion_worker(model=torch.nn.Linear(2, 2))
+    worker.vllm_config = SimpleNamespace(weight_transfer_config=WeightTransferConfig(backend="ipc"))
+    with pytest.raises(RuntimeError, match="no weight-reload metadata"):
+        worker._init_weight_transfer_engine()
 
 
 if __name__ == "__main__":

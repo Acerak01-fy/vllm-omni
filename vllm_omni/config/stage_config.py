@@ -646,12 +646,6 @@ class StageDeployConfig:
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 
-    # Weight transfer application policy.  The transport itself remains the
-    # upstream vLLM backend configured by ``weight_transfer_config``; this
-    # stage-local field selects how a diffusion worker applies received
-    # tensors.
-    weight_transfer_apply_strategy: str | None = None
-
     # Modality/service constraints consumed outside the core engine config.
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None

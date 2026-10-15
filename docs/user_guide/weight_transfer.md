@@ -14,19 +14,11 @@ Weight transfer is **opt-in**. Enable it with the pipeline-wide `weight_transfer
 # deploy override
 weight_transfer_config:
   backend: ipc
-
-# For a dense diffusion stage, keep the apply policy stage-local.
-stages:
-  - stage_id: 0
-    weight_transfer_apply_strategy: direct-load
 ```
 
 Restrict it to specific stages with a stage-level override; lifecycle RPCs are then routed only to the stages where the feature is enabled:
 
 ```yaml
-weight_transfer_config:
-  backend: ipc
-
 stages:
   - stage_id: 0
     # Stage 0 is not configured; it will not receive weight-transfer RPCs
@@ -35,20 +27,15 @@ stages:
       backend: ipc
 ```
 
-### Supported Transports and Apply Strategies
+### Supported transports
 
-The worker-side backends registered by upstream vLLM are inherited unchanged, plus one omni-specific variant:
+Omni uses upstream vLLM's engine factory and payload formats. AR stages retain
+upstream backend support (`ipc`, `nccl`, and `sparse_nccl`). The diffusion path
+validated here is unquantized Qwen-Image using `ipc` and upstream layerwise reload.
+No separate apply-strategy setting is required.
 
-| Transport / strategy | Description | Use Case |
-| ------- | ----------- | -------- |
-| `ipc` | CUDA IPC handles (zero-copy, same node), layerwise-reload protocol | Single-node vLLM-native (AR) stages |
-| `nccl` | NCCL broadcast from the trainer, layerwise-reload protocol | Multi-GPU trainers |
-| `sparse_nccl` | Sparse tensor transfer over NCCL, applied in place | Updating a subset of parameters |
-| `ipc` + `weight_transfer_apply_strategy: direct-load` | Standard IPC payloads, weights applied in place via the pipeline's `load_weights` | Dense, unquantized diffusion stages |
-
-The `direct-load` strategy mirrors upstream's `sparse_nccl` design point. It is
-implemented only for dense, unquantized diffusion weights. Use the default
-`layerwise` strategy for quantized modules.
+Other diffusion pipelines must explicitly enable `supports_weight_reload` after
+validating their loading contract. See the [design document](../design/feature/weight_transfer.md#diffusion-loading-contract).
 
 ## Usage
 
@@ -74,7 +61,7 @@ trainer_engine = WeightTransferTrainerFactory.trainer_init(
 trainer_engine.send_weights()
 ```
 
-This is the same path verl-omni-style trainers use: `trainer_init` performs the HTTP init handshake (e.g. `{"init_info": {"packed": false}}` for IPC), and `send_weights` ships one payload per parameter chunk with CUDA IPC handles.
+In the upstream trainer API, `trainer_init` performs the HTTP init handshake (e.g. `{"init_info": {"packed": false}}` for IPC), and `send_weights` ships one payload per parameter chunk with CUDA IPC handles.
 
 ### HTTP API (what the server exposes)
 
@@ -97,7 +84,6 @@ The `init_info` / `update_info` bodies are opaque to the HTTP layer; their schem
 engine = AsyncOmni(
     model="path/to/model",
     weight_transfer_config={"backend": "ipc"},
-    weight_transfer_apply_strategy="direct-load",
 )
 await engine.init_weight_transfer_engine({"packed": False})  # IPC handshake
 await engine.start_weight_update()
@@ -109,12 +95,15 @@ await engine.finish_weight_update()
 
 - Lifecycle calls fan out to every stage with weight transfer enabled and **fail if any stage reports an error** — a failed HTTP call means the round failed, it never silently succeeds.
 - Each worker enforces the protocol state machine: `update_weights` before `start_weight_update`, or a second `start_weight_update` without `finish_weight_update`, are rejected.
-- On failure, workers reset their per-stage update state; retry the full four-phase round.
+- Updates are not transactional. A failed update can leave partial values or meta tensors. Recreate the rollout after failure; resetting the update target does not restore the old weights.
 
 ## Limitations
 
-- Upstream's layerwise-reload protocol (used by `ipc`/`nccl` to rebuild quantized kernel-format storages in place) requires models built through vLLM's native reload-aware construction. Dense diffusion stages can use `ipc` with `weight_transfer_apply_strategy: direct-load`, which applies received weights through the pipeline's `load_weights`.
-- Multi-node trainers should use the `nccl` backend; `ipc` requires trainer and rollout workers to share GPUs on one node.
+- Pause generation while updating weights. Resume only after every selected stage finishes successfully.
+- Send complete weights for each updated layer, including all fused parameter shards. Untouched layers may be omitted.
+- Diffusion quantization, HSDP, inference weight offloading, and diffusion cache acceleration are not supported with this reload path yet.
+- IPC requires same-node CUDA IPC access and a compatible trainer/receiver GPU topology. HTTP control does not remove that requirement.
+- Diffusion NCCL and sparse updates require separate validation; the Qwen-Image RL tests cover IPC.
 
 ## See Also
 

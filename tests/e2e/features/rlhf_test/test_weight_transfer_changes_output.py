@@ -7,8 +7,8 @@ handles by a helper process (a process must not open its own exported
 handles, and the uniproc worker lives in this process) — mirroring
 ``IPCTrainerWeightTransferEngine._send_unpacked`` — shipped through the
 ``AsyncOmni`` four-phase lifecycle, and applied by the omni diffusion engine
-(``ipc`` transport with the ``direct-load`` apply strategy: weights are applied
-through the pipeline's ``load_weights`` without layerwise reload).
+(standard ``ipc`` transport and upstream layerwise reload, with weights routed
+through the pipeline's ``load_weights``).
 
 Flow:
 1. Generate image1 with original weights
@@ -218,7 +218,6 @@ async def test_weight_transfer_changes_generation():
             enforce_eager=True,
             max_num_seqs=1,
             weight_transfer_config={"backend": "ipc"},
-            weight_transfer_apply_strategy="direct-load",
         )
         after.callback(engine.shutdown)
 

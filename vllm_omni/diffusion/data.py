@@ -905,11 +905,6 @@ class OmniDiffusionConfig:
     # diffusion VllmConfig is built. ``None`` disables weight transfer.
     weight_transfer_config: dict[str, Any] | None = None
 
-    # Stage-local application policy.  Keep this outside the upstream typed
-    # WeightTransferConfig so AR stages continue to receive an untouched
-    # native config and future stages can choose independently.
-    weight_transfer_apply_strategy: str | None = None
-
     # Engine backend selection, resolved by ``DiffusionEngine.resolve_engine_class``
     # (mirrors ``DiffusionExecutor.get_class``). Config files use a string:
     # "default" -> DiffusionEngine, or an import path (set e.g. by a deploy
@@ -1278,8 +1273,6 @@ class OmniDiffusionConfig:
                 "diffusion_compile_granularity must be 'regional' or 'full', "
                 f"got {self.diffusion_compile_granularity!r}"
             )
-        if self.weight_transfer_apply_strategy not in {None, "direct-load", "layerwise"}:
-            raise ValueError("weight_transfer_apply_strategy must be 'direct-load' or 'layerwise'")
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
