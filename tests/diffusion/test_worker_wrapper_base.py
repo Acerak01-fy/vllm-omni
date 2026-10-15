@@ -587,6 +587,10 @@ class TestCustomPipelineWorkerExtension:
         mock_pipeline = mocker.Mock()
         mock_model_runner.pipeline = mock_pipeline
         wrapper.worker.model_runner = mock_model_runner
+        # __init__ is mocked; reproduce its disabled-WTE lifecycle state.
+        wrapper.worker._weight_update_active = False
+        wrapper.worker.weight_transfer_engine = None
+        wrapper.worker.vllm_config = None
         wrapper.worker.init_lora_manager = mocker.Mock()
         wrapper.worker.load_model = mocker.Mock()
 
@@ -620,6 +624,10 @@ class TestCustomPipelineWorkerExtension:
         mock_pipeline = mocker.Mock()
         mock_model_runner.pipeline = mock_pipeline
         wrapper.worker.model_runner = mock_model_runner
+        # __init__ is mocked; reproduce its disabled-WTE lifecycle state.
+        wrapper.worker._weight_update_active = False
+        wrapper.worker.weight_transfer_engine = None
+        wrapper.worker.vllm_config = None
         wrapper.worker.init_lora_manager = mocker.Mock()
         wrapper.worker.load_model = mocker.Mock()
 
@@ -649,6 +657,10 @@ class TestCustomPipelineWorkerExtension:
         mock_model_runner = mocker.Mock()
         mock_model_runner.pipeline = None
         wrapper.worker.model_runner = mock_model_runner
+        # __init__ is mocked; reproduce its disabled-WTE lifecycle state.
+        wrapper.worker._weight_update_active = False
+        wrapper.worker.weight_transfer_engine = None
+        wrapper.worker.vllm_config = None
         wrapper.worker.init_lora_manager = mocker.Mock()
         wrapper.worker.load_model = mocker.Mock()
 
@@ -753,6 +765,10 @@ class TestCustomPipelineWorkerExtension:
         mock_pipeline2 = mocker.Mock()
         mock_model_runner.pipeline = mock_pipeline1
         wrapper.worker.model_runner = mock_model_runner
+        # __init__ is mocked; reproduce its disabled-WTE lifecycle state.
+        wrapper.worker._weight_update_active = False
+        wrapper.worker.weight_transfer_engine = None
+        wrapper.worker.vllm_config = None
         wrapper.worker.init_lora_manager = mocker.Mock()
         wrapper.worker.load_model = mocker.Mock()
 
