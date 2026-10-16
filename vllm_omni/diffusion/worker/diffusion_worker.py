@@ -1163,6 +1163,19 @@ class DiffusionWorker:
         self._sleep_saved_buffers = {}
         self._step_lora_state = {}
 
+        # WTE retains the pipeline independently of model_runner. Close its
+        # transport before distributed teardown and drop both references before
+        # releasing the model's memory pools.
+        weight_transfer_engine = getattr(self, "weight_transfer_engine", None)
+        self.weight_transfer_engine = None
+        try:
+            if weight_transfer_engine is not None:
+                weight_transfer_engine.shutdown()
+        except Exception:
+            logger.exception("Failed to shut down diffusion weight transfer engine")
+        finally:
+            del weight_transfer_engine
+
         if model_runner is not None:
             mgr = getattr(model_runner, "kv_transfer_manager", None)
             if mgr is None:

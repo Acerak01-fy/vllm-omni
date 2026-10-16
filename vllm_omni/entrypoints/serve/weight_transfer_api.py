@@ -47,6 +47,12 @@ async def init_weight_transfer_engine(request: Request):
             detail="Invalid JSON format",
         ) from e
 
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Request body must be a JSON object",
+        )
+
     init_info = body.get("init_info")
     if init_info is None:
         raise HTTPException(
@@ -97,6 +103,12 @@ async def update_weights(request: Request):
             status_code=HTTPStatus.BAD_REQUEST,
             detail="Invalid JSON format",
         ) from e
+
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Request body must be a JSON object",
+        )
 
     update_info = body.get("update_info")
     if update_info is None:

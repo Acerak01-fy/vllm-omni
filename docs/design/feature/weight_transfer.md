@@ -88,6 +88,10 @@ model; replacement during an active update is rejected. Normal RL publications
 reuse the running pipeline and engine. Trainer topology queries, checksums, and
 publication versions belong to the training framework's adapter.
 
+Worker shutdown closes the WTE and releases its pipeline references before
+distributed-environment and memory-pool teardown. Repeated shutdown is a no-op;
+transport cleanup failures are logged and do not prevent the remaining cleanup.
+
 Updates are not transactional. A failed chunk can leave partially updated or
 meta tensors; resetting the target does not roll back model values. Stop training
 and recreate the rollout after a failed update. There is no automatic rollback
@@ -131,9 +135,10 @@ POST /update_weights                {"update_info": <backend payload>}
 POST /finish_weight_update
 ```
 
-The HTTP layer passes payloads to the engine. Missing required fields return
-400; worker failures propagate as errors. Build payloads with upstream trainer
-engines instead of maintaining a separate Omni wire format. See the
+The HTTP layer passes payloads to the engine. Invalid JSON, non-object request
+bodies, and missing required fields return 400; worker failures propagate as
+errors. Build payloads with upstream trainer engines instead of maintaining a
+separate Omni wire format. See the
 [user guide](../../user_guide/weight_transfer.md) for a trainer example.
 
 ## Validation
