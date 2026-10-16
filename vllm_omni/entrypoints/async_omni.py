@@ -1333,11 +1333,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         await self._weight_transfer_rpc("init_weight_transfer_engine", (init_info,))
         logger.info("[%s] Weight transfer engine initialized", self._name)
 
-    async def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
-        """Start a new weight update session across all stages.
+    async def start_weight_update(self) -> None:
+        """Start a new weight update session across configured stages.
 
-        Calls ``start_weight_update()`` on every stage's worker, which prepares
-        the engine to receive weight chunks via ``update_weights()``.
+        Each worker delegates preparation to its configured WTE backend,
+        which owns whether the update uses layerwise reload.
         """
         await self._weight_transfer_rpc("start_weight_update")
         logger.info("[%s] Weight update session started", self._name)
