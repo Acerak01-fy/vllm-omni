@@ -36,6 +36,7 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.rl_rollout import RLWeightTransferAdapter, WeightPublication, WeightUpdateChunk
 
 MODEL = "tiny-random/Qwen-Image"
 TOKENIZER_MODEL = "Qwen/Qwen2-1.5B-Instruct"
@@ -186,8 +187,8 @@ def _spawn_ipc_exporter(source_tensors: list[tuple[str, torch.Tensor]]):
     return payload, proc
 
 
-async def _transfer_weights(engine: AsyncOmni, source_tensors: list[tuple[str, torch.Tensor]]) -> None:
-    """Run one full four-phase round with the given source tensors.
+async def _transfer_weights(adapter: RLWeightTransferAdapter, source_tensors: list[tuple[str, torch.Tensor]]) -> None:
+    """Run one versioned publication through the native Omni WTE lifecycle.
 
     The payload is built by a helper process that mirrors
     ``IPCTrainerWeightTransferEngine._send_unpacked`` (single trainer rank);
@@ -196,9 +197,15 @@ async def _transfer_weights(engine: AsyncOmni, source_tensors: list[tuple[str, t
     """
     payload, exporter = _spawn_ipc_exporter(source_tensors)
     try:
-        await engine.start_weight_update()
-        await engine.update_weights(payload)
-        await engine.finish_weight_update()
+        version = adapter.current_version + 1
+        names = tuple(name for name, _ in source_tensors)
+        await adapter.publish(
+            WeightPublication(
+                version=version,
+                parameter_names=names,
+                chunks=(WeightUpdateChunk(version=version, parameter_names=names, payload=payload),),
+            )
+        )
     finally:
         del payload
         exporter.terminate()
@@ -273,10 +280,11 @@ async def test_weight_transfer_changes_generation():
         ]
 
         # Step 2: init handshake (same payload the trainer engine ships)
-        await engine.init_weight_transfer_engine(dict(IPC_INIT_INFO))
+        wte_adapter = RLWeightTransferAdapter(engine)
+        await wte_adapter.initialize(dict(IPC_INIT_INFO))
 
         # Step 3: Ship perturbed weights -> image2 must differ
-        await _transfer_weights(engine, perturbed_tensors)
+        await _transfer_weights(wte_adapter, perturbed_tensors)
 
         # Direct check that the shipped tensors actually landed in the live
         # parameters (separates "transfer delivered" from "output changed").
@@ -301,7 +309,7 @@ async def test_weight_transfer_changes_generation():
         # Step 4: Ship the pristine snapshot again -> image3 must return to
         # (near) image1.
         restored_tensors = [(name, tensor.clone()) for name, tensor in pristine_tensors]
-        await _transfer_weights(engine, restored_tensors)
+        await _transfer_weights(wte_adapter, restored_tensors)
 
         output3 = await _generate_once(
             engine, prompt, request_id=f"restored_{uuid.uuid4().hex[:8]}", sampling_params=sampling_params
