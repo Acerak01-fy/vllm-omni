@@ -8,6 +8,7 @@ adapters; the package does not depend on a trainer implementation.
 """
 
 from vllm_omni.rl_rollout.adapter import RLPublicationError, RLWeightTransferAdapter
+from vllm_omni.rl_rollout.adapters import QwenImageParameterPolicy, QwenImageRLAdapter
 from vllm_omni.rl_rollout.contracts import (
     ARRolloutSample,
     DiffusionRolloutSample,
@@ -24,6 +25,8 @@ __all__ = [
     "RLPublicationError",
     "RLUpdateResult",
     "RLWeightTransferAdapter",
+    "QwenImageParameterPolicy",
+    "QwenImageRLAdapter",
     "RolloutMode",
     "VLLMWeightTransferClient",
     "WeightPublication",
