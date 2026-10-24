@@ -4,10 +4,10 @@
 
 QwenImage RL normally updates the DiT transformer while keeping the VAE and
 conditioning components fixed.  This module makes that model boundary
-explicit and packages every parameter under ``transformer.`` into the
+explicit and validates names under ``transformer.`` in the
 model-neutral weight publication contract.  The publication is then handed to
 the existing vLLM/Omni weight-transfer lifecycle; this module does not know
-whether the configured transport is IPC, HTTP, or another upstream backend.
+whether control uses RPC or HTTP, or data uses IPC or another upstream backend.
 """
 
 from __future__ import annotations
@@ -16,11 +16,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from vllm_omni.rl_rollout.adapter import RLWeightTransferAdapter
-from vllm_omni.rl_rollout.contracts import (
-    VLLMWeightTransferClient,
-    WeightPublication,
-    WeightUpdateChunk,
-)
+from vllm_omni.rl_rollout.contracts import VLLMWeightTransferClient
 
 ParameterItems = Mapping[str, Any] | Iterable[tuple[str, Any]]
 
@@ -86,67 +82,32 @@ class QwenImageParameterPolicy:
         return tuple((name, value) for name, value in materialized if name in selected_names)
 
 
-class QwenImageRLAdapter:
-    """Build and publish QwenImage full-parameter snapshots.
+class QwenImageRLAdapter(RLWeightTransferAdapter):
+    """Validate the QwenImage manifest and forward trainer-encoded WTE payloads.
 
-    The adapter is intentionally small: model-specific work is limited to
-    selecting the transformer parameters and chunking their snapshot.  Native
-    vLLM/Omni WTE calls remain in :class:`RLWeightTransferAdapter`.
+    The trainer owns IPC handles, packed buffers, and their lifetime. This
+    adapter selects no transport and never turns tensors into a wire payload.
+    Use ``start_publication/update_chunk/finish_publication`` with a streaming
+    sender, or ``publish`` with independently owned, pre-encoded chunks.
     """
 
     def __init__(
         self,
-        client: VLLMWeightTransferClient | RLWeightTransferAdapter,
+        client: VLLMWeightTransferClient,
         *,
         policy: QwenImageParameterPolicy | None = None,
         current_version: int = 0,
-        chunk_size: int = 64,
     ) -> None:
-        if chunk_size <= 0:
-            raise ValueError("chunk_size must be positive")
+        super().__init__(client, current_version=current_version)
         self.policy = policy or QwenImageParameterPolicy()
-        self._transfer = (
-            client
-            if isinstance(client, RLWeightTransferAdapter)
-            else RLWeightTransferAdapter(client, current_version=current_version)
-        )
-        self.chunk_size = chunk_size
-
-    @property
-    def current_version(self) -> int:
-        return self._transfer.current_version
-
-    @property
-    def initialized(self) -> bool:
-        return self._transfer.initialized
 
     def trainable_parameter_names(self, parameters: ParameterItems) -> tuple[str, ...]:
-        """Return the exact manifest that will be published."""
+        """Return the trainable manifest using canonical pipeline parameter names."""
         return self.policy.select_names(parameters)
 
-    def build_publication(self, parameters: ParameterItems, *, version: int | None = None) -> WeightPublication:
-        """Build a versioned full transformer snapshot from pipeline parameters."""
-        selected = self.policy.select(parameters)
-        publication_version = self.current_version + 1 if version is None else version
-        names = tuple(name for name, _ in selected)
-        chunks = tuple(
-            WeightUpdateChunk(
-                version=publication_version,
-                parameter_names=tuple(name for name, _ in selected[offset : offset + self.chunk_size]),
-                payload=dict(selected[offset : offset + self.chunk_size]),
-            )
-            for offset in range(0, len(selected), self.chunk_size)
-        )
-        return WeightPublication(
-            version=publication_version,
-            parameter_names=names,
-            chunks=chunks,
-        )
-
-    async def initialize(self, init_info: Mapping[str, Any]) -> None:
-        """Initialize the configured native WTE transport."""
-        await self._transfer.initialize(init_info)
-
-    async def publish(self, parameters: ParameterItems) -> None:
-        """Publish one complete QwenImage transformer snapshot."""
-        await self._transfer.publish(self.build_publication(parameters))
+    async def start_publication(self, *, version: int, parameter_names: tuple[str, ...]) -> None:
+        """Reject parameters outside the recipe before the worker enters reload."""
+        selected = self.policy.select_names((name, None) for name in parameter_names)
+        if selected != parameter_names:
+            raise ValueError("QwenImage publication contains parameters outside the trainable policy")
+        await super().start_publication(version=version, parameter_names=parameter_names)

@@ -72,10 +72,9 @@ class DiffusionRolloutSample:
 class WeightUpdateChunk:
     """One versioned trainer publication chunk.
 
-    ``payload`` is deliberately opaque.  A QwenImage IPC adapter can put an
-    upstream ``IPCWeightTransferUpdateInfo`` there, while an HTTP adapter can
-    put its serialized update body there.  Omni's production WTE remains the
-    owner of transport and tensor application.
+    ``payload`` is an opaque, trainer-encoded upstream WTE update. RPC and HTTP
+    carry the same backend payload. Keep its exported storage alive until the
+    receiver acknowledges the update; the publication adapter does not copy it.
     """
 
     version: int
@@ -91,7 +90,11 @@ class WeightUpdateChunk:
 
 @dataclass(frozen=True)
 class WeightPublication:
-    """Complete full-parameter publication assembled from one or more chunks."""
+    """Pre-encoded publication whose chunks own independent, stable storage.
+
+    Packed IPC senders that reuse one buffer must use the adapter's streaming
+    lifecycle instead of collecting their handles into this tuple.
+    """
 
     version: int
     parameter_names: tuple[str, ...]

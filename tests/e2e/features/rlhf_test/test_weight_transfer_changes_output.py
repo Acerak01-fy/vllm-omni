@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""E2E test verifying weight transfer actually changes generation output.
+"""E2E test verifying QwenImage transformer weight transfer.
 
 Drives the *real* upstream IPC payload path: tensors are exported as CUDA IPC
 handles by a helper process (a process must not open its own exported
@@ -11,11 +11,11 @@ handles, and the uniproc worker lives in this process) — mirroring
 through the pipeline's ``load_weights``).
 
 Flow:
-1. Generate image1 with original weights
-2. Ship a perturbed copy of the transformer backbone through weight transfer
-   -> generate image2 (must differ from image1)
-3. Ship the original parameters again -> generate image3 (must be closer to
-   image1 than image2 is)
+1. Generate an image with the initial weights.
+2. Ship a perturbed transformer snapshot through native IPC and verify that
+   the live DiT parameter changed.
+3. Restore the original transformer snapshot and verify generation remains
+   valid.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.rl_rollout import RLWeightTransferAdapter, WeightPublication, WeightUpdateChunk
+from vllm_omni.rl_rollout import QwenImageRLAdapter, WeightPublication, WeightUpdateChunk
 
 MODEL = "tiny-random/Qwen-Image"
 TOKENIZER_MODEL = "Qwen/Qwen2-1.5B-Instruct"
@@ -187,7 +187,7 @@ def _spawn_ipc_exporter(source_tensors: list[tuple[str, torch.Tensor]]):
     return payload, proc
 
 
-async def _transfer_weights(adapter: RLWeightTransferAdapter, source_tensors: list[tuple[str, torch.Tensor]]) -> None:
+async def _transfer_weights(adapter: QwenImageRLAdapter, source_tensors: list[tuple[str, torch.Tensor]]) -> None:
     """Run one versioned publication through the native Omni WTE lifecycle.
 
     The payload is built by a helper process that mirrors
@@ -217,8 +217,8 @@ async def _transfer_weights(adapter: RLWeightTransferAdapter, source_tensors: li
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.asyncio
-async def test_weight_transfer_changes_generation():
-    """Verify that real IPC weight updates actually change the generated output."""
+async def test_qwen_image_transformer_weight_transfer():
+    """Verify that native IPC reloads the QwenImage DiT transformer snapshot."""
     with ExitStack() as after:
         engine = AsyncOmni(
             model=MODEL,
@@ -236,36 +236,31 @@ async def test_weight_transfer_changes_generation():
             engine, prompt, request_id=f"original_{uuid.uuid4().hex[:8]}", sampling_params=sampling_params
         )
         image1 = _image_to_array(output1)
+        assert np.isfinite(image1).all()
 
         pipeline = _get_diffusion_pipeline(engine)
-
-        # Pristine trainer-side snapshot (independent of the live model), taken
-        # before any transfer. The transformer backbone plus the VAE: the
-        # text encoder contains tied embeddings whose parameter names are
-        # enumerated by named_parameters() but are not loadable through the
-        # pipeline's AutoWeightsLoader, and partial (per-module) updates are
-        # the normal RL shape anyway.
-        pristine_tensors: list[tuple[str, torch.Tensor]] = [
-            (name, param.detach().clone())
+        wte_adapter = QwenImageRLAdapter(engine)
+        selected = wte_adapter.policy.select(pipeline.named_parameters())
+        selected_names = {name for name, _ in selected}
+        frozen_tensors = {
+            name: param.detach().cpu().clone()
             for name, param in pipeline.named_parameters()
-            if name.startswith(("transformer.", "vae."))
-        ]
-        assert pristine_tensors, "No transformer.*/vae.* parameters found in the pipeline"
+            if name not in selected_names
+        }
 
-        # Pick a weight whose perturbation provably moves the output of this
-        # (untrained, 2-step) tiny model. Measured reality: randomly replacing
-        # transformer weights (attn / norms) leaves the generated pixels
-        # unchanged — the untrained DiT's contribution is drowned by the VAE
-        # decode — while the VAE decoder *produces* the pixels, so perturbing
-        # it must change the image. Preference order matters here.
+        # The QwenImage full-parameter RL boundary is the DiT transformer.
+        # VAE and text encoders remain inference components and are not
+        # included in the trainer publication.
+        pristine_tensors: list[tuple[str, torch.Tensor]] = [(name, param.detach().clone()) for name, param in selected]
+        assert pristine_tensors, "No transformer.* parameters found in the pipeline"
+
+        # A deterministic nonzero perturbation also works for constant parameters.
         def _sensitivity(name: str) -> int:
-            if "vae.decoder" in name:
-                return 0
-            if name.startswith("vae."):
-                return 1
             if "scale_shift_table" in name:
-                return 2
-            return 3
+                return 0
+            if "attn" in name or "norm" in name:
+                return 1
+            return 2
 
         candidates = [(name, tensor) for name, tensor in pristine_tensors if tensor.numel() > 10]
         target_name, _ = min(candidates, key=lambda item: _sensitivity(item[0]))
@@ -274,16 +269,15 @@ async def test_weight_transfer_changes_generation():
         perturbed_tensors = [
             (
                 name,
-                torch.randn_like(tensor) * tensor.std() if name == target_name else tensor,
+                tensor + 0.125 if name == target_name else tensor,
             )
             for name, tensor in pristine_tensors
         ]
 
         # Step 2: init handshake (same payload the trainer engine ships)
-        wte_adapter = RLWeightTransferAdapter(engine)
         await wte_adapter.initialize(dict(IPC_INIT_INFO))
 
-        # Step 3: Ship perturbed weights -> image2 must differ
+        # Step 3: Ship perturbed transformer weights.
         await _transfer_weights(wte_adapter, perturbed_tensors)
 
         # Direct check that the shipped tensors actually landed in the live
@@ -295,6 +289,7 @@ async def test_weight_transfer_changes_generation():
         pristine = dict(pristine_tensors)[target_name].float().cpu()
         changed_diff = (live - pristine).abs().max().item()
         print(f"[test] live-vs-shipped max diff: {applied_diff:.6f}; live-vs-pristine max diff: {changed_diff:.6f}")
+        assert applied_diff == 0, "Live weight differs from the sent tensor"
         assert changed_diff > 0, "The perturbed weight did not reach the live model at all."
 
         output2 = await _generate_once(
@@ -302,30 +297,31 @@ async def test_weight_transfer_changes_generation():
         )
         image2 = _image_to_array(output2)
 
-        assert np.abs(image1 - image2).mean() > 0.01, (
-            "Image2 should differ from Image1 after the perturbed weight transfer, but they are nearly identical."
-        )
+        # Tiny random checkpoints can produce nearly identical pixels after a
+        # transformer-only update. The live parameter check above is the
+        # authoritative reload assertion; generation verifies the pipeline
+        # remains usable after the update.
 
-        # Step 4: Ship the pristine snapshot again -> image3 must return to
-        # (near) image1.
+        # Step 4: Ship the pristine snapshot again and generate once more.
         restored_tensors = [(name, tensor.clone()) for name, tensor in pristine_tensors]
         await _transfer_weights(wte_adapter, restored_tensors)
+        live_params = dict(pipeline.named_parameters())
+        for name, tensor in restored_tensors:
+            torch.testing.assert_close(live_params[name], tensor, rtol=0, atol=0)
+        for name, tensor in frozen_tensors.items():
+            torch.testing.assert_close(live_params[name].detach().cpu(), tensor, rtol=0, atol=0)
+        assert wte_adapter.current_version == 2
 
         output3 = await _generate_once(
             engine, prompt, request_id=f"restored_{uuid.uuid4().hex[:8]}", sampling_params=sampling_params
         )
         image3 = _image_to_array(output3)
 
-        diff_1_2 = np.abs(image1 - image2).mean()
-        diff_1_3 = np.abs(image1 - image3).mean()
-        assert diff_1_3 < diff_1_2 * 0.5, (
-            f"Image3 (restored) should be closer to Image1 than Image2 is: "
-            f"diff(1,3)={diff_1_3:.6f} vs diff(1,2)={diff_1_2:.6f}."
-        )
+        assert np.isfinite(image2).all() and np.isfinite(image3).all()
 
-        print("\nWeight transfer validation passed:")
-        print(f"  - Image1 vs Image2 mean diff: {diff_1_2:.6f} (perturbed, should be large)")
-        print(f"  - Image1 vs Image3 mean diff: {diff_1_3:.6f} (restored, should be small)")
+        print("\nQwenImage transformer weight transfer validation passed:")
+        print(f"  - updated parameter: {target_name}")
+        print(f"  - live-vs-pristine max diff: {changed_diff:.6f}")
 
 
 if __name__ == "__main__":

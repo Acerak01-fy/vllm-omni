@@ -82,6 +82,11 @@ AR workers inherit upstream worker methods. Diffusion workers expose the same
 methods and delegate to upstream WTE, with guards against invalid call ordering.
 The trainer must quiesce generation for the entire update session.
 
+The [RL publication adapter](rl_rollout_mock.md#qwenimage-streaming-publication)
+adds model parameter policies and publication validation above this lifecycle.
+QwenImage's UniRL integration streams each native IPC chunk through that adapter;
+the worker continues to consume the upstream payload and use upstream reload.
+
 The WTE is constructed after the active pipeline is loaded. Custom pipeline
 replacement closes the previous engine and binds a new one to the replacement
 model; replacement during an active update is rejected. Normal RL publications

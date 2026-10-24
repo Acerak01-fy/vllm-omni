@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_omni.rl_rollout import QwenImageParameterPolicy, QwenImageRLAdapter
+from vllm_omni.rl_rollout import QwenImageParameterPolicy, QwenImageRLAdapter, WeightPublication, WeightUpdateChunk
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -29,9 +29,9 @@ class _FakeClient:
 
 
 @pytest.mark.asyncio
-async def test_qwen_image_publishes_full_transformer_and_freezes_auxiliary_modules() -> None:
+async def test_qwen_image_streams_transformer_chunks_and_finishes_version() -> None:
     client = _FakeClient()
-    adapter = QwenImageRLAdapter(client, chunk_size=2)
+    adapter = QwenImageRLAdapter(client)
     parameters = {
         "transformer.blocks.0.attn.weight": "attn-0",
         "transformer.blocks.0.mlp.weight": "mlp-0",
@@ -39,23 +39,21 @@ async def test_qwen_image_publishes_full_transformer_and_freezes_auxiliary_modul
         "vae.decoder.conv_in.weight": "vae",
         "text_encoder.layers.0.weight": "text",
     }
-
-    await adapter.initialize({"backend": "ipc", "packed": False})
-    await adapter.publish(parameters)
-
+    names = adapter.trainable_parameter_names(parameters)
+    assert len(names) == 3 and all(name.startswith("transformer.") for name in names)
+    await adapter.initialize({"packed": True})
+    await adapter.start_publication(version=1, parameter_names=names)
+    # The sender reuses a buffer only after update_chunk acknowledges it.
+    payload = {"names": names[:2], "ipc_handles": "buffer-handle"}
+    await adapter.update_chunk(WeightUpdateChunk(version=1, parameter_names=names[:2], payload=payload))
+    assert client.calls[-1] == ("update", payload)
+    assert adapter.current_version == 0
+    payload = {"names": names[2:], "ipc_handles": "buffer-handle"}
+    await adapter.update_chunk(WeightUpdateChunk(version=1, parameter_names=names[2:], payload=payload))
+    await adapter.finish_publication()
     assert adapter.current_version == 1
-    assert adapter.trainable_parameter_names(parameters) == (
-        "transformer.blocks.0.attn.weight",
-        "transformer.blocks.0.mlp.weight",
-        "transformer.blocks.1.attn.weight",
-    )
     assert [name for name, _ in client.calls] == ["init", "start", "update", "update", "finish"]
     assert client.calls[-1] == ("finish", "1")
-    assert client.calls[2][1] == {
-        "transformer.blocks.0.attn.weight": "attn-0",
-        "transformer.blocks.0.mlp.weight": "mlp-0",
-    }
-    assert client.calls[3][1] == {"transformer.blocks.1.attn.weight": "attn-1"}
 
 
 def test_qwen_image_policy_can_be_explicitly_extended_for_a_recipe() -> None:
@@ -72,8 +70,37 @@ def test_qwen_image_policy_can_be_explicitly_extended_for_a_recipe() -> None:
     assert policy.select_names(parameters) == ("transformer.block.weight", "vae.decoder.weight")
 
 
-def test_qwen_image_adapter_rejects_snapshot_without_transformer_parameters() -> None:
-    adapter = QwenImageRLAdapter(_FakeClient())
+@pytest.mark.asyncio
+@pytest.mark.parametrize("names", [("vae.decoder.weight",), ("transformer.weight", "vae.decoder.weight")])
+async def test_qwen_image_rejects_auxiliary_weights_before_start(names) -> None:
+    client = _FakeClient()
+    adapter = QwenImageRLAdapter(client)
+    await adapter.initialize({"packed": True})
+    with pytest.raises(ValueError):
+        await adapter.start_publication(version=1, parameter_names=names)
+    assert [name for name, _ in client.calls] == ["init"]
 
-    with pytest.raises(ValueError, match="no QwenImage trainable parameters"):
-        adapter.build_publication({"vae.decoder.weight": "frozen"})
+
+@pytest.mark.asyncio
+async def test_qwen_image_adapter_accepts_opaque_native_payload() -> None:
+    client = _FakeClient()
+    adapter = QwenImageRLAdapter(client)
+    await adapter.initialize({"packed": True})
+
+    publication = WeightPublication(
+        version=1,
+        parameter_names=("transformer.block.weight",),
+        chunks=(
+            WeightUpdateChunk(
+                version=1,
+                parameter_names=("transformer.block.weight",),
+                payload={"ipc_handles_pickled": "opaque"},
+            ),
+        ),
+    )
+    await adapter.publish(publication)
+
+    assert client.calls[-2:] == [
+        ("update", {"ipc_handles_pickled": "opaque"}),
+        ("finish", "1"),
+    ]

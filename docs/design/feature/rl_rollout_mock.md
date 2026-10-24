@@ -1,9 +1,8 @@
 # HunyuanImage3 RL rollout interface (mock)
 
-This document defines the first rollout-side contract for HunyuanImage3 AR and
-diffusion RL. It is a CPU mock for validating the boundary before a real UniRL
-trainer is connected. It does not claim that a real checkpoint, CUDA IPC
-handle, FSDP process, GRPO implementation, or FlowGRPO implementation has run.
+This document defines the rollout publication contract shared by the
+HunyuanImage3 CPU mock and the QwenImage trainer integration. HunyuanImage3
+remains a mock; its tests do not establish real AR or diffusion RL support.
 
 ## Scope
 
@@ -53,7 +52,66 @@ every name declared by `start_weight_update`.
 The `version` and manifest are trainer-side publication bookkeeping. The
 production `RLWeightTransferAdapter` keeps that bookkeeping and translates only
 the chunks into the existing Omni `init/start/update/finish` calls. The payload
-itself remains an upstream IPC, HTTP, or other WTE payload.
+itself remains an upstream WTE payload, carried by RPC or HTTP control calls.
+
+## QwenImage streaming publication
+
+```text
+UniRL FlowGRPO + FSDP transformer
+  -> canonical export names: transformer.*
+  -> vLLM native packed IPC sender
+  -> UniRL RLWeightSyncClient
+  -> QwenImageRLAdapter -> RLWeightTransferAdapter
+  -> Omni WTE control calls (RPC or HTTP)
+  -> upstream IPCWeightTransferEngine -> layerwise reload
+  -> the same running QwenImage pipeline
+```
+
+`QwenImageRLAdapter` validates the declared parameter names using
+`QwenImageParameterPolicy`. The default recipe updates the full DiT
+transformer and rejects VAE/text-encoder names before starting reload. A new
+recipe can supply an explicit policy for other trainable components; its
+trainer must provide the corresponding export and loss implementation.
+
+The trainer supplies canonical names and native WTE payloads:
+
+```python
+await adapter.initialize({"packed": True})
+await adapter.start_publication(version=1, parameter_names=names)
+for chunk in trainer_encoded_chunks:
+    await adapter.update_chunk(chunk)
+await adapter.finish_publication()
+```
+
+`update_chunk` returns only after the underlying client acknowledges reception.
+The native sender can then reuse its packed buffer. The adapter retains names
+and version state, not tensor data or IPC handles. `publish(WeightPublication)`
+uses the same lifecycle for already encoded chunks with independent storage.
+There is no parameter-dictionary-to-IPC conversion in the model adapter.
+
+Duplicate, unknown, or wrong-version chunks and incomplete streams fail the
+publication. A transport or finish failure leaves `current_version` unchanged
+and blocks reuse of the adapter. The trainer must quiesce generation during
+updates and close/recreate a failed rollout runtime: the adapter cannot roll
+back an in-progress layerwise reload. Its version is an acknowledged client
+version; `AsyncOmni` does not itself stamp that version on generated samples.
+UniRL retains its sample-version bookkeeping and distributed failure consensus.
+
+The UniRL recipe configures `sync.native_client_adapter` with
+`unirl.rollout.engine.vllm_omni.rl_weight_sync.build_rl_weight_sync_client` and an
+`adapter_factory` resolving `vllm_omni.rl_rollout.QwenImageRLAdapter` through
+`hydra.utils.get_class`. The factory creates `RLWeightSyncClient` once the
+native sender supplies the manifest and current version. This bridge runs
+in the synchronous training worker; it drives the async adapter in a private
+loop and forwards each native payload unchanged to the existing sync client.
+FSDP gathering, packed buffers, CUDA handles, and import release remain in
+UniRL/vLLM. The worker's four WTE methods need no additional RL payload format.
+
+To extend the publication boundary for another model, define its canonical
+parameter policy, validate it before `start_publication`, and configure the
+trainer bridge with that adapter. Separately validate the pipeline's loader
+and reload metadata as described in [weight transfer](weight_transfer.md).
+The model adapter alone does not make a pipeline reloadable.
 
 ## Rollout sample contracts
 
