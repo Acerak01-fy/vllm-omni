@@ -82,6 +82,12 @@ AR workers inherit upstream worker methods. Diffusion workers expose the same
 methods and delegate to upstream WTE, with guards against invalid call ordering.
 The trainer must quiesce generation for the entire update session.
 
+[Model-specific RL helpers](rl_rollout_mock.md#model-specific-helpers) live in
+`vllm_omni/rl_rollout/models/`. They describe recipe parameter scopes without
+wrapping the native WTE lifecycle. QwenImage's UniRL integration connects its
+native sender directly to the control client; the worker consumes the upstream
+payload and uses upstream reload.
+
 The WTE is constructed after the active pipeline is loaded. Custom pipeline
 replacement closes the previous engine and binds a new one to the replacement
 model; replacement during an active update is rejected. Normal RL publications
