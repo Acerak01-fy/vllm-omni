@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Stable model-neutral contracts for RL rollout integrations."""
+"""Test-only samples and results for the CPU RL simulation."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
 RolloutMode = Literal["ar", "diffusion"]
 
@@ -69,49 +69,6 @@ class DiffusionRolloutSample:
 
 
 @dataclass(frozen=True)
-class WeightUpdateChunk:
-    """One versioned trainer publication chunk.
-
-    ``payload`` is an opaque, trainer-encoded upstream WTE update. RPC and HTTP
-    carry the same backend payload. Keep its exported storage alive until the
-    receiver acknowledges the update; the publication adapter does not copy it.
-    """
-
-    version: int
-    parameter_names: tuple[str, ...]
-    payload: Any
-
-    def __post_init__(self) -> None:
-        if self.version < 0:
-            raise ValueError("weight version must be non-negative")
-        if not self.parameter_names or len(set(self.parameter_names)) != len(self.parameter_names):
-            raise ValueError("weight chunks require unique, non-empty parameter names")
-
-
-@dataclass(frozen=True)
-class WeightPublication:
-    """Pre-encoded publication whose chunks own independent, stable storage.
-
-    Packed IPC senders that reuse one buffer must use the adapter's streaming
-    lifecycle instead of collecting their handles into this tuple.
-    """
-
-    version: int
-    parameter_names: tuple[str, ...]
-    chunks: tuple[WeightUpdateChunk, ...]
-
-    def __post_init__(self) -> None:
-        if self.version < 0:
-            raise ValueError("weight version must be non-negative")
-        if not self.parameter_names or len(set(self.parameter_names)) != len(self.parameter_names):
-            raise ValueError("publications require unique, non-empty parameter names")
-        if not self.chunks:
-            raise ValueError("publications require at least one weight chunk")
-        if any(chunk.version != self.version for chunk in self.chunks):
-            raise ValueError("all chunks must use the publication version")
-
-
-@dataclass(frozen=True)
 class RLUpdateResult:
     """Trainer result after a rollout, mock/real reward, and publication."""
 
@@ -122,19 +79,3 @@ class RLUpdateResult:
     loss: float
     published_version: int
     published_parameter_names: tuple[str, ...]
-
-
-class VLLMWeightTransferClient(Protocol):
-    """Existing AsyncOmni/vLLM WTE lifecycle used by the RL adapter."""
-
-    async def init_weight_transfer_engine(self, init_info: Mapping[str, Any]) -> None:
-        """Initialize the configured transport."""
-
-    async def start_weight_update(self) -> None:
-        """Start a weight update session."""
-
-    async def update_weights(self, update_info: Any) -> None:
-        """Forward one upstream backend-specific update payload."""
-
-    async def finish_weight_update(self, weight_version: str | None = None) -> None:
-        """Finish and publish the update session."""

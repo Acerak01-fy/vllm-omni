@@ -1,16 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU mock of the HunyuanImage3 AR/diffusion RL rollout boundary.
+"""CPU simulation of independent HunyuanImage3 AR/diffusion RL recipes.
 
-This module is a contract harness, not a model implementation.  It keeps a
-small tensor registry in place of the 80B HunyuanImage3 checkpoint and models
-the same direction of data flow as a real trainer:
-
-``generate -> reward/loss -> full trainable snapshot -> init/start/update/finish``
-
-The updater commits only after ``finish_weight_update``.  That makes it useful
-for checking publication/version semantics without requiring a real vLLM
-worker, CUDA IPC handles, or a training backend.
+The mock uses native WTE method signatures with CPU-only mapping payloads.
+It applies each update immediately and blocks generation until finish. It
+cannot prove real IPC, layerwise reload, stage coordination, or cache behavior.
 """
 
 from __future__ import annotations
@@ -23,12 +17,12 @@ from typing import Any, Literal
 
 import torch
 
-from vllm_omni.rl_rollout import (
+from tests.rl_rollout.mock_types import (
     ARRolloutSample,
     DiffusionRolloutSample,
     RLUpdateResult,
-    WeightUpdateChunk,
 )
+from vllm_omni.rl_rollout.models.hunyuan_image3 import select_stage_parameters
 
 
 class MockWeightTransferError(RuntimeError):
@@ -109,20 +103,13 @@ class _MockParameterStore:
 
 
 class MockWeightTransferSession:
-    """In-memory implementation of Omni's four weight-transfer calls.
-
-    The session accepts chunks in any order, rejects duplicates, and publishes
-    a version only when every name declared at ``start`` has arrived.  This is
-    deliberately stricter than a loose dictionary assignment because it
-    catches incomplete full-parameter exports before they affect rollout.
-    """
+    """CPU receiver using native lifecycle signatures and a fixed test manifest."""
 
     def __init__(self, store: _MockParameterStore) -> None:
         self._store = store
         self._initialized = False
-        self._active_version: int | None = None
-        self._expected_names: tuple[str, ...] = ()
-        self._pending: dict[str, torch.Tensor] = {}
+        self._active = False
+        self._received: set[str] = set()
         self._current_version = 0
         self.init_info: dict[str, Any] | None = None
         self.published_versions: list[int] = [0]
@@ -133,72 +120,49 @@ class MockWeightTransferSession:
 
     @property
     def update_in_progress(self) -> bool:
-        return self._active_version is not None
+        return self._active
 
     async def init_weight_transfer_engine(self, init_info: Mapping[str, Any]) -> None:
-        if self._initialized:
-            raise MockWeightTransferError("weight transfer engine is already initialized")
-        if self._active_version is not None:
+        if self._active:
             raise MockWeightTransferError("cannot initialize during an active weight update")
         self.init_info = dict(init_info)
         self._initialized = True
 
-    async def start_weight_update(self, *, version: int, parameter_names: Sequence[str]) -> None:
+    async def start_weight_update(self) -> None:
         if not self._initialized:
             raise MockWeightTransferError("init_weight_transfer_engine must run before start_weight_update")
-        if self._active_version is not None:
+        if self._active:
             raise MockWeightTransferError("a weight update is already in progress")
-        if version != self._current_version + 1:
-            raise MockWeightTransferError(
-                f"weight version must advance from {self._current_version} to "
-                f"{self._current_version + 1}, got {version}"
-            )
-        names = tuple(parameter_names)
-        if not names or len(set(names)) != len(names):
-            raise MockWeightTransferError("start_weight_update requires unique, non-empty parameter names")
-        if set(names) - set(self._store.trainable_names):
-            raise MockWeightTransferError("weight update manifest contains a frozen or unknown parameter")
-        self._active_version = version
-        self._expected_names = names
-        self._pending = {}
+        self._active = True
+        self._received = set()
 
-    async def update_weights(self, update: WeightUpdateChunk) -> None:
-        if self._active_version is None:
+    async def update_weights(self, update_info: Mapping[str, torch.Tensor]) -> None:
+        if not self._active:
             raise MockWeightTransferError("update_weights requires an active weight update")
-        if update.version != self._active_version:
-            raise MockWeightTransferError(
-                f"update version {update.version} does not match active version {self._active_version}"
-            )
-        if not update.parameter_names:
+        if not update_info:
             raise MockWeightTransferError("update_weights requires at least one parameter")
-        expected = set(self._expected_names)
-        payload = update.payload
-        if not isinstance(payload, Mapping):
-            raise MockWeightTransferError("mock update payload must be a parameter mapping")
-        if set(update.parameter_names) != set(payload):
-            raise MockWeightTransferError("chunk parameter names do not match its payload")
-        for name in update.parameter_names:
-            value = payload[name]
-            if name not in expected:
-                raise MockWeightTransferError(f"parameter {name!r} is not in the active update manifest")
-            if name in self._pending:
+        for name, value in update_info.items():
+            if name not in self._store.trainable_names:
+                raise MockWeightTransferError(f"parameter {name!r} is frozen or unknown")
+            if name in self._received:
                 raise MockWeightTransferError(f"parameter {name!r} was sent more than once")
             self._store.validate_value(name, value)
-            self._pending[name] = _clone(value)
+        self._store.commit(update_info)
+        self._received.update(update_info)
 
-    async def finish_weight_update(self) -> None:
-        if self._active_version is None:
+    async def finish_weight_update(self, weight_version: str | None = None) -> None:
+        if not self._active:
             raise MockWeightTransferError("finish_weight_update requires an active weight update")
-        missing = set(self._expected_names) - set(self._pending)
+        version = self._current_version + 1 if weight_version is None else int(weight_version)
+        if version != self._current_version + 1:
+            raise MockWeightTransferError(f"weight version must advance to {self._current_version + 1}, got {version}")
+        missing = set(self._store.trainable_names) - self._received
         if missing:
             raise MockWeightTransferError(f"cannot publish incomplete update; missing {sorted(missing)}")
-        version = self._active_version
-        self._store.commit(self._pending)
         self._current_version = version
         self.published_versions.append(version)
-        self._active_version = None
-        self._expected_names = ()
-        self._pending = {}
+        self._active = False
+        self._received.clear()
 
 
 class _BaseMockRolloutEngine:
@@ -238,14 +202,18 @@ class _BaseMockRolloutEngine:
     async def init_weight_transfer_engine(self, init_info: Mapping[str, Any]) -> None:
         await self._weight_transfer.init_weight_transfer_engine(init_info)
 
-    async def start_weight_update(self, *, version: int, parameter_names: Sequence[str]) -> None:
-        await self._weight_transfer.start_weight_update(version=version, parameter_names=parameter_names)
+    async def start_weight_update(self) -> None:
+        await self._weight_transfer.start_weight_update()
 
-    async def update_weights(self, update: WeightUpdateChunk) -> None:
-        await self._weight_transfer.update_weights(update)
+    async def update_weights(self, update_info: Mapping[str, torch.Tensor]) -> None:
+        await self._weight_transfer.update_weights(update_info)
 
-    async def finish_weight_update(self) -> None:
-        await self._weight_transfer.finish_weight_update()
+    async def finish_weight_update(self, weight_version: str | None = None) -> None:
+        await self._weight_transfer.finish_weight_update(weight_version)
+
+    def _require_idle(self) -> None:
+        if self._weight_transfer.update_in_progress:
+            raise MockWeightTransferError("generation is paused during a weight update")
 
 
 def _default_ar_parameters() -> tuple[dict[str, torch.Tensor], tuple[str, ...]]:
@@ -256,7 +224,7 @@ def _default_ar_parameters() -> tuple[dict[str, torch.Tensor], tuple[str, ...]]:
         # This represents an auxiliary component that the AR recipe freezes.
         "vision_model.encoder.weight": torch.full((2, 2), 0.40),
     }
-    return parameters, tuple(name for name in parameters if not name.startswith("vision_model."))
+    return parameters, tuple(name for name, _ in select_stage_parameters(parameters.items(), stage="ar"))
 
 
 def _default_diffusion_parameters() -> tuple[dict[str, torch.Tensor], tuple[str, ...]]:
@@ -265,12 +233,13 @@ def _default_diffusion_parameters() -> tuple[dict[str, torch.Tensor], tuple[str,
         "model.layers.0.mlp.down_proj.weight": torch.full((2, 2), 0.20),
         "patch_embed.proj.weight": torch.full((2, 2), 0.30),
         "time_embed.weight": torch.full((2, 2), 0.40),
+        "time_embed_2.weight": torch.full((2, 2), 0.45),
         "final_layer.linear.weight": torch.full((2, 2), 0.50),
         # VAE is intentionally frozen; it is used to decode the generated image.
         "vae.decoder.weight": torch.full((2, 2), 0.60),
         "vision_model.encoder.weight": torch.full((2, 2), 0.70),
     }
-    trainable = tuple(name for name in parameters if not name.startswith(("vae.", "vision_model.")))
+    trainable = tuple(name for name, _ in select_stage_parameters(parameters.items(), stage="diffusion"))
     return parameters, trainable
 
 
@@ -284,6 +253,7 @@ class MockARRolloutEngine(_BaseMockRolloutEngine):
         super().__init__(parameters, trainable)
 
     async def generate(self, prompt: str, *, seed: int = 0) -> ARRolloutSample:
+        self._require_idle()
         digest = _stable_bytes(f"ar:{prompt}:{seed}:{self.current_version}")
         prompt_token_ids = tuple(100 + byte % 200 for byte in digest[:4])
         response_token_ids = tuple(500 + byte % 500 for byte in digest[4:8])
@@ -313,6 +283,7 @@ class MockDiffusionRolloutEngine(_BaseMockRolloutEngine):
         self.num_inference_steps = num_inference_steps
 
     async def generate(self, prompt: str, *, seed: int = 0) -> DiffusionRolloutSample:
+        self._require_idle()
         digest = _stable_bytes(f"diffusion:{prompt}:{seed}")
         generator = torch.Generator(device="cpu").manual_seed(int.from_bytes(digest[:8], "big"))
         latent = torch.randn((1, 4, 2, 2), generator=generator)
@@ -392,17 +363,11 @@ class MockHunyuanImage3Trainer:
 
         version = self._published_version + 1
         names = self.rollout_engine.trainable_parameter_names
-        await self.transfer_client.start_weight_update(version=version, parameter_names=names)
+        await self.transfer_client.start_weight_update()
         items = list(self._trainable_parameters.items())
         for offset in range(0, len(items), 2):
-            await self.transfer_client.update_weights(
-                WeightUpdateChunk(
-                    version=version,
-                    parameter_names=tuple(name for name, _ in items[offset : offset + 2]),
-                    payload=dict(items[offset : offset + 2]),
-                )
-            )
-        await self.transfer_client.finish_weight_update()
+            await self.transfer_client.update_weights(dict(items[offset : offset + 2]))
+        await self.transfer_client.finish_weight_update(str(version))
         self._published_version = version
         return RLUpdateResult(
             mode=self.rollout_engine.mode,

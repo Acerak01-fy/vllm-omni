@@ -1,180 +1,132 @@
-# HunyuanImage3 RL rollout interface (mock)
+# RL rollout model integration
 
-This document defines the rollout publication contract shared by the
-HunyuanImage3 CPU mock and the QwenImage trainer integration. HunyuanImage3
-remains a mock; its tests do not establish real AR or diffusion RL support.
+Weight updates use vLLM's native WTE lifecycle. Model-specific integration
+helpers live in `vllm_omni/rl_rollout/models/`; they do not own transport clients,
+publication versions, or a second weight-update protocol.
 
-## Scope
-
-AR and diffusion are two independent recipes. A round updates one mode and
-publishes one complete snapshot of that mode's trainable parameters. The mock
-does not combine AR and diffusion losses in one optimizer step.
+## Native weight-transfer path
 
 ```text
-prompt
-  -> mock AR or diffusion rollout
-  -> token/logprob or image/trajectory sample
-  -> mock reward + advantage + loss
-  -> trainer updates its local full parameter snapshot
-  -> init -> start(version, manifest) -> update(chunk) x N -> finish
-  -> rollout publishes version
-  -> next rollout uses the new version
+trainer optimizer
+  -> canonical weight source
+  -> native WTE sender
+  -> control client (RPC or HTTP)
+  -> Omni worker
+  -> upstream IPCWeightTransferEngine / layerwise reload
+  -> the running pipeline
 ```
 
-The four weight-transfer calls keep the same lifecycle names as `AsyncOmni`:
+An async Omni client exposes the existing four calls:
 
 ```python
-await adapter.initialize({"backend": "ipc", "packed": False})
-await adapter.publish(
-    WeightPublication(
-        version=version,
-        parameter_names=names,
-        chunks=(WeightUpdateChunk(version=version, parameter_names=names, payload=update_info),),
-    )
-)
+await engine.init_weight_transfer_engine(init_info)
+await engine.start_weight_update()
+for update_info in trainer_encoded_chunks:
+    await engine.update_weights(update_info)
+await engine.finish_weight_update()
 ```
 
-The complete CPU mock can be driven without a server:
+The payload is built by the trainer's WTE sender. A CUDA IPC handle references
+live storage: the sender keeps the source alive and waits for each update to
+complete before overwriting a reusable packed buffer. The control client must
+propagate worker failures. Generation must be quiescent throughout the update;
+partial layerwise loading cannot be rolled back by a publication wrapper.
+
+The trainer owns parameter selection, canonical export, manifest verification,
+rank consensus, and publication/sample versions. Omni validates the worker
+lifecycle and delegates reception and reload to vLLM. `AsyncOmni` accepts a
+finish version for protocol compatibility but does not stamp it on samples.
+
+## Model-specific helpers
+
+```text
+vllm_omni/rl_rollout/models/
+  qwen_image.py        # full-transformer recipe parameter selection
+  hunyuan_image3.py    # AR / diffusion parameter scopes used by the CPU mock
+```
+
+These modules contain stateless, lazy selectors. They preserve the source
+values and storage rather than collecting full tensors. They are optional
+helpers for callers building a weight source, not mandatory client wrappers.
+The common worker contains no model-name dispatch for these selectors.
+
+### QwenImage
+
+`select_transformer_parameters` selects canonical `transformer.*` names from
+an iterable of named parameters. The GPU reload regression uses it to create a
+transformer-only source and checks that auxiliary weights remain unchanged.
+A different recipe can choose a different source without changing WTE.
+
+UniRL's full-parameter recipe builds its training backend around the transformer
+and applies `name_remap: {"*": "transformer.*"}` during export. Its native sender
+uses `VLLMNativeWeightSyncClient` directly. UniRL checks source metadata and
+rank agreement and advances versions only after successful completion. LoRA
+is disabled; VAE and text encoder weights are not exported.
+
+Generation still uses Omni outputs and UniRL's `Sample`, `Part`, and
+`LatentSegment` conversion. Capturing conditioning and denoising trajectories
+remains in the trainer's QwenImage pipeline integration.
+
+### HunyuanImage3
+
+`select_stage_parameters` uses canonical `model.*` backbone names and the
+selected recipe's heads. The `transformer.*` alias must not be exported as a
+second copy of the same backbone.
+
+| Recipe | Parameter scope | Auxiliary components excluded |
+| ------ | --------------- | ----------------------------- |
+| AR | `model.*`, `lm_head.*` | VAE, vision encoder/aligner |
+| Diffusion | `model.*`, image projection/output and timestep/guidance embeddings | VAE, vision encoder/aligner |
+
+The diffusion scope includes `patch_embed`, `final_layer`, `time_embed`,
+`time_embed_2`, `timestep_emb`, and the optional `guidance_emb` and
+`timestep_r_emb` components. Selection alone does not make HI3 reloadable.
+Real HI3 IPC, model-loader compatibility, shared-backbone stage coordination,
+and cache invalidation remain unvalidated.
+
+## Adding another model
+
+1. Use its existing pipeline `load_weights` implementation and validate the
+   upstream reload prerequisites described in [weight transfer](weight_transfer.md).
+2. Keep necessary RL-specific naming or model-state helpers in
+   `models/<model_name>.py`. Bind real model-specific hooks at the model or
+   pipeline that uses them; a compatible model needs no extra hook class.
+3. Keep parameter gathering, wire encoding, and training decisions in the
+   training framework. Reuse the native WTE client lifecycle.
+4. For a multi-stage model, explicitly validate target routing, shared-weight
+   replicas, request quiescence, and caches. Parameter prefix selection does
+   not implement those runtime guarantees.
+5. Verify real parameter application and subsequent generation; a CPU mock
+   establishes only the behavior it actually simulates.
+
+## CPU mock
+
+`tests/rl_rollout/mock_hunyuan_image3.py` models independent AR and diffusion
+recipes with CPU tensors and deterministic placeholder reward/loss updates.
+It uses native lifecycle signatures with a test-only mapping payload. Updates
+apply immediately; generation is blocked from start until a successful finish.
+The mock's fixed manifest and version checks belong to the test harness and do
+not claim equivalent bookkeeping in Omni's worker. Its sample/result dataclasses
+live in `tests/rl_rollout/mock_types.py` rather than the production API.
 
 ```python
 engine = MockDiffusionRolloutEngine(num_inference_steps=4)
 trainer = MockHunyuanImage3Trainer(engine)
 result = await trainer.run_round("a red kite", seed=7)
-assert result.published_version == 1
 assert result.rollout.weight_version == 0
-assert engine.current_version == 1
+assert result.published_version == 1
 ```
 
-`update_weights` may be called repeatedly. The mock buffers chunks and makes a
-version visible to generation only after `finish_weight_update` has received
-every name declared by `start_weight_update`.
-
-The `version` and manifest are trainer-side publication bookkeeping. The
-production `RLWeightTransferAdapter` keeps that bookkeeping and translates only
-the chunks into the existing Omni `init/start/update/finish` calls. The payload
-itself remains an upstream WTE payload, carried by RPC or HTTP control calls.
-
-## QwenImage streaming publication
-
-```text
-UniRL FlowGRPO + FSDP transformer
-  -> canonical export names: transformer.*
-  -> vLLM native packed IPC sender
-  -> UniRL RLWeightSyncClient
-  -> QwenImageRLAdapter -> RLWeightTransferAdapter
-  -> Omni WTE control calls (RPC or HTTP)
-  -> upstream IPCWeightTransferEngine -> layerwise reload
-  -> the same running QwenImage pipeline
-```
-
-`QwenImageRLAdapter` validates the declared parameter names using
-`QwenImageParameterPolicy`. The default recipe updates the full DiT
-transformer and rejects VAE/text-encoder names before starting reload. A new
-recipe can supply an explicit policy for other trainable components; its
-trainer must provide the corresponding export and loss implementation.
-
-The trainer supplies canonical names and native WTE payloads:
-
-```python
-await adapter.initialize({"packed": True})
-await adapter.start_publication(version=1, parameter_names=names)
-for chunk in trainer_encoded_chunks:
-    await adapter.update_chunk(chunk)
-await adapter.finish_publication()
-```
-
-`update_chunk` returns only after the underlying client acknowledges reception.
-The native sender can then reuse its packed buffer. The adapter retains names
-and version state, not tensor data or IPC handles. `publish(WeightPublication)`
-uses the same lifecycle for already encoded chunks with independent storage.
-There is no parameter-dictionary-to-IPC conversion in the model adapter.
-
-Duplicate, unknown, or wrong-version chunks and incomplete streams fail the
-publication. A transport or finish failure leaves `current_version` unchanged
-and blocks reuse of the adapter. The trainer must quiesce generation during
-updates and close/recreate a failed rollout runtime: the adapter cannot roll
-back an in-progress layerwise reload. Its version is an acknowledged client
-version; `AsyncOmni` does not itself stamp that version on generated samples.
-UniRL retains its sample-version bookkeeping and distributed failure consensus.
-
-The UniRL recipe configures `sync.native_client_adapter` with
-`unirl.rollout.engine.vllm_omni.rl_weight_sync.build_rl_weight_sync_client` and an
-`adapter_factory` resolving `vllm_omni.rl_rollout.QwenImageRLAdapter` through
-`hydra.utils.get_class`. The factory creates `RLWeightSyncClient` once the
-native sender supplies the manifest and current version. This bridge runs
-in the synchronous training worker; it drives the async adapter in a private
-loop and forwards each native payload unchanged to the existing sync client.
-FSDP gathering, packed buffers, CUDA handles, and import release remain in
-UniRL/vLLM. The worker's four WTE methods need no additional RL payload format.
-
-To extend the publication boundary for another model, define its canonical
-parameter policy, validate it before `start_publication`, and configure the
-trainer bridge with that adapter. Separately validate the pipeline's loader
-and reload metadata as described in [weight transfer](weight_transfer.md).
-The model adapter alone does not make a pipeline reloadable.
-
-## Rollout sample contracts
-
-An AR sample contains:
-
-- prompt text and `prompt_token_ids`;
-- `response_token_ids` and aligned `response_token_logprobs`;
-- `response_start` and `response_end` offsets into the concatenated `token_ids`;
-- the `weight_version` used for generation.
-
-A diffusion sample contains:
-
-- a placeholder `image` tensor;
-- the complete `latent_trajectory`;
-- one `sigma` and `timestep` per denoising step;
-- `sde_step_indices` identifying the steps retained for a FlowGRPO-like loss;
-- conditioning metadata and a trajectory log probability;
-- the `weight_version` used for generation.
-
-These fields are model-output data. The mock reward and loss are deliberately
-simple placeholders. A real trainer owns reward models, normalization,
-backward, gradient accumulation, optimizer steps, and checkpoint export.
-
-## Parameter ownership
-
-The mock registry uses HunyuanImage3-shaped names to exercise the same routing
-decision as the real model:
-
-| Mode | Published by the mock full-parameter recipe | Frozen by default |
-| ---- | ------------------------------------------- | ----------------- |
-| AR | `model.*`, `lm_head.*` | auxiliary vision parameters |
-| Diffusion | `model.*`, `patch_embed.*`, `time_embed.*`, `final_layer.*` | `vae.*`, `vision_model.*` |
-
-The frozen VAE and vision tensors remain in the rollout registry but are not in
-the update manifest. This makes accidental auxiliary-component updates visible
-in tests.
-
-## Lifecycle checks
-
-The mock rejects:
-
-- `start` or `update` before `init`;
-- a second `start` while an update is active;
-- non-monotonic publication versions;
-- unknown, frozen, duplicate, wrong-shape, wrong-dtype, or non-CPU tensors;
-- `finish` before all manifest names arrive;
-- generation observing a new version before `finish`.
-
-The checks are intentionally stronger than a dictionary assignment. They give
-the future UniRL adapter a concrete manifest and publication-version contract,
-while leaving transport-specific details (RPC, HTTP, or IPC payloads) outside
-the model sample schema.
-
-## Implementation and validation
-
-The stable contracts and adapter are in `vllm_omni.rl_rollout`. The CPU mock
-implementation is in `tests/rl_rollout/mock_hunyuan_image3.py`. The focused
-tests are:
+The mock exercises parameter scopes, repeated publication, invalid order,
+incomplete snapshots, frozen parameters, and tensor shape/dtype validation.
+It does not simulate two stages sharing physical storage or real KV caches.
 
 ```bash
-pytest -q -o addopts='' tests/rl_rollout/test_hunyuan_image3_mock.py
+pytest -q -o addopts='' tests/rl_rollout
 ```
 
-The `-o addopts=''` form is only needed in an environment where the optional
-pytest-xdist plugin is unavailable; normal repository test runners keep their
-configured `--dist=loadgroup` option.
+QwenImage's real IPC regression is
+`tests/e2e/features/rlhf_test/test_weight_transfer_changes_output.py`. Full
+FlowGRPO/PickScore acceptance additionally runs the UniRL two-GPU full-IPC
+recipe through RPC and HTTP control. Record the exact revisions and artifacts;
+these integration runs are distinct from the CPU mock.

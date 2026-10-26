@@ -36,7 +36,7 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.rl_rollout import QwenImageRLAdapter, WeightPublication, WeightUpdateChunk
+from vllm_omni.rl_rollout.models.qwen_image import select_transformer_parameters
 
 MODEL = "tiny-random/Qwen-Image"
 TOKENIZER_MODEL = "Qwen/Qwen2-1.5B-Instruct"
@@ -187,8 +187,8 @@ def _spawn_ipc_exporter(source_tensors: list[tuple[str, torch.Tensor]]):
     return payload, proc
 
 
-async def _transfer_weights(adapter: QwenImageRLAdapter, source_tensors: list[tuple[str, torch.Tensor]]) -> None:
-    """Run one versioned publication through the native Omni WTE lifecycle.
+async def _transfer_weights(engine: AsyncOmni, source_tensors: list[tuple[str, torch.Tensor]]) -> None:
+    """Transfer a snapshot directly through the native Omni WTE lifecycle.
 
     The payload is built by a helper process that mirrors
     ``IPCTrainerWeightTransferEngine._send_unpacked`` (single trainer rank);
@@ -197,15 +197,9 @@ async def _transfer_weights(adapter: QwenImageRLAdapter, source_tensors: list[tu
     """
     payload, exporter = _spawn_ipc_exporter(source_tensors)
     try:
-        version = adapter.current_version + 1
-        names = tuple(name for name, _ in source_tensors)
-        await adapter.publish(
-            WeightPublication(
-                version=version,
-                parameter_names=names,
-                chunks=(WeightUpdateChunk(version=version, parameter_names=names, payload=payload),),
-            )
-        )
+        await engine.start_weight_update()
+        await engine.update_weights(payload)
+        await engine.finish_weight_update()
     finally:
         del payload
         exporter.terminate()
@@ -239,8 +233,7 @@ async def test_qwen_image_transformer_weight_transfer():
         assert np.isfinite(image1).all()
 
         pipeline = _get_diffusion_pipeline(engine)
-        wte_adapter = QwenImageRLAdapter(engine)
-        selected = wte_adapter.policy.select(pipeline.named_parameters())
+        selected = tuple(select_transformer_parameters(pipeline.named_parameters()))
         selected_names = {name for name, _ in selected}
         frozen_tensors = {
             name: param.detach().cpu().clone()
@@ -275,10 +268,10 @@ async def test_qwen_image_transformer_weight_transfer():
         ]
 
         # Step 2: init handshake (same payload the trainer engine ships)
-        await wte_adapter.initialize(dict(IPC_INIT_INFO))
+        await engine.init_weight_transfer_engine(dict(IPC_INIT_INFO))
 
         # Step 3: Ship perturbed transformer weights.
-        await _transfer_weights(wte_adapter, perturbed_tensors)
+        await _transfer_weights(engine, perturbed_tensors)
 
         # Direct check that the shipped tensors actually landed in the live
         # parameters (separates "transfer delivered" from "output changed").
@@ -304,13 +297,12 @@ async def test_qwen_image_transformer_weight_transfer():
 
         # Step 4: Ship the pristine snapshot again and generate once more.
         restored_tensors = [(name, tensor.clone()) for name, tensor in pristine_tensors]
-        await _transfer_weights(wte_adapter, restored_tensors)
+        await _transfer_weights(engine, restored_tensors)
         live_params = dict(pipeline.named_parameters())
         for name, tensor in restored_tensors:
             torch.testing.assert_close(live_params[name], tensor, rtol=0, atol=0)
         for name, tensor in frozen_tensors.items():
             torch.testing.assert_close(live_params[name].detach().cpu(), tensor, rtol=0, atol=0)
-        assert wte_adapter.current_version == 2
 
         output3 = await _generate_once(
             engine, prompt, request_id=f"restored_{uuid.uuid4().hex[:8]}", sampling_params=sampling_params
